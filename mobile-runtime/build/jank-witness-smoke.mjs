@@ -14,6 +14,7 @@
 //  ⑥ markJankPhase 的 phase 随冻结样本落盘；15s 节拍只在有新调用时 flush。
 import { pathToFileURL } from "node:url";
 import path from "node:path";
+import fs from "node:fs";
 
 const here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/(\w:)/, "$1"));
 const failures = [];
@@ -64,6 +65,26 @@ globalThis.zcodeSqlite = {
 };
 globalThis.zcodeDevice = { name: () => "zcodeDevice", allFilesGranted: () => true, deviceInfo: () => "{}" };
 globalThis.zcodeExec = { exec: (req) => req }; // 原样回：壳不许改半个字节
+// JavaObject 形状替身（0.7.7 真机事故回归钉）：方法对 receiver 敏感（this 不是宿主对象就抛），
+// 外加一个**不可枚举**的额外方法（for-in 枚举不到、兜底表也没有）——壳必须 bind 回 orig 并把
+// 漏网方法沿原型链透传。Node 普通对象形状（此前全部假桥）验不到这两条，正是装机事故的盲区。
+const browserHost = {
+  open() {
+    if (this !== browserHost) throw new TypeError("非法 receiver：壳没把方法 bind 回宿主");
+    return "opened";
+  },
+  read() {
+    if (this !== browserHost) throw new TypeError("非法 receiver：壳没把方法 bind 回宿主");
+    return "READ";
+  },
+};
+Object.defineProperty(browserHost, "screenshot", {
+  value: () => "PNG",
+  enumerable: false,
+  writable: true,
+  configurable: true,
+});
+globalThis.zcodeBrowser = browserHost;
 
 const mod = await import(pathToFileURL(path.join(here, "..", "ui", "jank-witness.ts")).href);
 const { installJankWitness, markJankPhase } = mod;
@@ -72,6 +93,9 @@ const KEY = "zcode-mobile.jank.diag";
 const readDiag = () => JSON.parse(store.get(KEY) ?? "null");
 
 const origFs = globalThis.zcodeFs; // 记住引用：装壳应当替换全局对象本体，而不是把方法名吃掉
+// 0.7.8 起计时壳默认关（0.7.7 装机数据全空事故的止血）——本冒烟验的是**开壳后**的壳行为，
+// 所以显式打开开关再装；开关本身（缺省不装壳）由 ⑧ 源码级钉住。
+globalThis.localStorage.setItem("zcode-mobile.jank.shell", "1");
 installJankWitness();
 installJankWitness(); // 幂等：二次调用不重复装壳/心跳
 
@@ -150,4 +174,25 @@ run("桥缺席的宿主：装壳静默跳过（桌面 boot 不受影响）", () 
   return { ok: true };
 });
 
-console.log(failures.length ? `FAILURES: ${failures.join(", ")}` : `ALL ${6} PASS (realFsUnderlyingCalls=${realFsCalls}, sqliteQueries=${sqliteQueries})`);
+run("⑦ JavaObject 形状：receiver 敏感的桥方法被壳调用不许炸；漏网方法沿原型链透传", () => {
+  const b = globalThis.zcodeBrowser;
+  expect(b !== browserHost, "browser 全局没被壳替换（开关/装壳路径没走到？）");
+  expect(b.open("x") === "opened", "壳没 bind 回宿主对象：0.7.7 装机事故形状复现");
+  expect(b.read("x") === "READ", "read 的 receiver 转发坏了");
+  expect(b.screenshot() === "PNG", "不可枚举的漏网方法没有沿原型链透传");
+  // 计数照常记到这一族。
+  expect(readDiag().bridges === undefined || !readDiag().bridges.browser || readDiag().bridges.browser.open?.calls >= 1,
+    "browser.open 调用没进计数（探针/回退把整族撤了？允许撤族，但撤了别报错）");
+  return { browserWrapped: true };
+});
+
+run("⑧ 计时壳默认关（0.7.8 止血）：开关缺省不装壳", () => {
+  const src = fs.readFileSync(path.join(here, "..", "ui", "jank-witness.ts"), "utf8");
+  expect(src.includes('SHELL_FLAG_KEY = "zcode-mobile.jank.shell"'), "开关常量没了");
+  expect(/getItem\(SHELL_FLAG_KEY\)\s*===\s*"1"/.test(src) && src.includes("if (shellOn) instrumentBridges();"),
+    "装壳不再受开关门控（默认必须关：证人绝不变成破坏者）");
+  return { gated: true };
+});
+
+const totalChecks = failures.length ? null : 8;
+console.log(failures.length ? `FAILURES: ${failures.join(", ")}` : `ALL ${totalChecks} PASS (realFsUnderlyingCalls=${realFsCalls}, sqliteQueries=${sqliteQueries})`);

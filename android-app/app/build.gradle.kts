@@ -23,8 +23,8 @@ android {
         applicationId = "cn.zcode.mobile"
         minSdk = 26
         targetSdk = 34
-        versionCode = 71
-        versionName = "0.7.7"
+        versionCode = 72
+        versionName = "0.7.8"
     }
 
     // 安装包命名规则：应用名＋版本号（aZCode-0.3.2.apk），不随 buildType 变。

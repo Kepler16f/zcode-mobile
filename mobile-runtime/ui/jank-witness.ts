@@ -68,7 +68,7 @@ const BRIDGE_FAMILIES: Array<{ global: string; family: string; methods: string[]
   { global: "zcodeSqlite", family: "sqlite", methods: ["open", "close", "exec", "query"] },
   { global: "zcodeExec", family: "exec", methods: ["exec"] },
   { global: "zcodeBrowser", family: "browser", methods: ["open", "navigate", "back", "read", "close"] },
-  { global: "zcodeDevice", family: "device", methods: ["openExternal", "execL1", "execL2", "allFilesGranted", "deviceInfo"] },
+  { global: "zcodeDevice", family: "device", methods: ["openExternal", "execL1", "execL2", "allFilesGranted", "deviceInfo", "openAllFilesPermission", "externalStorageRoot"] },
   { global: "zcodeGitHttp", family: "githttp", methods: ["call"] },
 ];
 
@@ -169,16 +169,41 @@ function flushBridgeStats(): void {
   callsSinceFlush = 0;
 }
 
-function instrumentOne(family: string, method: string, fn: (...args: unknown[]) => unknown) {
+/**
+ * 包装一个桥方法。第二参 recv 是**原始宿主对象**：Java 桥方法对 receiver 敏感（0.7.7 装机
+ * 事故：壳替换全局后，调用点以壳为 this 调 fn.apply(this)——真机 Chromium 判非法调用，
+ * 所有桥消费方集体失败，侧栏/会话/文件全空＝"数据没了"，而库里的数据完好无损。Node 假桥
+ * 是无状态普通函数，冒烟验不出这条——桌面绿灯盖不住真机的老配方。）这里永远以 orig 为
+ * receiver 转发，调用点的 this 不再参与。
+ */
+function instrumentOne(
+  family: string,
+  method: string,
+  fn: (...args: unknown[]) => unknown,
+  recv: unknown,
+) {
   return function (this: unknown, ...args: unknown[]) {
     const t0 = Number(performance.now());
     try {
-      return fn.apply(this, args);
+      return fn.apply(recv, args);
     } finally {
       recordBridge(family, labelFor(family, method, args), Number(performance.now()) - t0);
     }
   };
 }
+
+/**
+ * 无副作用的活体探针：包完一族后用"必回错串"的调用摸一次通道——返回了（哪怕是错误 JSON）
+ * 说明 receiver 绑定正确、桥没被包死；**抛出异常**说明这个壳会把全家点掉，立刻回退成原对象。
+ * 只有能安全探针的族参与：fs/tree/githttp 拿非法请求打 call（原生回错误字符串，不落盘不开网），
+ * device 拿 deviceInfo（纯读）。sqlite/exec/browser 没有无副作用入口，靠 bind-orig 修复本身。
+ */
+const PROBE: Record<string, { method: string; arg: unknown }> = {
+  fs: { method: "call", arg: '{"op":"__probe__"}' },
+  tree: { method: "call", arg: '{"op":"__probe__"}' },
+  githttp: { method: "call", arg: '{"op":"__probe__"}' },
+  device: { method: "deviceInfo", arg: undefined },
+};
 
 /**
  * 给一个桥对象装壳。首选**整包替换全局**（globalThis.zcodeFs = 壳对象）：所有 JS 侧调用方
@@ -200,8 +225,10 @@ function instrumentBridges(): void {
         try { if (typeof orig[k] === "function") names.add(k); } catch { /* JavaObject 属性读取可能抛 */ }
       }
       if (!names.size) continue;
-      const wrapped: Record<string, unknown> = {};
-      for (const name of names) wrapped[name] = instrumentOne(spec.family, name, orig[name]);
+      // 壳用 Object.create(orig)：兜底表/枚举没覆盖到的方法沿原型链直达宿主对象，调用点
+      // 永远拿得到全量方法（方法表漂移不再可能吃掉功能）；被点的走计时壳、bind 回 orig。
+      const wrapped: Record<string, unknown> = Object.create(orig) as Record<string, unknown>;
+      for (const name of names) wrapped[name] = instrumentOne(spec.family, name, orig[name], orig);
       // 方案 A：替换全局。
       let done = false;
       try {
@@ -210,7 +237,28 @@ function instrumentBridges(): void {
       } catch {
         done = false;
       }
-      if (done) { wrappedFamilies += 1; continue; }
+      if (done) {
+        // 活体探针：包坏了立刻回退（宁可证人少一族，不能把数据通道包没了）。
+        let ok = true;
+        const probe = PROBE[spec.family];
+        if (probe) {
+          try {
+            (wrapped[probe.method] as (a?: unknown) => unknown)(probe.arg);
+          } catch {
+            ok = false;
+          }
+          if (!ok) {
+            try {
+              g[spec.global] = orig;
+            } catch {
+              /* 回退也写不进：留着探针已证伪的壳比没有壳更糟——但写不进说明原赋值根本未生效 */
+            }
+            continue;
+          }
+        }
+        wrappedFamilies += 1;
+        continue;
+      }
       // 方案 B：原地换方法（先试，成功几个算几个）。
       let patched = 0;
       for (const name of names) {
@@ -227,11 +275,29 @@ function instrumentBridges(): void {
 }
 
 let installed = false;
+
+/**
+ * 计时壳的开关（0.7.8 止血，用户装机报"0.7.7 装完工作区/数据全空、覆盖回 0.7.6 就好"）：
+ * 壳把每个桥换成 JS 壳对象——真机 Java 桥对象的可枚举性/可写性/receiver 语义哪一层和 Node
+ * 假桥不一样，桌面冒烟都验不到（[[device-blank-list-no-more-guessing]] 的老配方）。0.7.7 的
+ * boot 路径变更里只有它会全局改写桥引用，且数据实际无恙、换包即恢复——**证人绝不能变成破坏者**。
+ * 默认关（心跳/worst/phase 这套 0.4.10 已验证安全的形态照常运行）；排查卡死要 bridges/slowCalls
+ * 时，把 localStorage["zcode-mobile.jank.shell"] 置 "1" 重启即开（开壳后若再出现数据异常，
+ * 关掉开关立刻回到 0.7.6 行为，同时 M13 的读数还能带走现场）。
+ */
+const SHELL_FLAG_KEY = "zcode-mobile.jank.shell";
+
 export function installJankWitness(): void {
   if (installed || !globalThis.document) return;
   installed = true;
   // 装壳必须先于任何端口抓桥引用（entry.tsx 在 createMobileServices 之前调本函数）。
-  instrumentBridges();
+  let shellOn = false;
+  try {
+    shellOn = globalThis.localStorage?.getItem(SHELL_FLAG_KEY) === "1";
+  } catch {
+    shellOn = false;
+  }
+  if (shellOn) instrumentBridges();
   let last = Number(performance.now());
   let ticks = 0;
   // setInterval 而非 rAF：主线程堵死时 rAF 根本不排帧，量不出 gap；setTimeout 的迟到本身就是证据。
