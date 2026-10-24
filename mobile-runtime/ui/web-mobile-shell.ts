@@ -332,6 +332,11 @@ function attachObservers(): void {
     // （进设置/插件市场这类整页替换，把 #sidebar 连根卸掉）只有这里看得见——面板自己的
     // observer 随节点离场失效。sync 幂等且有 lastKey 短路，流式期间的 DOM 抖动只做
     // querySelector + 早退；rAF 合帧防高频重排。
+    // 0.7.7 补（用户报"进设置变暗没完全解决"）：RootWorkspaceContent 把覆盖标记做成
+    // **同一元素上的属性翻转**（data-root-workspace-surface="inert"⇄"interactive"），设置层
+    // 一旦挂载过就常驻——第二次进设置零 childList 变化，childList-only 的本观察器永不触发，
+    // sync() 里 coveredBySettingsLayer() 判对了也没有人叫醒它，遮罩继续压在设置层上＝偶发变暗。
+    // 属性必须进同一批观察：attributeFilter 收窄到这一个键，开销可忽略。
     let navScheduled = false;
     const navMo = new MutationObserver(() => {
       if (navScheduled) return;
@@ -341,7 +346,12 @@ function attachObservers(): void {
         sync();
       });
     });
-    navMo.observe(d.body, { childList: true, subtree: true });
+    navMo.observe(d.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-root-workspace-surface"],
+    });
     // 顶栏证人（0.4.7）：#sidebar 与浮层按钮同一棵 React 树挂载，settle 时两者都在 DOM 里了。
     // 拍三枪（0/1.5s/4s）覆盖"按钮晚于侧栏挂载"的宿主差异；旋转/缩放由 resize 那条补记。
     recordTopbarDiag();

@@ -873,6 +873,8 @@ export async function runDeviceChecks(rt) {
   // jank-witness 的心跳量相邻回调的实际 gap，≥800ms 记一笔（时间/阻塞毫秒/当时在跑什么 phase）。
   // 读法：total>0 ⇒ 这台设备发生过可感冻结；worst 列表里 gap 最大的那几次带 phase 标（tool:Grep 等）
   // 直接回答"堵在哪一段"。与 M12 同纪律：先交证人，修复按读数来，不盲调。
+  // 证人增强轮：同一诊断键里多了 bridges（族×操作的计数/总耗时/最慢单次）与 slowCalls
+  // （≥400ms 的单个桥调用采样，worst 12）——gap 说"堵了多久"，这两个说"堵在哪个桥的哪一下"。
   await check("M13：主线程冻结采样（卡死发生过的证据）", () => {
     let diag = null;
     try {
@@ -888,10 +890,16 @@ export async function runDeviceChecks(rt) {
       maxGapMs: diag.maxGapMs,
       lastPhase: diag.lastPhase,
       worst: (diag.worst ?? []).slice(0, 5),
+      // 桥族计数：bridges[族][op] = {calls, totalMs, maxMs, maxAt}——"Grep 时 fs.readdir 44 次
+      // 共 2100ms、单次最慢 480ms"这类归因直接可读。旧读数没有这两个字段，缺省 null（好事）。
+      bridges: diag.bridges ?? null,
+      slowCalls: (diag.slowCalls ?? []).slice(0, 8),
       note:
         diag.total === 0
-          ? "没有 ≥800ms 的主线程阻塞记录（若用户仍报卡死，症状多半在渲染/焦点层，看 M12）"
-          : `记录过 ${diag.total} 次 ≥800ms 阻塞，最长 ${diag.maxGapMs}ms；worst 的 phase 指向归因`,
+          ? (diag.slowCalls ?? []).length
+            ? "心跳没抓到 ≥800ms 的整段阻塞，但有 ≥400ms 的单个桥调用（看 slowCalls）——症状若出现在工具执行时，多半是多次慢调用连排"
+            : "没有 ≥800ms 的主线程阻塞记录，也没有 ≥400ms 的单次桥调用（若用户仍报卡死，症状多半在渲染/焦点层，看 M12）"
+          : `记录过 ${diag.total} 次 ≥800ms 阻塞，最长 ${diag.maxGapMs}ms；worst 的 phase 指向归因，slowCalls/bridges 指到具体桥操作`,
     };
   });
 

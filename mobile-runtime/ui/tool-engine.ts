@@ -16,7 +16,7 @@
 // 状态写 localStorage（与自检页同源）：agentLog 切页即丢，"引擎到底加载没有"必须进装机报告。
 import type { ModelToolCall, ModelToolSpec } from "./model-stream.js";
 import { createGitFs } from "../compat/git-fs-adapter.mjs";
-import { makeGitTool } from "./git-tool.js";
+import { GIT_ACTIONS, makeGitTool } from "./git-tool.js";
 import { sanitizeToolArguments } from "./tool-sanitize.js";
 import { browserControlEnabled, BROWSER_CONTROL_EVENT } from "./plugins-mobile.js";
 import { makeFetchTool } from "./fetch-tool.js";
@@ -517,7 +517,8 @@ export function createToolEngineFactory(
             if (/(?:^|[;&|]+\s*|\b(?:sudo|env)\s+)git\s/.test(command)) {
               const hint =
                 "端侧 bash 没有 git 二进制（Android 沙箱不带版本控制工具）。git 操作请改用 **Git 工具**" +
-                "（action: init/clone/status/add/commit/log/branch，纯 JS 实现；" +
+                // 动作清单从 git-tool 的单一事实源派生（0.7.6 装机"未知 action"案：别再手抄一份漂移清单）。
+                `（action: ${GIT_ACTIONS.join("/")}，纯 JS 实现；` +
                 (workspacePath.startsWith("/work")
                   ? "私有盘工作区直跑）。"
                   : "SAF 工作区会自动经终端镜像在私有盘上加速执行并回写工作区，首次较慢）。");

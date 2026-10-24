@@ -160,6 +160,44 @@ check("M12 证人：垫片计数写进 localStorage（≥1）", touchShim.ok && 
 // 且设置层真的在（别拿"设置页没渲染"当成遮罩收对了）。
 await edgeSwipe(10, 100);
 await page.waitForTimeout(700);
+
+// ── 0.7.7 纯属性翻转判据（"进设置偶发变暗"的残留路径）──
+// 上游 RootWorkspaceContent 在**同一元素**上翻转 data-root-workspace-surface="inert"⇄
+// "interactive"；设置层挂载过一次后常驻 DOM——再进设置零节点增删，0.7.1 的收遮罩判定
+// （coveredBySettingsLayer）虽然对，但 childList-only 的导航观察器不会为属性变化叫醒
+// sync，遮罩压回设置层上＝偶发发暗。这里手动翻属性（零 DOM 增删）钉死观察器接线：
+// 置 inert → 遮罩必须自动离场；还原 → 必须按抽屉真实状态重新投影（遮罩回来）。
+const attrRace = await page.evaluate(async () => {
+  const raf = (ms) => new Promise((res) => setTimeout(res, ms));
+  const surface = document.querySelector("[data-root-workspace-surface]");
+  const lit = () => {
+    const el = document.getElementById("zcode-narrow-scrim");
+    if (!el) return false;
+    const s = getComputedStyle(el);
+    return s.display !== "none" && s.opacity !== "0";
+  };
+  if (!surface) return { ok: false, why: "无 surface 属性元素（上游结构变了？判据需同步更新）" };
+  const wasLit = lit();
+  const prev = surface.getAttribute("data-root-workspace-surface");
+  surface.setAttribute("data-root-workspace-surface", "inert");
+  await raf(300);
+  const hiddenAfterInert = !lit();
+  surface.setAttribute("data-root-workspace-surface", prev || "interactive");
+  await raf(300);
+  const relitAfterRestore = lit();
+  return { ok: true, wasLit, hiddenAfterInert, relitAfterRestore };
+});
+check(
+  "纯属性覆盖（零 DOM 增删）：遮罩自动离场，不再偶发压暗设置层",
+  attrRace.ok === true && attrRace.wasLit === true && attrRace.hiddenAfterInert === true,
+  JSON.stringify(attrRace),
+);
+check(
+  "覆盖解除：按抽屉状态重新投影（遮罩该回来就回来）",
+  attrRace.ok === true && attrRace.wasLit === true && attrRace.relitAfterRestore === true,
+  JSON.stringify(attrRace),
+);
+
 const settingsBtn = page.locator('[data-testid="task-settings-button"]').first();
 if (await settingsBtn.count()) {
   await settingsBtn.scrollIntoViewIfNeeded().catch(() => {});

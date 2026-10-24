@@ -8,9 +8,21 @@
 //  - 提交身份端上没有 git config 可读：固定 aZCode <azcode@local>，commit 入参可覆盖。
 //  - 动态 import：entry.js 不为 git 付体积，首次调用才拉 chunk。
 import { createGitFs } from "../compat/git-fs-adapter.mjs";
+import { stripInvisibleChars } from "./tool-sanitize.js";
 
 const GIT_TOOL = "Git";
 const DEFAULT_AUTHOR = { name: "aZCode", email: "azcode@local" };
+
+/**
+ * action 集合的**单一事实源**（0.7.6 装机案：模型传 "Clone"/"clone " /夹零宽字符，
+ * 任意 Git 调用报"未知 action"）。schema enum、入口校验、分发分支、错误文案的
+ * 支持清单全部从这里派生；分发表又用 Record<GitActionName, …> 把"键 ↔ 分支"钉死在
+ * tsc 上——加/删动作只改这一处，三张手写清单互相漂移的老路从此封死。
+ */
+export const GIT_ACTIONS = [
+  "init", "clone", "status", "add", "commit", "log", "branch", "remote", "push", "pull", "fetch",
+] as const;
+export type GitActionName = (typeof GIT_ACTIONS)[number];
 
 // isomorphic-git 的命令都是 `({fs, dir, ...}) => Promise<...>`；类型面只声明用到的窄形状
 // （tsconfig 开了 noUncheckedIndexedAccess，索引签名会把每次调用判 undefined，这里点名方法）。
@@ -236,12 +248,68 @@ export interface GitStageControl {
   writeBack(snapshot: unknown): Promise<{ failed: number; errors: string[] } | null>;
 }
 
+/**
+ * action 入口归一化（0.7.6 装机"未知 action"案的修复面）：剥隐形字符 → trim → 小写。
+ * tool-engine.execute 已在 arguments JSON **原文**上过一次 sanitizeToolArguments，但那道闸
+ * 只覆盖 agent 一个入口，且码点表（18 枚）之外的隐形字符照样漏网——这里对取值再补一刀，
+ * 任何直连 handler 的路径（冒烟/自检/未来入口）形状等价。大小写与首尾空白则是净化管不着、
+ * 模型又高频提交的形态（"Clone" / "clone "），严格 === 会把它们全打进 default 分支。
+ */
+export function normalizeGitAction(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  return stripInvisibleChars(raw).trim().toLowerCase();
+}
+
+export function isGitActionName(action: string): action is GitActionName {
+  return (GIT_ACTIONS as readonly string[]).includes(action);
+}
+
+/**
+ * 把收到的值渲染成"截图后仍然可读"的码点形式：可打印 ASCII 原样保留，其余
+ * （空格、制表/换行、零宽、双向控制）一律换成 U+XXXX 记号。装机案的错误文案是
+ * `未知 action：<值>（...）`——值若全是空白/隐形字符，截图里就成了"未知 action：（...）"，
+ * 看不出模型传了什么，锅没法定。
+ */
+export function printableCodepoints(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp >= 0x21 && cp <= 0x7e) {
+      out += ch;
+    } else {
+      if (out.length > 0 && !out.endsWith(" ")) out += " ";
+      out += `U+${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+    }
+  }
+  return out.trimEnd();
+}
+
+/** 未知 action 的报错三件套：收到什么（码点可打印）+ 归一化成什么 + 支持什么。 */
+function unknownActionError(raw: string, normalized: string): string {
+  const head =
+    raw.length === 0
+      ? "未知 action：未收到（空字符串或非字符串入参）"
+      : `未知 action：收到值 "${printableCodepoints(raw)}"`;
+  let normalizedNote = "";
+  if (raw.length > 0 && normalized !== raw) {
+    normalizedNote =
+      normalized.length === 0
+        ? "，归一化后为空（原值只有空白/隐形字符）"
+        : `，归一化后 "${printableCodepoints(normalized)}"`;
+  }
+  return (
+    `${head}${normalizedNote}（空白/隐形字符以 U+XXXX 码点显示）。` +
+    `支持的动作：${GIT_ACTIONS.join("/")}。` +
+    `大小写、首尾空白与零宽/双向字符已自动处理，这个值仍不在表内（如 checkout/diff 不是本工具的能力）——请从支持清单选一个重发。`
+  );
+}
+
 export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStageControl) {
   return {
     metadata: {
       name: GIT_TOOL,
       description:
-        "内置 git（纯 JS 实现）：init/clone/status/add/commit/log/branch/push/pull/fetch/remote。" +
+        `内置 git（纯 JS 实现）：${GIT_ACTIONS.join("/")}。` +
         "提交身份默认 aZCode <azcode@local>（commit 入参可传 author.name/email 覆盖）。" +
         "SAF 工作区（/mnt/…）自动经终端镜像在私有盘上加速执行并把结果回写工作区，" +
         "大仓库首次会慢（全量镜像）。" +
@@ -252,8 +320,9 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
         properties: {
           action: {
             type: "string",
-            enum: ["init", "clone", "status", "add", "commit", "log", "branch", "remote", "push", "pull", "fetch"],
+            enum: [...GIT_ACTIONS],
             description:
+              "动作名对大小写不敏感，首尾空白与零宽/双向字符会自动剥除。" +
               "init=在当前工作区建 .git；clone=url 克隆到 dir（必传 url）；status=改动清单；add=暂存（path 或 '.'）；" +
               "commit=message 提交暂存；log=最近 depth 条（默认 20）；branch=分支名列表 / ref 建分支+切换；" +
               "remote=url 添加名为 remote 的远端 / 无 url 列出远端；push=推送当前分支到 remote（默认 origin）；" +
@@ -284,7 +353,12 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
     },
     handler: async (raw: unknown) => {
       const input = (raw ?? {}) as Record<string, unknown>;
-      const action = typeof input.action === "string" ? input.action : "";
+      // action 入口归一化 + 表外短路（0.7.6 装机"未知 action"案）：非法动作直接拒——
+      // 不为它付 loadGit，也不触发 SAF 镜像两拍（首次全量物化可达秒级～十秒级）。
+      // 错误文案带收到值的码点形式，截图即可定责（模型拼错 vs 入参夹不可见字符）。
+      const rawAction = typeof input.action === "string" ? input.action : "";
+      const action = normalizeGitAction(rawAction);
+      if (!isGitActionName(action)) throw new Error(unknownActionError(rawAction, action));
       const core = await loadGit();
       const dir = workspacePath;
       // SAF 纪律两拍（见 GitStageControl）：镜像在场 → 拍快照 → 跑命令 → diff 回写。
@@ -317,185 +391,202 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
   };
 }
 
-async function runGitAction(
+/** 老 runGitAction 的参数面收进上下文对象，让分发表每项签名一致（不新增动作，纯一致性修复）。 */
+interface GitActionCtx {
+  core: GitModule;
+  fs: unknown;
+  dir: string;
+  input: Record<string, unknown>;
+}
+
+/**
+ * 分发表：键与 GIT_ACTIONS 一一对应——Record<GitActionName, …> 让 tsc 对"漏分支"
+ * （缺键）与"多分支"（字面量多键）都报错，enum/校验/分发从此不靠人肉同步。
+ * 分支体为原 switch case 逐字平移，行为零改动。
+ */
+const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<string>> = {
+  init: async ({ core, fs, dir }) => {
+    await core.init({ fs, dir });
+    return `已在 ${dir} 初始化 git 仓库（.git 已创建，默认分支 master）。`;
+  },
+  clone: async ({ core, fs, dir, input }) => {
+    const url = typeof input.url === "string" ? input.url.trim() : "";
+    if (!url.startsWith("https://") && !url.startsWith("http://")) {
+      throw new Error(`clone 需要 http/https 地址：${url}`);
+    }
+    const http = await loadGitHttp();
+    const subdir = typeof input.dir === "string" && input.dir.trim() ? input.dir.trim() : "";
+    // 附着模式（0.6.8，装机"clone 到子目录再搬 .git 到根"的脆弱舞蹈）：dir="." 或省略
+    // = 把历史挂到**当前目录**：init → 连 origin → fetch → 对齐 HEAD 到远端默认分支，
+    // **不 checkout**（现有快照文件原地不动，statusMatrix 会如实报差异）。
+    // 这正是"目录已有文件又想有 git 历史"的正解——isomorphic-git 的 clone 对非空目录
+    // 会把远端文件盖下来，模型不敢用才去搬 .git，搬的过程中 refs 布局一乱就全崩。
+    if (!subdir || subdir === "." || subdir === "./") {
+      await core.init({ fs, dir });
+      await core.addRemote({ fs, dir, remote: "origin", url, force: true });
+      const info = await core
+        .getRemoteInfo({ http, url, onAuth: authFrom(input) })
+        .catch(() => ({ HEAD: undefined, refs: undefined }));
+      // HEAD 形如 "ref: refs/heads/main"；拿不到默认分支就退回 fetch 后再猜。
+      const headRef = typeof info.HEAD === "string" ? /^ref: refs\/heads\/(.+)$/.exec(info.HEAD)?.[1] : undefined;
+      await core.fetch({ fs, http, dir, remote: "origin", depth: 50, onAuth: authFrom(input) });
+      const branches = (await core.listBranches({ fs, dir })) as string[];
+      const target = headRef && branches.includes(headRef)
+        ? headRef
+        : branches.includes("main")
+          ? "main"
+          : branches.includes("master")
+            ? "master"
+            : branches[0] ?? "";
+      if (target) {
+        const sha = await core.expandRef({ fs, dir, ref: `refs/heads/${target}` });
+        await core.writeRef({ fs, dir, ref: "HEAD", value: `ref: refs/heads/${target}`, force: true });
+        return `已把 ${url} 的历史挂到 ${dir}（分支 ${target} @ ${String(sha ?? "?").slice(0, 10)}，未改动现有文件；用 status 看差异）。`;
+      }
+      return `已连接 ${url} 并 fetch，但本地没有可对齐的分支（远端可能是空仓库）。`;
+    }
+    const target = `${dir}/${subdir.replace(/^\/+/, "")}`;
+    await core.clone({ fs, http, dir: target, url, singleBranch: false, depth: 50 });
+    const branches = ((await core.listBranches({ fs, dir: target }).catch(() => [])) as string[]) ?? [];
+    return `已克隆 ${url} → ${target}（分支：${branches.slice(0, 5).join("、") || "?"}）。`;
+  },
+  status: async ({ core, fs, dir }) => {
+    const matrix = (await core.statusMatrix({ fs, dir })) as StatusRow[];
+    // statusMatrix 行 = [file, head, workdir, stage]，各位 0/1/2（0=无 1=同 2=不同）。
+    const changed = matrix
+      .filter((row) => !(row[1] === row[2] && row[2] === row[3]))
+      .map((row) => {
+        const [file, head, workdir] = row;
+        const mark = head === 0 ? "  new file" : workdir === 0 ? "  deleted" : workdir === 2 && head === 1 ? "  modified" : "  changed";
+        return `${file}${mark}`;
+      });
+    const { branch } = await repoContext(core, fs, dir);
+    return `分支：${branch}\n改动 ${changed.length} 个文件：\n${changed.slice(0, 200).join("\n") || "（干净）"}`;
+  },
+  add: async ({ core, fs, dir, input }) => {
+    const rawPath = typeof input.path === "string" && input.path.trim() ? input.path.trim() : ".";
+    if (rawPath === ".") {
+      await core.add({ fs, dir, filepath: "." });
+      return "已暂存全部改动（add .）。";
+    }
+    for (const p of rawPath.split(/[,\s]+/).filter(Boolean)) {
+      await core.add({ fs, dir, filepath: p.replace(/^\/+/, "") });
+    }
+    return `已暂存：${rawPath}`;
+  },
+  commit: async ({ core, fs, dir, input }) => {
+    const message = typeof input.message === "string" ? input.message.trim() : "";
+    if (!message) throw new Error("commit 需要 message");
+    const sha = await core.commit({
+      fs,
+      dir,
+      message,
+      author: {
+        name: typeof input.authorName === "string" && input.authorName.trim() ? input.authorName.trim() : DEFAULT_AUTHOR.name,
+        email: typeof input.authorEmail === "string" && input.authorEmail.trim() ? input.authorEmail.trim() : DEFAULT_AUTHOR.email,
+      },
+    });
+    return `已提交：${String(sha).slice(0, 10)} — ${message}`;
+  },
+  log: async ({ core, fs, dir, input }) => {
+    const depth = typeof input.depth === "number" && input.depth > 0 ? Math.min(input.depth, 100) : 20;
+    const commits = (await core.log({ fs, dir, depth })) as LogEntry[];
+    return commits
+      .map((c) => `${String(c.oid).slice(0, 10)} ${c.commit.author.name} ${c.commit.author.timestamp ? new Date(c.commit.author.timestamp * 1000).toISOString().slice(0, 16) : ""}\n  ${c.commit.message.split("\n")[0]}`)
+      .join("\n");
+  },
+  branch: async ({ core, fs, dir, input }) => {
+    const ref = typeof input.ref === "string" && input.ref.trim() ? input.ref.trim() : "";
+    if (ref) {
+      await core.branch({ fs, dir, ref, checkout: true });
+      return `已创建并切换到分支 ${ref}。`;
+    }
+    const branches = (await core.listBranches({ fs, dir })) as string[];
+    const { branch } = await repoContext(core, fs, dir);
+    return `当前分支：${branch}\n全部分支：${branches.join("、")}`;
+  },
+  remote: async ({ core, fs, dir, input }) => {
+    const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : "";
+    const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
+    if (url) {
+      if (!url.startsWith("https://") && !url.startsWith("http://")) {
+        throw new Error(`remote 需要 http/https 地址：${url}`);
+      }
+      await core.addRemote({ fs, dir, remote: remoteName, url, force: input.force === true });
+      return `远端 ${remoteName} 已指向 ${url}。`;
+    }
+    const remotes = (await core.listRemotes({ fs, dir })) as Array<{ remote: string; url: string }>;
+    return remotes.length > 0
+      ? remotes.map((r) => `${r.remote}\t${r.url}`).join("\n")
+      : "（还没有配置远端——用 action=remote + url 添加。）";
+  },
+  push: async ({ core, fs, dir, input }) => {
+    const http = await loadGitHttp();
+    const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
+    const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
+    const branch = (await core.currentBranch({ fs, dir, fullname: false })) as string | null;
+    const pushResult = (await core.push({
+      fs,
+      http,
+      dir,
+      remote: remoteName,
+      ...(url ? { url } : {}),
+      ref: branch ?? undefined,
+      force: input.force === true,
+      onAuth: authFrom(input),
+    })) as { ok?: boolean; refs?: Record<string, string> };
+    // 凭据失败时 isomorphic-git 会抛 UnexpectedServerResponse/401——如实上抛给模型，
+    // 它能拿着错误原文去向用户要令牌。
+    return `已推送 ${branch ?? "?"} → ${remoteName}${pushResult.ok === false ? "（远端返回 ok=false）" : ""}。`;
+  },
+  pull: async ({ core, fs, dir, input }) => {
+    const http = await loadGitHttp();
+    const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
+    const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
+    const branch = (await core.currentBranch({ fs, dir, fullname: false })) as string | null;
+    const pullResult = (await core.pull({
+      fs,
+      http,
+      dir,
+      remote: remoteName,
+      ...(url ? { url } : {}),
+      ...(branch ? { ref: input.ref && typeof input.ref === "string" && input.ref.trim() ? input.ref.trim() : branch } : {}),
+      fastForward: true, // 只快进：分叉时如实报错让模型决断，不静默造合并提交
+      onAuth: authFrom(input),
+      author: DEFAULT_AUTHOR,
+    })) as { fetchHead?: string; newHead?: string };
+    return `已拉取 ${remoteName}（${branch ?? "?"}）${pullResult.newHead ? `，更新到 ${String(pullResult.newHead).slice(0, 10)}` : "，已是最新"}。`;
+  },
+  fetch: async ({ core, fs, dir, input }) => {
+    const http = await loadGitHttp();
+    const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
+    const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
+    const depth = typeof input.depth === "number" && input.depth > 0 ? input.depth : undefined;
+    await core.fetch({
+      fs,
+      http,
+      dir,
+      remote: remoteName,
+      ...(url ? { url } : {}),
+      ...(depth ? { depth } : {}),
+      onAuth: authFrom(input),
+    });
+    return `已从 ${remoteName} 取回远端引用（未合并——用 branch/pull 落地）。`;
+  },
+};
+
+/**
+ * 分发入口：action 必须已是归一化且过校验的 GitActionName（handler 入口短路，表外字符串
+ * 走不到这里；分发表键又被 Record 类型钉成 GIT_ACTIONS——三层同源）。
+ */
+export async function runGitAction(
   core: GitModule,
   fs: unknown,
   dir: string,
-  action: string,
+  action: GitActionName,
   input: Record<string, unknown>,
 ): Promise<string> {
-  switch (action) {
-    case "init": {
-      await core.init({ fs, dir });
-      return `已在 ${dir} 初始化 git 仓库（.git 已创建，默认分支 master）。`;
-    }
-    case "clone": {
-      const url = typeof input.url === "string" ? input.url.trim() : "";
-      if (!url.startsWith("https://") && !url.startsWith("http://")) {
-        throw new Error(`clone 需要 http/https 地址：${url}`);
-      }
-      const http = await loadGitHttp();
-      const subdir = typeof input.dir === "string" && input.dir.trim() ? input.dir.trim() : "";
-      // 附着模式（0.6.8，装机"clone 到子目录再搬 .git 到根"的脆弱舞蹈）：dir="." 或省略
-      // = 把历史挂到**当前目录**：init → 连 origin → fetch → 对齐 HEAD 到远端默认分支，
-      // **不 checkout**（现有快照文件原地不动，statusMatrix 会如实报差异）。
-      // 这正是"目录已有文件又想有 git 历史"的正解——isomorphic-git 的 clone 对非空目录
-      // 会把远端文件盖下来，模型不敢用才去搬 .git，搬的过程中 refs 布局一乱就全崩。
-      if (!subdir || subdir === "." || subdir === "./") {
-        await core.init({ fs, dir });
-        await core.addRemote({ fs, dir, remote: "origin", url, force: true });
-        const info = await core
-          .getRemoteInfo({ http, url, onAuth: authFrom(input) })
-          .catch(() => ({ HEAD: undefined, refs: undefined }));
-        // HEAD 形如 "ref: refs/heads/main"；拿不到默认分支就退回 fetch 后再猜。
-        const headRef = typeof info.HEAD === "string" ? /^ref: refs\/heads\/(.+)$/.exec(info.HEAD)?.[1] : undefined;
-        await core.fetch({ fs, http, dir, remote: "origin", depth: 50, onAuth: authFrom(input) });
-        const branches = (await core.listBranches({ fs, dir })) as string[];
-        const target = headRef && branches.includes(headRef)
-          ? headRef
-          : branches.includes("main")
-            ? "main"
-            : branches.includes("master")
-              ? "master"
-              : branches[0] ?? "";
-        if (target) {
-          const sha = await core.expandRef({ fs, dir, ref: `refs/heads/${target}` });
-          await core.writeRef({ fs, dir, ref: "HEAD", value: `ref: refs/heads/${target}`, force: true });
-          return `已把 ${url} 的历史挂到 ${dir}（分支 ${target} @ ${String(sha ?? "?").slice(0, 10)}，未改动现有文件；用 status 看差异）。`;
-        }
-        return `已连接 ${url} 并 fetch，但本地没有可对齐的分支（远端可能是空仓库）。`;
-      }
-      const target = `${dir}/${subdir.replace(/^\/+/, "")}`;
-      await core.clone({ fs, http, dir: target, url, singleBranch: false, depth: 50 });
-      const branches = ((await core.listBranches({ fs, dir: target }).catch(() => [])) as string[]) ?? [];
-      return `已克隆 ${url} → ${target}（分支：${branches.slice(0, 5).join("、") || "?"}）。`;
-    }
-    case "status": {
-      const matrix = (await core.statusMatrix({ fs, dir })) as StatusRow[];
-      // statusMatrix 行 = [file, head, workdir, stage]，各位 0/1/2（0=无 1=同 2=不同）。
-      const changed = matrix
-        .filter((row) => !(row[1] === row[2] && row[2] === row[3]))
-        .map((row) => {
-          const [file, head, workdir] = row;
-          const mark = head === 0 ? "  new file" : workdir === 0 ? "  deleted" : workdir === 2 && head === 1 ? "  modified" : "  changed";
-          return `${file}${mark}`;
-        });
-      const { branch } = await repoContext(core, fs, dir);
-      return `分支：${branch}\n改动 ${changed.length} 个文件：\n${changed.slice(0, 200).join("\n") || "（干净）"}`;
-    }
-    case "add": {
-      const rawPath = typeof input.path === "string" && input.path.trim() ? input.path.trim() : ".";
-      if (rawPath === ".") {
-        await core.add({ fs, dir, filepath: "." });
-        return "已暂存全部改动（add .）。";
-      }
-      for (const p of rawPath.split(/[,\s]+/).filter(Boolean)) {
-        await core.add({ fs, dir, filepath: p.replace(/^\/+/, "") });
-      }
-      return `已暂存：${rawPath}`;
-    }
-    case "commit": {
-      const message = typeof input.message === "string" ? input.message.trim() : "";
-      if (!message) throw new Error("commit 需要 message");
-      const sha = await core.commit({
-        fs,
-        dir,
-        message,
-        author: {
-          name: typeof input.authorName === "string" && input.authorName.trim() ? input.authorName.trim() : DEFAULT_AUTHOR.name,
-          email: typeof input.authorEmail === "string" && input.authorEmail.trim() ? input.authorEmail.trim() : DEFAULT_AUTHOR.email,
-        },
-      });
-      return `已提交：${String(sha).slice(0, 10)} — ${message}`;
-    }
-    case "log": {
-      const depth = typeof input.depth === "number" && input.depth > 0 ? Math.min(input.depth, 100) : 20;
-      const commits = (await core.log({ fs, dir, depth })) as LogEntry[];
-      return commits
-        .map((c) => `${String(c.oid).slice(0, 10)} ${c.commit.author.name} ${c.commit.author.timestamp ? new Date(c.commit.author.timestamp * 1000).toISOString().slice(0, 16) : ""}\n  ${c.commit.message.split("\n")[0]}`)
-        .join("\n");
-    }
-    case "branch": {
-      const ref = typeof input.ref === "string" && input.ref.trim() ? input.ref.trim() : "";
-      if (ref) {
-        await core.branch({ fs, dir, ref, checkout: true });
-        return `已创建并切换到分支 ${ref}。`;
-      }
-      const branches = (await core.listBranches({ fs, dir })) as string[];
-      const { branch } = await repoContext(core, fs, dir);
-      return `当前分支：${branch}\n全部分支：${branches.join("、")}`;
-    }
-    case "remote": {
-      const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : "";
-      const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
-      if (url) {
-        if (!url.startsWith("https://") && !url.startsWith("http://")) {
-          throw new Error(`remote 需要 http/https 地址：${url}`);
-        }
-        await core.addRemote({ fs, dir, remote: remoteName, url, force: input.force === true });
-        return `远端 ${remoteName} 已指向 ${url}。`;
-      }
-      const remotes = (await core.listRemotes({ fs, dir })) as Array<{ remote: string; url: string }>;
-      return remotes.length > 0
-        ? remotes.map((r) => `${r.remote}\t${r.url}`).join("\n")
-        : "（还没有配置远端——用 action=remote + url 添加。）";
-    }
-    case "push": {
-      const http = await loadGitHttp();
-      const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
-      const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
-      const branch = (await core.currentBranch({ fs, dir, fullname: false })) as string | null;
-      const pushResult = (await core.push({
-        fs,
-        http,
-        dir,
-        remote: remoteName,
-        ...(url ? { url } : {}),
-        ref: branch ?? undefined,
-        force: input.force === true,
-        onAuth: authFrom(input),
-      })) as { ok?: boolean; refs?: Record<string, string> };
-      // 凭据失败时 isomorphic-git 会抛 UnexpectedServerResponse/401——如实上抛给模型，
-      // 它能拿着错误原文去向用户要令牌。
-      return `已推送 ${branch ?? "?"} → ${remoteName}${pushResult.ok === false ? "（远端返回 ok=false）" : ""}。`;
-    }
-    case "pull": {
-      const http = await loadGitHttp();
-      const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
-      const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
-      const branch = (await core.currentBranch({ fs, dir, fullname: false })) as string | null;
-      const pullResult = (await core.pull({
-        fs,
-        http,
-        dir,
-        remote: remoteName,
-        ...(url ? { url } : {}),
-        ...(branch ? { ref: input.ref && typeof input.ref === "string" && input.ref.trim() ? input.ref.trim() : branch } : {}),
-        fastForward: true, // 只快进：分叉时如实报错让模型决断，不静默造合并提交
-        onAuth: authFrom(input),
-        author: DEFAULT_AUTHOR,
-      })) as { fetchHead?: string; newHead?: string };
-      return `已拉取 ${remoteName}（${branch ?? "?"}）${pullResult.newHead ? `，更新到 ${String(pullResult.newHead).slice(0, 10)}` : "，已是最新"}。`;
-    }
-    case "fetch": {
-      const http = await loadGitHttp();
-      const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
-      const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
-      const depth = typeof input.depth === "number" && input.depth > 0 ? input.depth : undefined;
-      await core.fetch({
-        fs,
-        http,
-        dir,
-        remote: remoteName,
-        ...(url ? { url } : {}),
-        ...(depth ? { depth } : {}),
-        onAuth: authFrom(input),
-      });
-      return `已从 ${remoteName} 取回远端引用（未合并——用 branch/pull 落地）。`;
-    }
-    default:
-      throw new Error(`未知 action：${action}（init/clone/status/add/commit/log/branch/remote/push/pull/fetch）`);
-  }
+  return gitActionHandlers[action]({ core, fs, dir, input });
 }
 
 /** 入参里的凭据 → onAuth 应答；没有就返回 undefined（服务器拒绝时错误原文上抛）。 */

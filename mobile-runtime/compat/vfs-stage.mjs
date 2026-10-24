@@ -144,7 +144,13 @@ export async function ensureStaging(mountPath) {
   }
   const { files, dirs } = await walkTree(mount);
   native.mkdir(mount, { recursive: true });
-  for (const d of dirs) native.mkdir(d, { recursive: true });
+  // 每个目录一次**同步** mkdir 过桥（FsBridge 私有盘一次往返 ≈0.4ms，树侧更深时更贵）：
+  // 原来这里整串连发没有让出点，几百个目录就是几百次往返连成的死区——装机"物化阶段卡死"
+  // 的形状之一。walkTree 有 YIELD_EVERY、readMany 批间有 await，唯独这条漏了，补上同一条纪律。
+  for (let i = 0; i < dirs.length; i++) {
+    native.mkdir(dirs[i], { recursive: true });
+    if ((i + 1) % YIELD_EVERY === 0) await nextTick();
+  }
   let skipped = 0;
   for (let i = 0; i < files.length; i += READ_CHUNK) {
     const chunk = files.slice(i, i + READ_CHUNK);
