@@ -1,0 +1,470 @@
+{
+  "generatedAt": "2026-10-03T02:15:52.556Z",
+  "runtime": [
+    {
+      "name": "bundle 导出可用",
+      "ok": true,
+      "ms": 0.1,
+      "detail": {
+        "exports": 4
+      }
+    },
+    {
+      "name": "垫片 fs 读写（VFS）",
+      "ok": true,
+      "ms": 56.4,
+      "detail": {
+        "files": 7
+      }
+    },
+    {
+      "name": "registry 裁剪（只注册移动端 5 个工具）",
+      "ok": true,
+      "ms": 0.9,
+      "detail": {
+        "registered": [
+          "[\"0\",\"1\",\"2\",\"3\"]",
+          "[\"0\",\"1\",\"2\",\"3\",\"4\"]",
+          "[\"0\",\"1\",\"2\",\"3\"]",
+          "[\"0\",\"1\",\"2\",\"3\"]",
+          "[\"0\",\"1\",\"2\",\"3\"]"
+        ]
+      }
+    },
+    {
+      "name": "Read 工具",
+      "ok": true,
+      "ms": 26.8,
+      "detail": {
+        "bytes": 242,
+        "snippet": "{\"type\":\"text\",\"filePath\":\"/work/demo/src/index.ts\",\"content\":\"import { join } f"
+      }
+    },
+    {
+      "name": "Read 分段读取（offset/limit）",
+      "ok": true,
+      "ms": 10.9,
+      "detail": {
+        "startLine": 2,
+        "numLines": 1,
+        "totalLines": 4
+      }
+    },
+    {
+      "name": "Grep 上下文与 -o（端口不能忽略的入参）",
+      "ok": true,
+      "ms": 16.1,
+      "detail": {
+        "contextLines": 3,
+        "onlyMatching": 3
+      }
+    },
+    {
+      "name": "Grep multiline（-U 跨行）",
+      "ok": true,
+      "ms": 5.4,
+      "detail": {
+        "bytes": 69
+      }
+    },
+    {
+      "name": "Glob 工具",
+      "ok": true,
+      "ms": 9.3,
+      "detail": {
+        "hits": 1
+      }
+    },
+    {
+      "name": "Grep 工具（internal-cli 搜索后端）",
+      "ok": true,
+      "ms": 15.7,
+      "detail": {
+        "matched": 4
+      }
+    },
+    {
+      "name": "Write 工具",
+      "ok": true,
+      "ms": 34.4,
+      "detail": {
+        "bytes": 26
+      }
+    },
+    {
+      "name": "Edit 工具",
+      "ok": true,
+      "ms": 45.2,
+      "detail": {
+        "now": "{\"level\":\"high\"}"
+      }
+    },
+    {
+      "name": "HttpClientPort：GET 取回自身",
+      "ok": true,
+      "ms": 12.2,
+      "detail": {
+        "status": 200,
+        "bytes": 5230,
+        "ms": 11
+      }
+    },
+    {
+      "name": "HttpClientPort：egress=public 拦内网字面量",
+      "ok": true,
+      "ms": 1.2,
+      "detail": {
+        "blocked": 5,
+        "proto": "unsupported_protocol"
+      }
+    },
+    {
+      "name": "HttpClientPort：maxResponseBytes 触发 too_large",
+      "ok": true,
+      "ms": 6.4,
+      "detail": {
+        "code": "too_large"
+      }
+    },
+    {
+      "name": "ExecutionPort：没有原生桥时诚实失败",
+      "ok": true,
+      "ms": 0.8,
+      "detail": {
+        "status": "spawn_error",
+        "message": "当前宿主没有执行能力：端侧 shell 需要原生执行桥（Android: nat"
+      }
+    },
+    {
+      "name": "ExecutionPort：桥接层 argv/shell 两条路径",
+      "ok": true,
+      "ms": 0.7,
+      "detail": {
+        "routes": [
+          "shell",
+          "argv"
+        ],
+        "signalNotForwarded": true
+      }
+    },
+    {
+      "name": "SessionStore：WASM SQLite 上跑完整迁移",
+      "ok": false,
+      "ms": 389,
+      "error": "SQLite migration 0019_dwf_journal failed for /work/.zcode/db.sqlite"
+    },
+    {
+      "name": "SessionStore：会话/消息/part/todo 往返",
+      "ok": false,
+      "ms": 0.7,
+      "error": "Cannot read properties of null (reading 'createSession')"
+    }
+  ],
+  "device": [
+    {
+      "name": "宿主与内核",
+      "ok": true,
+      "ms": 0.9,
+      "detail": {
+        "webview": true,
+        "chromium": 118,
+        "crossOriginIsolated": false,
+        "device": "Subsystem for Android(TM)",
+        "app": "0.0.2(2)",
+        "sdkInt": 33,
+        "abis": "arm64-v8a,armeabi-v7a,armeabi",
+        "javaMaxMemoryMB": 192,
+        "pageSize": 4096
+      }
+    },
+    {
+      "name": "关卡10：SharedArrayBuffer 可构造",
+      "ok": true,
+      "ms": 0.2,
+      "detail": {
+        "byteLength": 8,
+        "viewLength": 1,
+        "aliasedArrayBuffer": true
+      }
+    },
+    {
+      "name": "关卡6：gb18030/gbk/big5 解码（FileSystemPort 编码契约）",
+      "ok": true,
+      "ms": 0.1,
+      "detail": {
+        "gb18030": "中文测试",
+        "gbk": "中文测试",
+        "big5": "中文"
+      }
+    },
+    {
+      "name": "关卡7：OPFS / IndexedDB / 配额",
+      "ok": true,
+      "ms": 0.2,
+      "detail": {
+        "indexedDB": true,
+        "opfs": "blocked: TypeError",
+        "quota": {
+          "usageMB": 0,
+          "quotaMB": 75566
+        }
+      }
+    },
+    {
+      "name": "关卡2：256 MB TypedArray 分配（低端机内存上限 R6）",
+      "ok": true,
+      "ms": 0.1,
+      "detail": {
+        "allocatedMB": 256,
+        "jsHeapLimitMB": 1083
+      }
+    },
+    {
+      "name": "关卡2：连续分配不 OOM（释放后回收）",
+      "ok": true,
+      "ms": 0.2,
+      "detail": {
+        "rounds": 8,
+        "chunkMB": 64
+      }
+    },
+    {
+      "name": "关卡3：Glob/Grep/Read 在 3000 文件量级的耗时",
+      "ok": true,
+      "ms": 0.2,
+      "detail": {
+        "files": 3000,
+        "bytesPerFileKB": 4,
+        "globMs": 405.9,
+        "grepMs": 7634.1,
+        "readMs": 11.3,
+        "grepWithinGate": false
+      }
+    },
+    {
+      "name": "关卡9 / L1：派生子进程能跑 /system/bin/sh",
+      "ok": true,
+      "ms": 1.2,
+      "detail": {
+        "shell": true,
+        "shellMs": 150,
+        "toybox": true,
+        "uname": ".\naarch64",
+        "python": "sh: python3: inaccessible or not found\nsh: python: inaccessible or not found\nNO_PYTHON"
+      }
+    },
+    {
+      "name": "关卡9 / L2：随包 ELF 的 execve 前置条件",
+      "ok": true,
+      "ms": 0.1,
+      "detail": {
+        "nativeLibraryDir": "/data/app/~~iq5MN6z--344smTApIRgVg==/cn.zcode.mobile-b2XKElcEwMo69hf-614Iaw==/lib/arm64",
+        "bundledToolchain": false,
+        "candidates": 0,
+        "hasLooseNativeLibs": false,
+        "note": "本机 NDK 是空占位，没有随包 ELF；execve 正对照要等 L2 立项目（§8 M4b）",
+        "verdict": "L2 未启用：本机 NDK 是空占位，没有随包 ELF 可 exec。正对照要等 §8 M4b 立项"
+      }
+    },
+    {
+      "name": "R16：SessionStore 用的存储引擎（异步启动迁移 openStartup）",
+      "ok": false,
+      "ms": 515.3,
+      "error": "SQLite migration 0019_dwf_journal failed for /zcode-mobile-selfcheck/db.sqlite"
+    },
+    {
+      "name": "L1：ExecutionPort 接原生执行桥（argv / shell / timeout）",
+      "ok": true,
+      "ms": 0.4,
+      "detail": {
+        "argv": "argv-ok",
+        "argvLiteral": "a; echo pwned",
+        "shell": "shell-ok | aarch64 | /",
+        "timeoutMs": 709,
+        "spawnError": "IOException: Cannot run program \"/system/bin/definitely-not-here\": error=2, No s",
+        "available": "[ acpi base64 basename blkdiscard blkid blockdev cal cat chattr chcon chgrp chmod chown chroot chrt cksum clear cmp comm cp cpio cut date dd devmem df diff dirname dmesg dos2unix du echo egrep env expand expr fallocate false fgrep file find flock fmt free freeramdisk fsfreeze fsync getconf getenforce getfattr getopt grep groups gunzip gzip head help hostname hwclock i2cdetect i2cdump i2cget i2cset iconv id ifconfig inotifyd insmod install ionice iorenice iotop kill killall ln load_policy log logname losetup ls lsattr lsmod lsof lspci lsusb makedevs md5sum microcom mkdir mkfifo mknod mkswap mktemp modinfo modprobe more mount mountpoint mv nbd-client nc netcat netstat nice nl nohup nproc nsenter od partprobe paste patch pgrep pidof ping ping6 pivot_root pkill pmap printenv printf prlimit ps pwd pwdx readelf readlink realpath renice restorecon rev rfkill rm rmdir rmmod rtcwake runcon sed sendevent seq setenforce setfattr setsid sha1sum sha224sum sha256sum sha384sum sha512sum sleep sort split stat strings stty swapoff swapon sync sysctl tac tail tar taskset tee test time timeout top touch tr traceroute traceroute6 true truncate tty tunctl uclampset ulimit umount uname uniq unix2dos unlink unshare uptime usleep uudecode uuencode uuidgen vconfig vi vmstat watch wc which whoami xargs xxd yes zcat  "
+      }
+    },
+    {
+      "name": "R18：vfs 落到真盘（zcodeFs 桥 + Bash 子进程看得见同一棵树）",
+      "ok": false,
+      "ms": 35.2,
+      "error": "rename EIO, permission denied: /work/fs-bridge/probe.txt"
+    },
+    {
+      "name": "R18：真盘桥协议（假桥按 FsBridge.kt 语义，桌面跑）",
+      "ok": true,
+      "ms": 0.2,
+      "detail": {
+        "skipped": true,
+        "reason": "设备已有真桥，假桥用例只在无 Android 宿主的桌面上有意义"
+      }
+    },
+    {
+      "name": "R16：原生桥协议 + 逐语句迁移（假桥 = 真 SQLite）",
+      "ok": true,
+      "ms": 0.2,
+      "detail": {
+        "skipped": true,
+        "reason": "设备已有原生桥，假桥用例只在无 Android 宿主的桌面上有意义",
+        "engine": "native-android-sqlite"
+      }
+    }
+  ],
+  "deviceRaw": {
+    "generatedAt": "2026-10-03T02:16:32.856Z",
+    "passed": 12,
+    "total": 14,
+    "results": [
+      {
+        "name": "宿主与内核",
+        "ok": true,
+        "ms": 0.9,
+        "detail": {
+          "webview": true,
+          "chromium": 118,
+          "crossOriginIsolated": false,
+          "device": "Subsystem for Android(TM)",
+          "app": "0.0.2(2)",
+          "sdkInt": 33,
+          "abis": "arm64-v8a,armeabi-v7a,armeabi",
+          "javaMaxMemoryMB": 192,
+          "pageSize": 4096
+        }
+      },
+      {
+        "name": "关卡10：SharedArrayBuffer 可构造",
+        "ok": true,
+        "ms": 0.2,
+        "detail": {
+          "byteLength": 8,
+          "viewLength": 1,
+          "aliasedArrayBuffer": true
+        }
+      },
+      {
+        "name": "关卡6：gb18030/gbk/big5 解码（FileSystemPort 编码契约）",
+        "ok": true,
+        "ms": 0.1,
+        "detail": {
+          "gb18030": "中文测试",
+          "gbk": "中文测试",
+          "big5": "中文"
+        }
+      },
+      {
+        "name": "关卡7：OPFS / IndexedDB / 配额",
+        "ok": true,
+        "ms": 0.2,
+        "detail": {
+          "indexedDB": true,
+          "opfs": "blocked: TypeError",
+          "quota": {
+            "usageMB": 0,
+            "quotaMB": 75566
+          }
+        }
+      },
+      {
+        "name": "关卡2：256 MB TypedArray 分配（低端机内存上限 R6）",
+        "ok": true,
+        "ms": 0.1,
+        "detail": {
+          "allocatedMB": 256,
+          "jsHeapLimitMB": 1083
+        }
+      },
+      {
+        "name": "关卡2：连续分配不 OOM（释放后回收）",
+        "ok": true,
+        "ms": 0.2,
+        "detail": {
+          "rounds": 8,
+          "chunkMB": 64
+        }
+      },
+      {
+        "name": "关卡3：Glob/Grep/Read 在 3000 文件量级的耗时",
+        "ok": true,
+        "ms": 0.2,
+        "detail": {
+          "files": 3000,
+          "bytesPerFileKB": 4,
+          "globMs": 405.9,
+          "grepMs": 7634.1,
+          "readMs": 11.3,
+          "grepWithinGate": false
+        }
+      },
+      {
+        "name": "关卡9 / L1：派生子进程能跑 /system/bin/sh",
+        "ok": true,
+        "ms": 1.2,
+        "detail": {
+          "shell": true,
+          "shellMs": 150,
+          "toybox": true,
+          "uname": ".\naarch64",
+          "python": "sh: python3: inaccessible or not found\nsh: python: inaccessible or not found\nNO_PYTHON"
+        }
+      },
+      {
+        "name": "关卡9 / L2：随包 ELF 的 execve 前置条件",
+        "ok": true,
+        "ms": 0.1,
+        "detail": {
+          "nativeLibraryDir": "/data/app/~~iq5MN6z--344smTApIRgVg==/cn.zcode.mobile-b2XKElcEwMo69hf-614Iaw==/lib/arm64",
+          "bundledToolchain": false,
+          "candidates": 0,
+          "hasLooseNativeLibs": false,
+          "note": "本机 NDK 是空占位，没有随包 ELF；execve 正对照要等 L2 立项目（§8 M4b）",
+          "verdict": "L2 未启用：本机 NDK 是空占位，没有随包 ELF 可 exec。正对照要等 §8 M4b 立项"
+        }
+      },
+      {
+        "name": "R16：SessionStore 用的存储引擎（异步启动迁移 openStartup）",
+        "ok": false,
+        "ms": 515.3,
+        "error": "SQLite migration 0019_dwf_journal failed for /zcode-mobile-selfcheck/db.sqlite"
+      },
+      {
+        "name": "L1：ExecutionPort 接原生执行桥（argv / shell / timeout）",
+        "ok": true,
+        "ms": 0.4,
+        "detail": {
+          "argv": "argv-ok",
+          "argvLiteral": "a; echo pwned",
+          "shell": "shell-ok | aarch64 | /",
+          "timeoutMs": 709,
+          "spawnError": "IOException: Cannot run program \"/system/bin/definitely-not-here\": error=2, No s",
+          "available": "[ acpi base64 basename blkdiscard blkid blockdev cal cat chattr chcon chgrp chmod chown chroot chrt cksum clear cmp comm cp cpio cut date dd devmem df diff dirname dmesg dos2unix du echo egrep env expand expr fallocate false fgrep file find flock fmt free freeramdisk fsfreeze fsync getconf getenforce getfattr getopt grep groups gunzip gzip head help hostname hwclock i2cdetect i2cdump i2cget i2cset iconv id ifconfig inotifyd insmod install ionice iorenice iotop kill killall ln load_policy log logname losetup ls lsattr lsmod lsof lspci lsusb makedevs md5sum microcom mkdir mkfifo mknod mkswap mktemp modinfo modprobe more mount mountpoint mv nbd-client nc netcat netstat nice nl nohup nproc nsenter od partprobe paste patch pgrep pidof ping ping6 pivot_root pkill pmap printenv printf prlimit ps pwd pwdx readelf readlink realpath renice restorecon rev rfkill rm rmdir rmmod rtcwake runcon sed sendevent seq setenforce setfattr setsid sha1sum sha224sum sha256sum sha384sum sha512sum sleep sort split stat strings stty swapoff swapon sync sysctl tac tail tar taskset tee test time timeout top touch tr traceroute traceroute6 true truncate tty tunctl uclampset ulimit umount uname uniq unix2dos unlink unshare uptime usleep uudecode uuencode uuidgen vconfig vi vmstat watch wc which whoami xargs xxd yes zcat  "
+        }
+      },
+      {
+        "name": "R18：vfs 落到真盘（zcodeFs 桥 + Bash 子进程看得见同一棵树）",
+        "ok": false,
+        "ms": 35.2,
+        "error": "rename EIO, permission denied: /work/fs-bridge/probe.txt"
+      },
+      {
+        "name": "R18：真盘桥协议（假桥按 FsBridge.kt 语义，桌面跑）",
+        "ok": true,
+        "ms": 0.2,
+        "detail": {
+          "skipped": true,
+          "reason": "设备已有真桥，假桥用例只在无 Android 宿主的桌面上有意义"
+        }
+      },
+      {
+        "name": "R16：原生桥协议 + 逐语句迁移（假桥 = 真 SQLite）",
+        "ok": true,
+        "ms": 0.2,
+        "detail": {
+          "skipped": true,
+          "reason": "设备已有原生桥，假桥用例只在无 Android 宿主的桌面上有意义",
+          "engine": "native-android-sqlite"
+        }
+      }
+    ]
+  }
+}

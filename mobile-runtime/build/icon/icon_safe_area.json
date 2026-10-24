@@ -1,0 +1,28 @@
+{
+  "source": "zcode/public/logo/icons/1024x1024.png",
+  "sourceGlyphBBoxPx": [
+    706,
+    600
+  ],
+  "sourceGlyphContentRadiusPx": 460.38,
+  "canvasPx": 1024,
+  "safeZonePx": 660,
+  "contentBoxLimitPx": 660,
+  "edgeMinPx": 100,
+  "alphaEdgeMinPx": 24,
+  "adaptiveContentRadiusDp": 31.0,
+  "backgroundStops": {
+    "top": [
+      21,
+      23,
+      24
+    ],
+    "bottom": [
+      1,
+      1,
+      1
+    ]
+  },
+  "legacyCornerRatio": 0.1348,
+  "measuredBy": "check-icons.mjs（独立解码真实像素），这里只记生成参数"
+}

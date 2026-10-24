@@ -1,0 +1,16 @@
+{
+  "generatedAt": "2026-10-02T15:26:33Z",
+  "host": "desktop Chromium 150 (Windows), WebView=false, crossOriginIsolated=false",
+  "summary": "27 PASS / 2 FAIL",
+  "note": "两条 FAIL 是 L1/L2 原生进程探针，只在 Android 宿主可判定。SharedArrayBuffer 这一行 aliasedArrayBuffer=true 说明这台 Chromium 上 SAB 确实不存在，是 prelude 把它别名到 ArrayBuffer 才让 bundle 加载下去的（§7 R15/R4）。关卡计时里 ms 字段偏小、detail 内的 globMs/grepMs/readMs 才是真值。",
+  "highlights": {
+    "sessionStore_migrations_on_sqljs_ms": 12772.8,
+    "bench_3000_files": { "globMs": 475.2, "grepMs": 1037.7, "readMs": 5018.7, "grepWithinGate": true },
+    "alloc": { "singleMB": 256, "jsHeapLimitMB": 4192, "roundsAfterFree": "8x64MB ok" },
+    "storage": { "indexedDB": true, "opfs": "blocked: TypeError (非安全上下文/无 COOP-COEP)", "quotaMB": 312818 },
+    "encodings": { "gb18030": "中文测试", "gbk": "中文测试", "big5": "中文" },
+    "sqliteEngine": "sql.js-wasm",
+    "fakeNativeBridge": { "engine": "native-android-sqlite", "tables": 24, "exec": 115, "run": 27, "read": 31, "pragmaViaQuery": 1, "blobReadRejects": 0 }
+  },
+  "artifact": { "apk": "zcode-mobile-0.0.1-debug.apk", "bytes": 3024419, "versionCode": 1, "versionName": "0.0.1" }
+}

@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 全部文件管理权限（0.7.3，用户点名"申请对全部文件的管理权限"）：
+         Android 11+ 的 MANAGE_EXTERNAL_STORAGE，授予后 FsBridge 才放行 /ext 前缀
+         （= 外部存储公共目录树 /sdcard）。权限本身由用户在系统设置页手动授予
+         （设置页"去系统授权"按钮直达本 app 的开关，见 DeviceProbe.openAllFilesPermission）；
+         app 拿不到就如实 EACCES。声明 ≠ 授予：不授权时行为与旧版逐字一致。 -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:usesCleartextTraffic="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ZcodeMobile">
+        <!-- usesCleartextTraffic（0.4.8，装机反馈"http 开头的模型提供商根本连不上"）：
+             Android 9+ 默认禁止明文 HTTP，WebView 的 fetch 打 http:// 网关会被系统层拦
+             （mixedContentMode 只管 https 页面引 http 资源的那一面，管不到 cleartext 政策）。
+             自建网关（http://192.168.x.x:8000/v1 一类）是端侧的正当用法，桌面 CLI 同样放行。
+             代价：API key 会按用户自选的网关协议明文传输——用户对自己的网关负责。 -->
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!--
+              授权页最后一步会跳 zcode://oauth/callback（上游 buildDesktopOAuthRedirectUriFromEnv 拼的
+              就是这个 URI，见 services/src/oauth/providers/configUtils.ts:34）。singleTask 让系统在
+              已运行的任务上回到本应用，而不是新开一个 WebView 实例。
+              这条 URL **必须交给 JS**（OAuthLinkBridge + platform.onOAuthCallback）：手机浏览器在把
+              自定义 scheme 交出来的那一刻就冻结/回收那个标签页，网站那页自己的收尾没跑完，轮询会永远
+              pending（0.2.0 装机就是这句"一直转圈圈"）。state 比对与 token 交换都在服务层做。
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="zcode" android:host="oauth" android:pathPrefix="/callback" />
+            </intent-filter>
+        </activity>
+
+        <!-- 内置浏览器（0.6.0）：Browser 工具的可见页面。独立于主 Activity——
+             模型 open() 时从主界面之上弹出，用户看完点返回回主界面，状态留在 BrowserBridge。 -->
+        <activity
+            android:name=".BrowserActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
+            android:exported="false" />
+    </application>
+</manifest>

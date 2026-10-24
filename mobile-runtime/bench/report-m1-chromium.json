@@ -1,0 +1,38 @@
+{
+  "gate": "M1 bundle 能干活 + M2 端口前三个 + SessionStore 复用",
+  "host": "desktop Chromium 150 (Electron 43) — 不是 Android WebView，真机列仍空缺",
+  "bundle": { "file": "mobile-runtime/build/dist/zcode-core.mobile.js", "bytes": 5308518, "modules": 1181, "nodeBuiltinsNeeded": 15, "note": "14 个来自 core；第 15 个 node:sqlite 只在复用桌面 session-store 时才需要（+130 KB）" },
+  "summary": "18/18 PASS",
+  "results": [
+    { "step": "bundle 导出可用", "ok": true, "ms": 0.3, "detail": { "exports": 4 } },
+    { "step": "垫片 fs 读写（VFS）", "ok": true, "ms": 3.8, "detail": { "files": 8 } },
+    { "step": "registry 裁剪（只注册移动端 5 个工具）", "ok": true, "ms": 2.7, "detail": { "tools": 5 } },
+    { "step": "Read 工具", "ok": true, "ms": 68.9, "detail": { "bytes": 242 } },
+    { "step": "Read 分段读取（offset/limit）", "ok": true, "ms": 28.6, "detail": { "startLine": 2, "numLines": 1, "totalLines": 4 } },
+    { "step": "Grep 上下文与 -o", "ok": true, "ms": 46.2, "detail": { "contextLines": 3, "onlyMatching": 3 } },
+    { "step": "Grep multiline（-U 跨行）", "ok": true, "ms": 19.8, "detail": { "bytes": 69 } },
+    { "step": "Glob 工具", "ok": true, "ms": 12.6, "detail": { "hits": 1 } },
+    { "step": "Grep 工具（internal-cli 搜索后端）", "ok": true, "ms": 7.6, "detail": { "matched": 4 } },
+    { "step": "Write 工具", "ok": true, "ms": 17.8, "detail": { "bytes": 26 } },
+    { "step": "Edit 工具", "ok": true, "ms": 50.1, "detail": { "now": "{\"level\":\"high\"}" } },
+    { "step": "HttpClientPort：GET 取回自身", "ok": true, "ms": 74.7, "detail": { "status": 200, "bytes": 1940 } },
+    { "step": "HttpClientPort：egress=public 拦内网字面量", "ok": true, "ms": 14.6, "detail": { "blocked": 5, "proto": "unsupported_protocol" } },
+    { "step": "HttpClientPort：maxResponseBytes 触发 too_large", "ok": true, "ms": 59.2, "detail": { "code": "too_large" } },
+    { "step": "ExecutionPort：没有原生桥时诚实失败", "ok": true, "ms": 4.5, "detail": { "status": "spawn_error" } },
+    { "step": "ExecutionPort：桥接层 argv/shell 两条路径", "ok": true, "ms": 3.1, "detail": { "routes": ["shell", "argv"] } },
+    { "step": "SessionStore：WASM SQLite 上跑完整迁移", "ok": true, "ms": null, "detail": { "ready": true } },
+    { "step": "SessionStore：会话/消息/part/todo 往返（含 close→落盘→重开）", "ok": true, "ms": null, "detail": { "sessions": 1, "messages": 1, "partText": "把 level 改成 high", "todos": 1 } }
+  ],
+  "bugs_found_by_the_gate": [
+    "FileSystemPort.readTextFileRange 少了契约必填的 startLine/lineCount/totalLines，Read 的 runtimeOutputSchema(.strict + z.number().int()) 整块校验失败；harness 之前还把 e.code 优先于 e.message，把 zod 明细吞了。",
+    "HttpClientPort 里 v4 & 0xff000000 这类掩码比较在有符号 32 位下恒为假，192.168/169.254 两个网段漏拦（SSRF 口子）；改成 >>> 0 归正。",
+    "先 arrayBuffer() 再比 maxResponseBytes 会在低内存设备上先把大响应整个读进内存（§7 R6）；改成 content-length 预判 + 流式累计到上限即 cancel。",
+    "Grep 端口静默忽略 -B/-o/multiline，工具层照单全收，等于返回错结果；现在三条都实现并各有一步断言。",
+    "adapters/storage/session-store/migration-runner.ts:18 在模块顶层 new SharedArrayBuffer + Atomics.wait 当同步 sleep，WebView 主线程上直接让整包加载失败（SharedArrayBuffer is not defined）；prelude 里降级为 no-op，并注明换 native 多进程引擎后必须改回真等待。",
+    "sql.js 的 Database 没有 lastInsertRowid()/changes()（prototype 只暴露 getRowsModified 等少数名字），桌面 store 的写入路径依赖前者；用 SELECT last_insert_rowid()/changes() 补。"
+  ],
+  "unresolved": [
+    "sql.js 是整库进内存：本机 ~/.zcode/cli/db/db.sqlite 实测 36 MB + 4 MB WAL，低端机的 60–150 MB 预算顶得慌。Android 该走原生 SQLite 同步桥，这条要真机量化。",
+    "关卡 2/3/6/8/9/10 需要真机；APK 已能出但没设备，adb devices 为空。"
+  ]
+}

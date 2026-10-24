@@ -1,0 +1,208 @@
+{
+  "meta": {
+    "probeVersion": "1.0.0",
+    "startedAt": "2026-10-02T07:11:25.672Z",
+    "host": "node-24.19.0-win32-arm64",
+    "ua": "Node.js/24",
+    "esVersion": "es2026",
+    "finishedAt": "2026-10-02T07:11:26.885Z"
+  },
+  "capabilities": {
+    "import:node:fs": {
+      "ok": true,
+      "detail": 105
+    },
+    "import:node:fs/promises": {
+      "ok": true,
+      "detail": 34
+    },
+    "import:node:path": {
+      "ok": true,
+      "detail": 18
+    },
+    "import:node:crypto": {
+      "ok": true,
+      "detail": 71
+    },
+    "import:node:vm": {
+      "ok": true,
+      "detail": 11
+    },
+    "import:node:zlib": {
+      "ok": true,
+      "detail": 48
+    },
+    "import:node:net": {
+      "ok": true,
+      "detail": 19
+    },
+    "import:node:worker_threads": {
+      "ok": true,
+      "detail": 22
+    },
+    "import:node:child_process": {
+      "ok": true,
+      "detail": 10
+    },
+    "import:node:sqlite": {
+      "ok": true,
+      "detail": 6
+    },
+    "import:node:sea": {
+      "ok": true,
+      "detail": 6
+    },
+    "import:node:util": {
+      "ok": true,
+      "detail": 35
+    },
+    "import:node:os": {
+      "ok": true,
+      "detail": 24
+    },
+    "fs:roundtrip": {
+      "ok": true,
+      "detail": 1024
+    },
+    "fs:chmod": {
+      "ok": true,
+      "detail": "666"
+    },
+    "sqlite:DatabaseSync": {
+      "ok": true,
+      "detail": "b"
+    },
+    "vm:runInNewContext": {
+      "ok": true,
+      "detail": 2
+    },
+    "net:listen": {
+      "ok": true,
+      "detail": 28353
+    },
+    "worker:available": {
+      "ok": true,
+      "detail": 42
+    },
+    "child_process:spawn": {
+      "ok": true,
+      "detail": "status=0 out=hi"
+    },
+    "crypto:createHash": {
+      "ok": true,
+      "detail": "ba7816bf8f01"
+    },
+    "WebAssembly": {
+      "ok": true,
+      "detail": "streaming"
+    },
+    "SharedArrayBuffer": {
+      "ok": true,
+      "detail": "present"
+    },
+    "Atomics": {
+      "ok": true,
+      "detail": "present"
+    },
+    "fetch:https": {
+      "ok": true,
+      "detail": 2
+    },
+    "WebSocket": {
+      "ok": true,
+      "detail": "present"
+    },
+    "indexedDB": {
+      "ok": false,
+      "error": "absent"
+    },
+    "opfs": {
+      "ok": false,
+      "error": "absent"
+    },
+    "storageQuota": {
+      "ok": false,
+      "error": "absent"
+    },
+    "postMessage:channel": {
+      "ok": true,
+      "detail": "present"
+    },
+    "TextDecoder:gb18030": {
+      "ok": true,
+      "detail": "中"
+    },
+    "TextDecoder:gbk": {
+      "ok": true,
+      "detail": "中"
+    },
+    "TextDecoder:big5": {
+      "ok": true,
+      "detail": "中"
+    },
+    "TextDecoder:utf-8": {
+      "ok": true,
+      "detail": "中"
+    }
+  },
+  "benchmarks": [
+    {
+      "name": "scan-regex-2MB",
+      "ok": true,
+      "ms": 5.98,
+      "detail": {
+        "hits": 219510,
+        "matches": 12196
+      }
+    },
+    {
+      "name": "json-parse-2MB",
+      "ok": true,
+      "ms": 78.97,
+      "detail": 20000
+    },
+    {
+      "name": "string-concat-1e5",
+      "ok": true,
+      "ms": 31.32,
+      "detail": 452011
+    },
+    {
+      "name": "wasm-instantiate",
+      "ok": true,
+      "ms": 15.29,
+      "detail": "add(1,2)=3"
+    },
+    {
+      "name": "fs-write-read-8MB",
+      "ok": true,
+      "ms": 66.95,
+      "detail": 8388608
+    },
+    {
+      "name": "crypto-sha256-8MB",
+      "ok": true,
+      "ms": 131.37,
+      "detail": "ad97f870"
+    }
+  ],
+  "limits": {
+    "memoryMB": {
+      "rss": 94.06,
+      "heapUsed": 9.36,
+      "heapTotal": 28.44
+    },
+    "allocation256MB": true
+  },
+  "summary": {
+    "okCount": 31,
+    "missingCount": 3,
+    "missing": [
+      "indexedDB",
+      "opfs",
+      "storageQuota"
+    ],
+    "slow": [],
+    "failed": []
+  }
+}

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh" class="dark theme-zai-dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <title>aZCode</title>
+    <script>
+      // 首帧主题必须在这里（type=module 的 entry.js 之前）定下来：模块脚本异步执行，
+      // 等它里的 applyTheme 再切 class，深色 App 在浅色系统上会先闪一屏底色、反之亦然。
+      // 逻辑与 entry.tsx 的 applyTheme / 上游 useTheme 同源：以 localStorage 的 zcode-theme 为准，
+      // system 时跟随系统夜间模式。注意真机上 media query 不可信：外壳关掉了算法反色，
+      // WebView 的 prefers-color-scheme 被钉在"应用的明暗"上，永远读到 light —— 系统深浅色
+      // 要问原生桥 zcodeUi.systemDark()（0.3.5 装机反馈"跟随系统无效"即此），桥不在（桌面浏览器）
+      // 才退回 media query。夜间模式切换会重建 Activity，重建后这段会再跑一遍。
+      (function () {
+        var saved = null;
+        try { saved = localStorage.getItem("zcode-theme"); } catch (e) {}
+        if (saved !== "light" && saved !== "dark" && saved !== "zai-light" && saved !== "zai-dark" && saved !== "system") {
+          saved = "zai-dark";
+        }
+        var prefersDark;
+        try { prefersDark = window.zcodeUi && typeof window.zcodeUi.systemDark === "function"
+          ? window.zcodeUi.systemDark()
+          : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches); } catch (e) { prefersDark = true; }
+        var resolved = saved === "system" ? (prefersDark ? "dark" : "light") : saved;
+        // 归一化与上游 useTheme.normalizeThemePreference 同一张表：dark/light 收敛到 zai-* 两套配色。
+        if (resolved === "dark") resolved = "zai-dark";
+        if (resolved === "light") resolved = "zai-light";
+        var dark = resolved === "zai-dark";
+        var root = document.documentElement;
+        root.classList.toggle("dark", dark);
+        root.classList.toggle("theme-zai-dark", resolved === "zai-dark");
+        root.classList.toggle("theme-zai-light", resolved === "zai-light");
+        root.style.colorScheme = dark ? "dark" : "light";
+        root.style.background = dark ? "#161616" : "#ffffff";
+      })();
+    </script>
+    <!-- Tailwind v4 的产物由上游 Vite 生成一次（build/bundle-ui.mjs 里复制进来）：
+         esbuild 只透传 .css，不会跑 Tailwind 的 @source 扫描，端侧自己写一套等于第二份样式事实。 -->
+    <link rel="stylesheet" href="./zcode-ui.css" />
+    <style>
+      html, body, #root { height: 100%; margin: 0; }
+      /* 兜底底色交给上面的首帧脚本按主题设；这里不写死深色，浅色主题才不会闪一屏黑。 */
+      /* 首屏之前的兜底：JS 起不来时屏幕上至少有一行字，而不是一个白框。 */
+      #booting { position: fixed; inset: 0; display: grid; place-items: center; color: #9a9a9a; font: 13px/1.6 ui-monospace, Consolas, monospace; }
+    </style>
+    <script type="importmap">
+      { "imports": { "typescript": "./shims/typescript-stub.js" } }
+    </script>
+    <!-- sql.js 的胶水必须当普通 script 载入：它自己用 scriptDirectory 定位 .wasm。 -->
+    <script src="./sql-wasm.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="booting">aZCode 端侧启动中…</div>
+    <script type="module" src="./entry.js">
+    </script>
+    <script>
+      // entry.js 抛错时上面那句 import 不会执行，所以要给一个能被看见的收尾：
+      // 把错误写进 #booting，装机后才回收得到"白屏"到底白在哪一步。
+      // 用 capture 而不是 bubble：子 chunk 拉取失败（404、 MIME 不对）的 error 事件在
+      // script 元素上触发、不冒泡，只在 window 冒泡阶段监听的话恰好漏掉最常见的一种失败。
+      function report(text) {
+        const el = document.getElementById("booting");
+        if (el && !document.getElementById("root")?.childElementCount) el.textContent = text;
+      }
+      window.addEventListener("error", (e) => {
+        report("启动失败：" + (e.message || String(e.error)) + "\n" + (e.filename || "") + ":" + (e.lineno || "") +
+          "\n" + (String((e.error && e.error.stack) || "").split("\n").slice(0, 6).join("\n")));
+      }, true);
+      window.addEventListener("unhandledrejection", (e) => {
+        report("启动失败（Promise）：" + String((e.reason && (e.reason.stack || e.reason.message)) || e.reason)
+          .split("\n").slice(0, 7).join("\n"));
+      });
+    </script>
+  </body>
+</html>

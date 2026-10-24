@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标：前景只含字形、且已按直径 62dp 的内容圆收过（判据是 64dp，留 1dp 吸收
+     降采样振铃），圆形 / 圆角矩形 / 方角遮罩下都不缺角。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

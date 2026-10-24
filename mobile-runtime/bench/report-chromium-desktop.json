@@ -1,0 +1,35 @@
+{
+  "probeVersion": "1.0.0",
+  "startedAt": "2026-10-02T09:17:39.653Z",
+  "finishedAt": "2026-10-02T09:17:42.105Z",
+  "host": "browser",
+  "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) QoderCN/0.4.3 Chrome/150.0.7871.114 Electron/43.1.1 Safari/537.36",
+  "esVersion": "es2026",
+  "caveat": "这是桌面 Chromium 150（browser-use 内嵌 Electron），只是 WebView 的替身列。真机 WebView 与 ArkWeb 仍需各测一列；SAB 为 false 的原因是没有 COOP/COEP 隔离，不是内核不支持。",
+  "capabilities": {
+    "WebAssembly": "ok(streaming)",
+    "SharedArrayBuffer": "MISSING 需 cross-origin isolation",
+    "Atomics": "ok(present)",
+    "fetch:https": "ok",
+    "WebSocket": "ok",
+    "indexedDB": "ok",
+    "opfs": "ok",
+    "storageQuota": "ok(quotaMB=315167 usageMB=0，桌面值，端侧无参考意义)",
+    "postMessage:channel": "ok",
+    "TextDecoder:gb18030": "ok(中)",
+    "TextDecoder:gbk": "ok(中)",
+    "TextDecoder:big5": "ok(中)",
+    "TextDecoder:utf-8": "ok(中)",
+    "node:*": "全部 13 项 MISSING（fs fs/promises path crypto vm zlib net worker_threads child_process sqlite sea util os + 派生的 fs:roundtrip fs:chmod sqlite vm net worker child_process crypto）—— 即 mobile-compat 的完整工作面"
+  },
+  "benchmarks": [
+    { "name": "scan-regex-2MB", "ms": 46.4, "node24Desktop": 5.98, "ratio": 7.8 },
+    { "name": "json-parse-2MB", "ms": 164.8, "node24Desktop": 78.97, "ratio": 2.1 },
+    { "name": "string-concat-1e5", "ms": 115.1, "node24Desktop": 31.32, "ratio": 3.7 },
+    { "name": "wasm-instantiate", "ms": 55.7, "node24Desktop": 15.29, "ratio": 3.6, "ok": true },
+    { "name": "fs-write-read-8MB", "ms": null, "note": "浏览器无 fs，端侧改测 OPFS" },
+    { "name": "crypto-sha256-8MB", "ms": null, "note": "需垫片走 WebCrypto 后重测" }
+  ],
+  "limits": { "jsHeapLimitMB": 4192, "allocation256MB": true },
+  "summary": { "okCount": 12, "missingCount": 22 }
+}

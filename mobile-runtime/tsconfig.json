@@ -1,0 +1,66 @@
+{
+  // 端侧 UI 组合根（mobile-runtime/ui/*.ts）的正式类型检查工程。
+  //
+  // 为什么仓库里一直没有它：esbuild 只做转译、不做类型检查，端侧代码从第一天起就靠
+  // harness（chat-e2e / selfcheck / *Smoke）当验收线。这条欠债在 §1.5.19 咬过一次——
+  // 连通性检查把 formal 输入读成扁平的 `input.providerId`，屏幕上出现"Provider「undefined」"，
+  // 而这类形状错 tsc 一定抓得到。这个工程的存在就是把那句话从"注释"变成"能跑的命令"。
+  //
+  // 编译器选项照抄 zcode/tsconfig.base.json 的实际口径（非 strict、noUncheckedIndexedAccess、
+  // verbatimModuleSyntax、isolatedModules），不是偷懒：本工程的输入图会把 packages/* 的**源码**
+  // 一起拉进来，选项比上游严就会在别人的文件里造出上游并不存在的错，那种"错误清单"没法用于判断。
+  // 我自己的文件与上游在同一个 program 里，因此也接受同一套规则。
+  //
+  // paths 是把包名指到源码的替代手段：mobile-runtime/ 在上游 pnpm workspace 之外，
+  // 目录里没有任何 node_modules，@zcode/* 的软链只存在于各依赖方自己的 node_modules 下，
+  // 从 mobile-runtime/ui 往上找是找不到的（bundle-ui.mjs 用 nodePaths 解决同一件事）。
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2024", "dom", "dom.iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    // 与 bundle-ui.mjs 的 `jsx: "automatic"` 同口径：automatic 就是 TS 的 react-jsx
+    // （产物里 import { jsx } from "react/jsx-runtime"，没有 React.createElement）。
+    // 不写这行，entry.tsx 里每个 JSX 节点都是 TS17004，上游 packages/ui 的 .tsx 也全成假错。
+    "jsx": "react-jsx",
+    // 不用 baseUrl：TS 6 已经把它标成弃用（TS5101），而 5.x 起 paths 可以直接按本文件所在目录解析。
+    // 下面所有 target 都相对 mobile-runtime/，所以同时指得到 zcode/（上游包源码）。
+    "paths": {
+      "@zcode/rpc": ["../zcode/packages/rpc/src/index.ts"],
+      "@zcode/client": ["../zcode/packages/client/src/index.ts"],
+      "@zcode/ui": ["../zcode/packages/ui/src/index.ts"],
+      "@zcode/provider": ["../zcode/packages/provider/src/index.ts"],
+      "@zcode/provider-node": ["../zcode/packages/provider-node/src/index.ts"],
+      "@zcode/shared": ["../zcode/packages/shared/src/index.ts"],
+      "@zcode/shared/*": ["../zcode/packages/shared/src/*"],
+      "@zcode/services": ["../zcode/packages/services/src/index.ts"],
+      // 与 bundle-ui.mjs 的 DEEP_PREFIX 同一个惯例：上游自己也是按实现文件深引的
+      // （services/src/index.ts:88 写明根入口故意不导工厂）。这里带 .js 后缀，映射到 .ts。
+      "@zcode/services/deep/*.js": ["../zcode/packages/services/src/*.ts"],
+      "@zcode/services/deep/*": ["../zcode/packages/services/src/*"],
+      // packages/ui 源码内部用 @/ 自引用（上游 Vite alias + tsconfig paths 同一份约定）
+      "@/*": ["../zcode/packages/ui/src/*"]
+    },
+    // 本工程同样在 pnpm workspace 之外，往上找不到任何 node_modules/@types，所以 typeRoots 显式指过去。
+    // 不指的话 @types/node 里的全局（process、Buffer、NodeJS.*）在 compat/ 的 .mjs 桥里全是"名称不存在"。
+    "typeRoots": ["../zcode/node_modules/@types"],
+    "types": ["node"],
+    "esModuleInterop": true,
+    "allowJs": true,
+    "checkJs": false,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true
+  },
+  "include": [
+    "ui/**/*.ts",
+    "ui/**/*.tsx",
+    // packages/ui 的资源声明（assets.d.ts / css.d.ts / env.d.ts / electron-webview.d.ts）。
+    // 不纳进来会造出一批假错：ProviderLogo.tsx 那 15 条全是 "Cannot find module './assets/*.png'"，
+    // 而那些通配模块声明上游是放在**单独的文件**里、由它自己的 tsconfig include 到 src/**。
+    "../zcode/packages/ui/src/**/*.d.ts"
+  ]
+}

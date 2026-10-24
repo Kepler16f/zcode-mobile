@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "isomorphic-git": "^1.43.3"
+  }
+}

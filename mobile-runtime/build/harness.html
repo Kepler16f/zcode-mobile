@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <title>ZCode M1 关卡 · 端侧 runtime</title>
+    <style>
+      body { background: #161616; color: #e6e6e6; font: 13px/1.6 ui-monospace, Consolas, monospace; margin: 0; padding: 16px; }
+      h1 { font-size: 15px; margin: 0 0 12px; }
+      .row { display: flex; gap: 8px; align-items: baseline; border-bottom: 1px solid #262626; padding: 6px 0; }
+      .ok { color: #4ec9b0; } .fail { color: #ff6b6b; } .ms { color: #7a7a7a; margin-left: auto; }
+      pre { margin: 2px 0 0; white-space: pre-wrap; color: #9cdcfe; font-size: 12px; }
+      #summary { margin-top: 12px; font-weight: bold; }
+    </style>
+  </head>
+  <body>
+    <h1>ZCode M1/M2 关卡 —— 用 mobile-compat 垫片驱动 core 的工具层与存储层</h1>
+    <script type="importmap">
+      { "imports": { "typescript": "./dist/shims/typescript-stub.js" } }
+    </script>
+    <!-- sql.js 的胶水按普通 script 载入：它自己用 scriptDirectory 定位 .wasm，打包会打断那段探测。 -->
+    <script src="./dist/sql-wasm.js"></script>
+    <div id="out">运行中…</div>
+    <div id="summary"></div>
+    <script type="module">
+      const out = document.getElementById("out");
+      try {
+        const { run } = await import("./m1-run.mjs");
+        const report = await run();
+        out.innerHTML = report.results
+          .map(
+            (r) =>
+              `<div class="row"><span class="${r.ok ? "ok" : "fail"}">${r.ok ? "PASS" : "FAIL"}</span><span>${r.name}</span><span class="ms">${r.ms} ms</span></div>` +
+              `<pre>${JSON.stringify(r.detail ?? r.error, null, 1)}</pre>`,
+          )
+          .join("");
+        document.getElementById("summary").textContent =
+          `${report.passed} PASS / ${report.failed.length} FAIL · 事件 ${report.events} 条`;
+        window.__zcodeM1Report = report;
+      } catch (e) {
+        out.innerHTML = `<div class="fail">加载失败：${String(e && e.stack ? e.stack : e)}</div>`;
+        window.__zcodeM1Report = { fatal: String(e && e.message ? e.message : e) };
+      }
+    </script>
+  </body>
+</html>

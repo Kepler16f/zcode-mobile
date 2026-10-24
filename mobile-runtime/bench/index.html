@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZCode Runtime Probe</title>
+    <style>
+      body { font: 13px/1.5 ui-monospace, monospace; margin: 12px; background: #161616; color: #d8d8d8; }
+      h1 { font-size: 15px; margin: 0 0 8px; }
+      .row { display: flex; justify-content: space-between; border-bottom: 1px solid #2a2a2a; padding: 2px 0; }
+      .ok { color: #4ade80; }
+      .bad { color: #f87171; }
+      pre { white-space: pre-wrap; word-break: break-all; background: #101010; padding: 8px; }
+      button { font: inherit; padding: 6px 10px; margin-bottom: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>ZCode Runtime Probe · <span id="host">…</span></h1>
+    <button id="rerun">重新运行</button>
+    <div id="summary"></div>
+    <h1>能力</h1>
+    <div id="caps"></div>
+    <h1>基准</h1>
+    <div id="benches"></div>
+    <h1>报告 JSON</h1>
+    <button id="copy">复制</button>
+    <pre id="json"></pre>
+    <script type="module">
+      import { runProbe } from "./probe.mjs";
+
+      const el = (id) => document.getElementById(id);
+
+      async function run() {
+        el("summary").textContent = "运行中…";
+        const report = await runProbe();
+        el("host").textContent = report.meta.host;
+        el("summary").textContent =
+          `能力 ${report.summary.okCount} 可用 / ${report.summary.missing.length} 缺失 · 基准 ${report.benchmarks.length} 项`;
+        el("caps").innerHTML = Object.entries(report.capabilities)
+          .map(
+            ([k, v]) =>
+              `<div class="row"><span>${k}</span><span class="${v.ok ? "ok" : "bad"}">${
+                v.ok ? "OK " + JSON.stringify(v.detail ?? "") : "缺失 " + v.error
+              }</span></div>`,
+          )
+          .join("");
+        el("benches").innerHTML = report.benchmarks
+          .map(
+            (b) =>
+              `<div class="row"><span>${b.name}</span><span class="${b.ok ? "ok" : "bad"}">${b.ms}ms ${
+                b.ok ? "" : "FAIL " + b.error
+              }</span></div>`,
+          )
+          .join("");
+        el("json").textContent = JSON.stringify(report, null, 2);
+        window.__zcodeProbeReport = report;
+      }
+
+      el("rerun").addEventListener("click", run);
+      el("copy").addEventListener("click", () => navigator.clipboard.writeText(el("json").textContent));
+      run();
+    </script>
+  </body>
+</html>

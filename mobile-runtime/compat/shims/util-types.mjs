@@ -1,0 +1,11 @@
+export const isRegExp = (v) => v instanceof RegExp;
+export const isDate = (v) => v instanceof Date;
+export const isMap = (v) => v instanceof Map;
+export const isSet = (v) => v instanceof Set;
+export const isPromise = (v) => v instanceof Promise || (v && typeof v.then === "function");
+export const isUint8Array = (v) => v instanceof Uint8Array;
+export const isArrayBufferView = (v) => ArrayBuffer.isView(v);
+export const isNativeError = (v) => v instanceof Error;
+export const isFunction = (v) => typeof v === "function";
+export const isStringObject = (v) => v instanceof String;
+export const isAsyncFunction = (v) => typeof v === "function" && v.constructor?.name === "AsyncFunction";

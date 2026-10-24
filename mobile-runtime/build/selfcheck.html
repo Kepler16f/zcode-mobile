@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>ZCode 真机自检 · M1/M2 + §3.4 关卡</title>
+    <style>
+      body { background: #161616; color: #e6e6e6; font: 13px/1.6 ui-monospace, Consolas, monospace; margin: 0; padding: 12px; }
+      h1 { font-size: 15px; margin: 0 0 4px; }
+      h2 { font-size: 13px; margin: 18px 0 6px; color: #7a9fd0; }
+      .row { display: flex; gap: 8px; align-items: baseline; border-bottom: 1px solid #262626; padding: 5px 0; }
+      .ok { color: #4ec9b0; } .fail { color: #ff6b6b; } .ms { color: #7a7a7a; margin-left: auto; flex-shrink: 0; }
+      pre { margin: 2px 0 0; white-space: pre-wrap; word-break: break-all; color: #9cdcfe; font-size: 12px; }
+      #summary { margin: 10px 0; font-weight: bold; }
+      button { background: #2d2d2d; color: #e6e6e6; border: 1px solid #444; padding: 6px 12px; font: inherit; margin-right: 8px; }
+      #fatal { color: #ff6b6b; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>ZCode 真机自检</h1>
+    <div>
+      <button id="rerun">重跑</button>
+      <button id="copy">复制 JSON</button>
+      <span id="hint">接上手机打开本页即出报告；复制后可直接贴回对话。</span>
+    </div>
+    <div id="summary">运行中…</div>
+    <h2>A. M1/M2 工具层与存储层（18 步）</h2>
+    <div id="out-a">运行中…</div>
+    <h2>B. §3.4 真机关卡（内存 / 编码 / SAB / 配额 / exec / SQLite 引擎）</h2>
+    <div id="out-b">运行中…</div>
+    <div id="fatal"></div>
+
+    <script type="importmap">
+      { "imports": { "typescript": "./dist/shims/typescript-stub.js" } }
+    </script>
+    <!-- sql.js 的胶水按普通 script 载入：它自己用 scriptDirectory 定位 .wasm，打包会打断那段探测。 -->
+    <script src="./dist/sql-wasm.js"></script>
+    <script type="module">
+      const rt = await import("./dist/zcode-core.mobile.js");
+      // 真盘桥先用一次：桥在但根目录建不起来时，退回内存盘并把原因带进报告，
+      // 而不是让 A 段第一个 Write 莫名其妙炸掉。
+      window.__zcodeFsReady = rt.vfs.ensureReady();
+      // 顶部带上包版本：装机复测贴回来的数字要能分清是 0.0.1 还是 0.0.2 跑的。
+      window.__zcodeAppVersion = globalThis.zcodeDevice
+        ? JSON.parse(globalThis.zcodeDevice.deviceInfo()).appVersion ?? "?"
+        : "非 Android";
+
+      function render(target, results) {
+        document.getElementById(target).innerHTML = results
+          .map(
+            (r) =>
+              `<div class="row"><span class="${r.ok ? "ok" : "fail"}">${r.ok ? "PASS" : "FAIL"}</span><span>${r.name}</span><span class="ms">${r.ms} ms</span></div>` +
+              `<pre>${JSON.stringify(r.detail ?? r.error, null, 1)}</pre>`,
+          )
+          .join("");
+      }
+
+      async function runAll() {
+        document.getElementById("summary").textContent = "运行中…";
+        document.getElementById("fatal").textContent = "";
+        const report = { generatedAt: new Date().toISOString(), runtime: [], device: [] };
+        window.__zcodeSelfCheck = report;
+        try {
+          const { run } = await import("./m1-run.mjs");
+          const m1 = await run();
+          report.runtime = m1.results;
+          render("out-a", m1.results);
+        } catch (e) {
+          document.getElementById("out-a").innerHTML =
+            `<div class="fail">A 段加载失败：${String(e?.stack ?? e)}</div>`;
+        }
+        try {
+          const { runDeviceChecks, reportText } = await import("./selfcheck.mjs");
+          report.device = await runDeviceChecks(rt);
+          render("out-b", report.device);
+          report.deviceRaw = JSON.parse(reportText());
+        } catch (e) {
+          document.getElementById("out-b").innerHTML =
+            `<div class="fail">B 段加载失败：${String(e?.stack ?? e)}</div>`;
+        }
+        const all = [...report.runtime, ...report.device];
+        const failed = all.filter((r) => !r.ok).length;
+        document.getElementById("summary").textContent =
+          `${all.length - failed} PASS / ${failed} FAIL · app=${window.__zcodeAppVersion} · sqlite=${rt.sqliteEngine()} · fs=${rt.fsEngine()}` +
+          (window.__zcodeFsReady?.root === undefined ? "" : ` · root=${window.__zcodeFsReady.root}`) +
+          (window.__zcodeFsReady?.error ? ` · 真盘退回内存：${window.__zcodeFsReady.error}` : "");
+      }
+
+      document.getElementById("rerun").onclick = runAll;
+      document.getElementById("copy").onclick = async () => {
+        const text = JSON.stringify(window.__zcodeSelfCheck, null, 2);
+        try {
+          await navigator.clipboard.writeText(text);
+          document.getElementById("hint").textContent = "已复制。";
+        } catch {
+          // WebView 里 clipboard 常被权限挡掉：退化成可选全文，别静默失败。
+          document.getElementById("hint").innerHTML =
+            `<pre>${text.slice(0, 4000)}${text.length > 4000 ? "\n…（截断，完整 JSON 在 window.__zcodeSelfCheck）" : ""}</pre>`;
+        }
+      };
+
+      await runAll();
+    </script>
+  </body>
+</html>
