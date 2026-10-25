@@ -302,11 +302,11 @@ class FsBridge(private val context: Context) {
         return if (dir.isDirectory && dir.canRead()) dir else null
     }
 
-    /** 用户点名的"直接操作本地文件"（0.7.4）：外部存储树判定，供正向解析与反向映射共用。 */
-    private fun isExternalSpelling(path: String): Boolean {
-        val first = path.trimStart('/').substringBefore('/', "")
-        return first == "sdcard" || first == "storage"
-    }
+    /** 用户点名的"直接操作本地文件"（0.7.4）：外部存储树判定，供正向解析与反向映射共用。
+     *  0.7.9：规则收进 ZcodePaths.isExternalStorageSpelling —— ExecBridge 的 cwd 映射必须与这里
+     *  同一条判据，否则"文件工具在 /sdcard/… 读写、Bash 却 cd 进私有盘假目录"两侧各说各话。 */
+    private fun isExternalSpelling(path: String): Boolean =
+        ZcodePaths.isExternalStorageSpelling(path)
 
     /**
      * 虚拟绝对路径 → 真实 File。`..` 直接拒绝（JS 侧 norm 已经折过一遍，这里是第二道闸），

@@ -20,8 +20,11 @@
 //      这里在返回 ACK 之前就把初始帧压进出站队列，并把订阅 id 写在帧上，交给 barrier 暂存。
 //
 // 明确没做的（写在这里，不让它安静地变成一个假画面）：
-//   - MCP / 子代理 / compact / goal / 工作流：命令一律 ack rejected + 原因码，
+//   - MCP / 子代理 / goal / 工作流：命令一律 ack rejected + 原因码，
 //     对应入口在 availability 里就是关的，不会出现"按钮能点、点了没反应"。
+//   - 上下文压缩（0.7.4 起已接）：compact 命令 + "/compact" 输入前缀 + 轮首自动压缩；
+//     长上下文由摘要接管，HISTORY_MESSAGES_MAX 退为压缩失败时的兜底截断（如实注入
+//     "早期历史已省略 N 条"标记，不再无声掐断）。见 COMPACT 段。
 //   - 会话持久化：会话只活在这个进程里。重启后 UI 拿旧 sessionId 来回看，这里如实回
 //     "这台设备上看不到之前那次对话的内容"，绝不拿空时间线冒充历史。
 //   - 排队（0.7.1 起已接）：一轮进行中入队（inputRouting=enqueue），队列项可删/改/重排/
@@ -47,6 +50,7 @@ import {
   type CommandAck,
   type CommandEnvelope,
   type CommandResult,
+  type CommandStateSummary,
   type CommandsQueryParams,
   type CommandsQueryResult,
   type ConversationDelta,
@@ -111,8 +115,27 @@ import {
 /** 与上游 continuous profile 同一个值（core.ts:38）：30 ms 内的增量并成一帧。 */
 const FLUSH_WINDOW_MS = 30;
 const SNAPSHOT_WINDOW_ROWS = PROTOCOL_V4_LIMITS.snapshotTailWindowRows;
-/** 送给模型的历史消息条数上限。超过只带最近这些 —— 压缩（compact）在 P0 还没有。 */
+/**
+ * 历史消息条数的兜底上限（0.7.4 降级）：上下文压缩（compact）已接管长会话，正常路径下
+ * 送给模型的历史 = 摘要 + 压缩点之后的全部对话行，不受这一格约束。只有**压缩失败/被中断**
+ * 时它才生效——截到最近 N 条，并在最前面注入一条"早期历史已省略 N 条"的如实标记，
+ * 不再像 P0 那样无声掐断。
+ */
 const HISTORY_MESSAGES_MAX = 40;
+/**
+ * 自动压缩的触发线（0.7.4，COMPACT 段）：估算占用 ≥ COMPACT_TRIGGER_TOKENS 就压。
+ * 估算口径 = 网关上一轮报回的 input_tokens + 本轮新增文本的字符启发（≈ chars/2.5 个 token，
+ * 中英混排取保守值）；usage 从没报过（新会话/网关不回用量）时纯按字符启发。
+ * 60k 的依据：端侧出货模型上下文多为 128k~200k，触发点留足一轮长回答 + 工具往返的余量，
+ * 又不至于撞 provider 的窗口报错（那会让整轮直接失败，比压缩贵得多）。
+ */
+const COMPACT_TRIGGER_TOKENS = 60_000;
+/** 压缩时保留的最近对话行数（尾部原文）：摘要覆盖前部，这几行逐字保留，模型看得到最新的来回。 */
+const COMPACT_KEEP_RECENT_ROWS = 14;
+/** 送给模型的单条历史正文与压缩输入的封顶字符数：防 transcript 里某条超长正文把压缩请求本身撑爆。 */
+const COMPACT_MAX_MESSAGE_CHARS = 8_000;
+/** 压缩产出的摘要封顶字符数（进 transcript 与持久化，太长等于没压）。 */
+const COMPACT_SUMMARY_MAX_CHARS = 4_000;
 /** P0 的单轮输出上限。真实值应由模型能力配置给出，这里先给一个不会把回答截断得太狠的数。 */
 /** 单轮输出预算的默认上限。0.5.1：4096 → 16384——P0 的临时值把长回答拦腰截在
  *  finish_reason=length 上（用户看到的"说到一半就断了"），且思考档位开启后推理 token
@@ -196,6 +219,20 @@ export interface MobileAgentServiceOptions {
     onLifecycleEvent?: (event: MobileHookLifecycleEvent) => void;
     onDiagnostic?: (message: string) => void;
   }) => Promise<MobileHookRuntime | null>;
+  /**
+   * 上下文压缩总开关（默认开）。自检可关掉以隔离"自动压缩在长对话里悄悄触发"的变量。
+   */
+  compactEnabled?: boolean;
+  /**
+   * 自动压缩触发阈值（token 估算）。自检注入一个极小值即可确定性地逼出自动压缩，
+   * 不必真攒够 60k 上下文。缺省用 COMPACT_TRIGGER_TOKENS。
+   */
+  compactTriggerTokens?: number;
+  /**
+   * 压缩时逐字保留的最近对话行数。自检注入小值（如 1）即可在两三句里逼出压缩边界；
+   * 缺省用 COMPACT_KEEP_RECENT_ROWS。
+   */
+  compactKeepRecentRows?: number;
 }
 
 interface MobileSession {
@@ -214,6 +251,9 @@ interface MobileSession {
   /** 挂起的审批（当前只有 Bash 会产生一条）。buildSnapshot 把它原样投进快照的 pendingInteractions，
    *  UI 的 V4InteractionDialogs 据此弹窗，用户点选走 resolveInteraction 命令。 */
   pendingInteractions: PendingInteraction[];
+  /** 执行中的维护命令（0.7.4：compact）。协议里这就是"命令已被权威侧接管"的凭据，
+   *  客户端的乐观 overlay 按 commandId 在这里出现即退场（store 的 reconcileOptimistic）。 */
+  pendingCommands: CommandStateSummary[];
   /** 正在跑的这一轮。stop 与"忙不忙"都只看它。 */
   run: { abort: AbortController; executionId: string; turnId: string } | null;
   /** 等待队列（0.7.1）。queueItem 形状逐字对齐协议 queueItemSchema（帧会被 schema 校验）。 */
@@ -225,6 +265,22 @@ interface MobileSession {
   /** "立即发送/打断插入"抢占下来的输入：当前轮 abort 后由 afterTurnSettled 立刻起跑，
    *  优先级高于队列排空。同一时刻最多一条（第二次抢占会 abort 掉同一条待跑项）。 */
   pendingStartNow?: MobileQueueItem;
+  /** 压缩摘要（0.7.4）：覆盖 rows[0..contextSummaryCoveredThroughRowId] 的早期段。
+   *  进下一轮 transcript 的头部（替代被覆盖的原文）；时间线行**不删**，展示层全量回放。 */
+  contextSummary?: string;
+  /** 摘要覆盖到的最后一行的 rowId（含）。压缩点之后的行逐字进历史。 */
+  contextSummaryCoveredThroughRowId?: number;
+  /** 压缩点之后被省略、由兜底截断丢弃的行数（压缩失败时才出现）：标记段按它写"早期历史已省略 N 条"。 */
+  omittedEarlyRows?: number;
+  /** 最近一次网关报回的 input_tokens（自动压缩触发估算的基线）。 */
+  lastPromptTokens?: number;
+  /** 正在跑的 compact 轮句柄：stop/中断的收口走 settleCompact（不是对话轮的 settleTurn）。 */
+  compactRun?: {
+    turnId: string;
+    markerRowId: number;
+    abort: AbortController;
+    selection: ModelSelectionValue | null;
+  };
   /** 这台设备上找不回历史：订阅时要如实说出来。 */
   missing: boolean;
 }
@@ -350,7 +406,12 @@ function errorInfo(
  * 关掉是对的。0.7.1 起队列三件套（改/立即发/恢复）随"队列里有没有待跑项"开合：
  * 队列空的会话上这些入口没有意义，开着就是给用户一个必然报错的按钮。
  */
-function buildAvailability(running: boolean, switchModel: boolean, hasQueuedItems: boolean) {
+function buildAvailability(
+  running: boolean,
+  switchModel: boolean,
+  hasQueuedItems: boolean,
+  compactReady: boolean,
+) {
   const closed = { allowed: false as const, reasonCode: "mobile.p0.notImplemented" };
   const busy = { allowed: false as const, reasonCode: "mobile.p0.busy" };
   const gate = running ? busy : closed;
@@ -358,7 +419,8 @@ function buildAvailability(running: boolean, switchModel: boolean, hasQueuedItem
   const queueEmpty = { allowed: false as const, reasonCode: "mobile.queue.empty" };
   return {
     fork: gate,
-    compact: gate,
+    // compact（0.7.4 已接）：空闲且没在压缩才允许；对话进行中置 busy（runCompact 另有单飞闸）。
+    compact: compactReady ? queueReady : busy,
     switchModelConfig: running
       ? busy
       : switchModel
@@ -664,10 +726,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   }
 
   /** 输入路由（0.7.1）：跑着 = enqueue（一句话进等待队列）；空闲但队列被暂停（stop/失败留下的
-   *  待跑项）= choice（客户端渲染"清空队列后发送/保留队列立即发送"确认框）；其余 startNow。 */
+   *  待跑项）= choice（客户端渲染"清空队列后发送/保留队列立即发送"确认框）；其余 startNow。
+   *  0.7.4：压缩轮（compactRun）也算"跑着"——压缩在改历史水位，此时开新轮会读到半压缩态。 */
   function inputRoutingOf(session: MobileSession): ConversationSnapshot["inputRouting"] {
     const hasQueued = session.queue.items.length > 0;
-    return session.run
+    return session.run || session.compactRun
       ? { mode: "enqueue" }
       : hasQueued && !session.queue.autoDrain
         ? { mode: "choice" }
@@ -676,9 +739,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   function availabilityOf(session: MobileSession): ConversationSnapshot["availability"] {
     return buildAvailability(
-      session.run !== null,
+      // compact 动作的开关随"有没有在跑别的活"：压缩进行中不能再开第二次（runCompact 里也有单飞闸）。
+      session.run !== null || session.compactRun !== undefined,
       Boolean(options.modelTargets),
       session.queue.items.length > 0,
+      session.run === null && session.compactRun === undefined,
     );
   }
 
@@ -702,7 +767,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       usage: usageState(session),
       queue: queueStateOf(session),
       pendingInteractions: session.pendingInteractions,
-      pendingCommands: [],
+      // 执行中的维护命令（0.7.4）：手动 compact 的 ACK 与这条投影就是"权威侧已接管"的凭据，
+      // 客户端的乐观 overlay 按 commandId 在这里出现即退场（reconcileOptimistic）。
+      pendingCommands: session.pendingCommands,
       backgroundWorks: [],
       goal: null,
       plan: null,
@@ -805,10 +872,20 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   function upsertRow(session: MobileSession, row: ConversationRow): void {
     const index = session.rows.findIndex((r) => r.rowId === row.rowId);
-    if (index >= 0) session.rows[index] = row;
-    else session.rows.push(row);
+    // 协议纪律（apply.ts 权威 reducer）：row.upserted 对**客户端未见过的 rowId 是 no-op**
+    // （apply.ts:"未加载 rowId = no-op"），新行必须走 row.appended 才进得了 window。
+    // 0.8.0 判据（chat-smoke 压缩 marker）抓出：时间线标记这类"第一次出现就带终态"的行此前
+    // 按 upserted 发出去，永远到不了客户端。新行 append、旧行 update，由服务端事实决定 op，
+    // 调用点不必各管各的。
+    const isNew = index < 0;
+    if (isNew) session.rows.push(row);
+    else session.rows[index] = row;
     flushPending(session);
-    emitFrame(session, { kind: "deltas", deltas: [{ op: "row.upserted", row }] }, "online");
+    emitFrame(
+      session,
+      { kind: "deltas", deltas: [{ op: isNew ? "row.appended" : "row.upserted", row }] },
+      "online",
+    );
   }
 
   /** A 区更新：字段级整体替换，绝不深合并。 */
@@ -822,12 +899,15 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       pendingInteractions?: PendingInteraction[];
       /** 队列的新形状（0.7.1）。给值 = 这一拍要发 queue 键；不给 = 该键保持不动。 */
       queue?: ConversationSnapshot["queue"];
+      /** 维护命令投影（0.7.4 compact）。给值 = 发 pendingCommands 键；客户端据此让乐观气泡退场。 */
+      pendingCommands?: CommandStateSummary[];
     },
   ): void {
     if (patch.revision !== undefined) session.revision = patch.revision;
     if (patch.control) session.control = patch.control;
     if (patch.config) session.config = patch.config;
     if (patch.pendingInteractions) session.pendingInteractions = patch.pendingInteractions;
+    if (patch.pendingCommands) session.pendingCommands = patch.pendingCommands;
     flushPending(session);
     emitFrame(
       session,
@@ -849,6 +929,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
               ...(patch.config ? { config: session.config } : {}),
               ...(patch.usage ? { usage: patch.usage } : {}),
               ...(patch.pendingInteractions ? { pendingInteractions: patch.pendingInteractions } : {}),
+              ...(patch.pendingCommands ? { pendingCommands: patch.pendingCommands } : {}),
               ...(patch.queue ? { queue: patch.queue } : {}),
             },
           },
@@ -957,6 +1038,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       cumulative: { inputTokens: 0, outputTokens: 0 },
       run: null,
       pendingInteractions: [],
+      pendingCommands: [],
       // 队列不持久化（协议裁决：进程死了就丢，重启后由用户决定重发），所以每次建会话都是空的。
       queue: { items: [], autoDrain: true, nextAdmissionSeq: 0 },
       reasoningRowId: null,
@@ -992,6 +1074,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       cumulative: { inputTokens: 0, outputTokens: 0 },
       run: null,
       pendingInteractions: [],
+      pendingCommands: [],
       queue: { items: [], autoDrain: true, nextAdmissionSeq: 0 },
       reasoningRowId: null,
       reasoningStartedAt: 0,
@@ -1034,6 +1117,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           cumulative: { ...session.cumulative },
           nextRowId: session.nextRowId,
           turnUsage: turnUsageOf(session),
+          // 压缩状态随行一起落盘（0.7.4）：缺了它重启后"已压缩"的会话历史与摘要对不上。
+          ...(session.contextSummary ? { contextSummary: session.contextSummary } : {}),
+          ...(session.contextSummaryCoveredThroughRowId !== undefined
+            ? { contextSummaryCoveredThroughRowId: session.contextSummaryCoveredThroughRowId }
+            : {}),
           phase: session.control.phase,
           lastError: session.control.lastError,
         },
@@ -1093,6 +1181,16 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       return null;
     }
     if (!persisted) return null;
+    // 0.8.0（工作区指定"没生效"的可见化，来自工作区线交付）：还原会话的归属以**持久化路径**
+    // 为准——会话跟着建它的工作区走，重选文件夹不搬旧会话（协议语义如此）。但用户的感知是
+    // "选了目录，会话还在别处跑"，所以两条路径不一致时必须能在 agentLog 里看见，
+    // 而不是静默按旧路径继续。
+    if (workspacePath && persisted.workspacePath && persisted.workspacePath !== workspacePath) {
+      say(
+        `会话 ${sessionId} 属于工作区 ${persisted.workspacePath}，但命令从 ${workspacePath} 发来：` +
+          `仍按原工作区执行（这是设计，不是丢句）；要在新目录干活请新建会话。`,
+      );
+    }
     const diedMidTurn =
       persisted.state.phase === "running" || persisted.state.phase === "prewarming";
     const phase = diedMidTurn ? "completedInterrupted" : persisted.state.phase;
@@ -1120,10 +1218,20 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       cumulative: { ...persisted.state.cumulative },
       run: null,
       pendingInteractions: [],
+      pendingCommands: [],
       // 队列刻意不还原：协议裁决"CLI 进程死亡即丢，重新对齐后由用户决定重发"。
       queue: { items: [], autoDrain: true, nextAdmissionSeq: 0 },
       reasoningRowId: null,
       reasoningStartedAt: 0,
+      // 压缩状态随行一起还原（0.7.4）：老记录没有这两个键，按未压缩处理。
+      ...(persisted.state.contextSummary
+        ? {
+            contextSummary: persisted.state.contextSummary,
+            ...(persisted.state.contextSummaryCoveredThroughRowId !== undefined
+              ? { contextSummaryCoveredThroughRowId: persisted.state.contextSummaryCoveredThroughRowId }
+              : {}),
+          }
+        : {}),
       missing: false,
     });
     say(`从持久化还原会话 ${sessionId}（${session.rows.length} 行，phase=${phase}）`);
@@ -1179,17 +1287,294 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
    * 但**当前这一轮内**的 assistant(tool_calls) → tool(结果) 必须原样带回去，否则第二步起
    * 模型看不到自己调了什么、拿到什么结果，循环直接死在"重复调用同一个工具"上。
    * 所以循环用的是局部 transcript，不是 historyMessages(session)。
+   *
+   * 0.7.4 上下文压缩接线：长对话由摘要接管（contextSummary 顶在最前，压缩点之后的行逐字
+   * 保留），HISTORY_MESSAGES_MAX 退为**压缩失败/未生效**时的兜底截断 —— 且截断不再无声：
+   * 顶部注入一条如实的"早期历史已省略 N 条"标记。
    */
   function historyMessages(session: MobileSession): ModelTurnMessage[] {
     const out: ModelTurnMessage[] = [];
+    if (session.contextSummary) {
+      // 摘要进历史的方式：一条说明来源的 user 消息。模型据此知道更早的原文已被压缩，
+      // 需要细节时应如实向用户承认，而不是编造。
+      out.push({
+        role: "user",
+        content:
+          "[上下文压缩摘要] 此前的对话已按下述摘要压缩（早期原文不再逐字提供）。" +
+          "把摘要当作既定事实的背景，不要向用户复述这条说明本身：\n" +
+          session.contextSummary,
+      });
+    }
+    const coveredThrough = session.contextSummaryCoveredThroughRowId ?? 0;
     for (const row of session.rows) {
+      if (row.rowId <= coveredThrough) continue;
       if (row.kind === "userInput" && row.origin === "realUser") {
         out.push({ role: "user", content: row.text });
       } else if (row.kind === "assistantText" && row.text) {
         out.push({ role: "assistant", content: row.text });
       }
     }
-    return out.slice(-HISTORY_MESSAGES_MAX);
+    // 兜底截断只在"没有摘要且超限"时生效：有摘要 = 压缩在管长上下文，不再掐（症状③）。
+    if (!session.contextSummary && out.length > HISTORY_MESSAGES_MAX) {
+      const dropped = out.length - HISTORY_MESSAGES_MAX;
+      session.omittedEarlyRows = dropped;
+      return [
+        {
+          role: "user",
+          content:
+            `[早期历史已省略 ${dropped} 条] 上下文压缩未能生效，为守住窗口只保留了最近 ${HISTORY_MESSAGES_MAX} 条对话。` +
+            "如果用户问起更早的内容，如实说明这段历史已被省略。",
+        },
+        ...out.slice(-HISTORY_MESSAGES_MAX),
+      ];
+    }
+    session.omittedEarlyRows = undefined;
+    return out;
+  }
+
+
+  /** 当前要送给模型的历史（不含 system 提示词）的粗估 token 占用：网关用量优先，字符启发兜底。 */
+  function estimateHistoryTokens(session: MobileSession): number {
+    let chars = 0;
+    for (const m of historyMessages(session)) chars += m.content.length;
+    const byChars = Math.ceil(chars / 2.5);
+    // 网关上一轮报回的 input_tokens 是**当时**窗口的真实水位；此后每轮对话只增不减
+    // （除了刚压过），两者取大是保守且不骗人的估计。
+    return Math.max(session.lastPromptTokens ?? 0, byChars);
+  }
+
+  /**
+   * 手动压缩收口后的续跑（0.7.4）。压缩进行中 sendText/立即发送都按"忙"处理（输入路由
+   * enqueue），它们等在队列/pendingStartNow 里；这条流跑完就轮到它们：
+   *   - 抢占项优先（与 afterTurnSettled 同一规则，失败/中断也不吞它）；
+   *   - success/noop：autoDrain 排空；
+   *   - failed/cancelled：有待排空项就把队列置为暂停 —— 与一轮失败/被停同一收场，
+   *     绝不拿一次失败的压缩静默吞用户的排队输入。
+   * 自动压缩不走这里：它挂在对话轮里，那条轮的 afterTurnSettled 已管着续跑。
+   */
+  function afterCompactSettled(
+    session: MobileSession,
+    outcome: "success" | "failed" | "cancelled" | "noop",
+  ): void {
+    if (sessions.get(session.sessionId) !== session) return;
+    // 另一条压缩还在飞（单飞闸外第二次调用只会拿 noop）：它的收口才管续跑，这里直接退场。
+    if (session.compactRun) return;
+    const pending = session.pendingStartNow;
+    if (pending) {
+      session.pendingStartNow = undefined;
+      startQueuedItem(session, pending);
+      return;
+    }
+    const hasQueued = session.queue.items.some((item) => item.dispatch.state === "queued");
+    if (outcome === "failed" || outcome === "cancelled") {
+      if (hasQueued && session.queue.autoDrain) {
+        session.queue.autoDrain = false;
+        session.queue.pauseReason = outcome === "cancelled" ? "stopped" : "error";
+        emitQueue(session, outcome === "cancelled" ? "压缩被中断，队列已暂停" : "压缩失败，队列已暂停");
+      }
+      return;
+    }
+    if (session.run) return; // 压缩期间开跑的新轮自己会排空，这里不抢它的续跑
+    if (!hasQueued || !session.queue.autoDrain) return;
+    const next = session.queue.items.find((item) => item.dispatch.state === "queued");
+    if (next) startQueuedItem(session, next);
+  }
+
+  /**
+   * 上下文压缩（0.7.4）：把压缩点之前的早期对话交给**当前模型**压成摘要，替换 transcript
+   * 的前部；时间线行**不删**（展示层全量回放），只让历史取用摘要。三条入口共用这一个函数：
+   *   - 自动：runTurn 装配 transcript 前，估算占用 ≥ COMPACT_TRIGGER_TOKENS；
+   *   - 命令：v4 `compact` 维护命令（UI 的 context usage 面板入口）；
+   *   - 输入前缀：sendText 的 "/compact"（与桌面 slashCommands 的识别口径一致）。
+   * 时间线上落一条 timelineMarker(compact) 行 —— 协议里这就是"已压缩上下文"的系统行
+   * （ConversationRowView 按 marker.status 渲染 started/completed/failed/skipped）。
+   * 失败/中断：marker 如实收 failed/cancelled，transcript 不动，下一轮自然退回
+   * historyMessages 的兜底截断（带省略标记），绝不静默吞对话。
+   */
+  async function runCompact(
+    session: MobileSession,
+    params: {
+      origin: "manual" | "auto";
+      selection: ModelSelectionValue | null;
+      sourceCommandId?: string;
+      clientId?: string;
+      /** 逐字保留的最近对话行数（自检注入小值逼出压缩边界；缺省 COMPACT_KEEP_RECENT_ROWS）。 */
+      keepRecentRows?: number;
+    },
+  ): Promise<"success" | "failed" | "cancelled" | "noop"> {
+    if (session.compactRun) return "noop"; // 单飞：同一会话同一时刻只跑一次压缩
+    const targets = options.modelTargets;
+    if (!targets) return "noop";
+    const keepRows =
+      params.keepRecentRows ?? options.compactKeepRecentRows ?? COMPACT_KEEP_RECENT_ROWS;
+    const coveredThrough = session.contextSummaryCoveredThroughRowId ?? 0;
+    // 可压的对话行 = 历史里会被逐字送进模型的那些（与 historyMessages 同判据）。
+    const candidates = session.rows.filter(
+      (row) =>
+        row.rowId > coveredThrough &&
+        ((row.kind === "userInput" && row.origin === "realUser") ||
+          (row.kind === "assistantText" && row.text)),
+    );
+    const markerRowId = takeRowId(session);
+    const markerTurnId = newId("compact");
+    /** running 期间把命令投进 pendingCommands —— 协议上这是"权威侧已接管"的凭据，
+     *  客户端按 commandId 让输入型命令的乐观投影退场；收口（任意终态）必须撤回。 */
+    const publishPendingCommand = (present: boolean): void => {
+      if (params.origin !== "manual" || !params.sourceCommandId) return;
+      const next = present
+        ? [
+            ...session.pendingCommands,
+            {
+              commandId: params.sourceCommandId,
+              clientId: params.clientId ?? boundClientId ?? "mobile-client",
+              type: "compact",
+              state: "executing" as const,
+              at: now(),
+            },
+          ]
+        : session.pendingCommands.filter((c) => c.commandId !== params.sourceCommandId);
+      session.pendingCommands = next;
+      // 带 control 一起发：patch.control 在场才会重算并下发 availability/inputRouting
+      // （见 updateState）—— 压缩进行中要让输入路由变 enqueue、compact 按钮变 busy，
+      // 终态撤回时再原样发一次把它们扳回来。
+      updateState(session, { revision: session.revision + 1, pendingCommands: next, control: session.control });
+    };
+    const appendMarker = (
+      marker: { type: "compact"; origin: "manual" | "auto"; status: "running" | "success" | "failed" | "noop" | "cancelled"; tokensBefore?: number; tokensAfter?: number },
+    ): void => {
+      upsertRow(session, {
+        rowId: markerRowId,
+        turnId: markerTurnId,
+        entityId: String(markerRowId),
+        createdAt: now(),
+        createdAtSeq: session.seq,
+        kind: "timelineMarker",
+        lane: "assistantWork",
+        ...(params.sourceCommandId ? { sourceCommandId: params.sourceCommandId } : {}),
+        marker,
+      } as ConversationRow);
+    };
+    // 尾部行数不足（全是值得逐字保留的近话）：没有可压的前段就如实 noop，不制造空摘要。
+    if (candidates.length <= keepRows + 1) {
+      if (params.origin === "manual") {
+        appendMarker({ type: "compact", origin: "manual", status: "noop" });
+        publishPendingCommand(false);
+        say("压缩请求被跳过：当前上下文还太短，没有可压缩的早期段落");
+      }
+      return "noop";
+    }
+    const selection = params.selection ?? session.config.modelSelection ?? null;
+    if (!selection?.providerId || !selection?.modelId) {
+      appendMarker({ type: "compact", origin: params.origin, status: "failed" });
+      say("上下文压缩失败：没有可用的模型选择");
+      return "failed";
+    }
+    const abort = new AbortController();
+    session.compactRun = { turnId: markerTurnId, markerRowId, abort, selection };
+    publishPendingCommand(true);
+    appendMarker({
+      type: "compact",
+      origin: params.origin,
+      status: "running",
+      tokensBefore: estimateHistoryTokens(session),
+    });
+    const tokensBefore = estimateHistoryTokens(session);
+    try {
+      const target = await resolveModelTarget(targets, selection);
+      if (options.deviceId) target.metadataUserId = options.deviceId;
+      // 压缩输入 = 将要送出的同一份历史（摘要 + 全部未压行），外加一条指令；
+      // 正文不进时间线（这条流的 onDelta 只收字），压缩产物本身替换历史前部。
+      // 单条正文封顶（COMPACT_MAX_MESSAGE_CHARS）：某条超长历史行不该把压缩请求自己撑爆。
+      const cappedInput: ModelTurnMessage[] = [
+        {
+          role: "system",
+          content:
+            "You are a context-compaction engine. Summarize the conversation so far so another " +
+            "AI assistant can continue the work with full fidelity. Preserve: the user's goals " +
+            "and constraints, decisions made, file paths/symbols/commands touched, important " +
+            "tool results, task progress (what is done vs. in flight), and anything promised. " +
+            "Write dense bullet notes. Never invent facts. Stay under 4000 characters.",
+        },
+        ...historyMessages(session).map((m) =>
+          m.content.length > COMPACT_MAX_MESSAGE_CHARS
+            ? { ...m, content: `${m.content.slice(0, COMPACT_MAX_MESSAGE_CHARS)}…（超长正文截尾）` }
+            : m,
+        ),
+        { role: "user", content: "Compress everything above into the summary notes now." },
+      ];
+      let summary = "";
+      const result = await streamModelCompletionWithRetry({
+        target,
+        messages: cappedInput,
+        // 摘要是"压缩产物"，不是对话回答：给小预算（默认档的四分之一），
+        // 防模型把压缩请求当续写任务写成长文。
+        maxOutputTokens: Math.min(MAX_OUTPUT_TOKENS, 4_096),
+        signal: abort.signal,
+        onDelta: (piece) => {
+          summary += piece;
+        },
+        onRetry: (attempt, waitMs, reason) =>
+          say(`压缩请求重连：第 ${attempt} 次尝试（上次 ${reason}，已等 ${Math.round(waitMs / 1000)} 秒）`),
+      });
+      // 注意：**不**把这次请求的 input_tokens 记成新基线 —— 它是压缩**前**的全文水位，
+      // 记下来会让下一轮的估算立刻再次越过阈值（连环自压）。压缩后的真实水位由
+      // 下一段字符启发 + 下一次对话轮的网关用量自然接管。
+      void result.usage;
+      summary = summary.trim();
+      if (abort.signal.aborted) throw Object.assign(new Error("aborted"), { aborted: true });
+      if (!summary) {
+        appendMarker({ type: "compact", origin: params.origin, status: "failed", tokensBefore });
+        say("上下文压缩失败：模型没有产出摘要");
+        return "failed";
+      }
+      if (summary.length > COMPACT_SUMMARY_MAX_CHARS) {
+        summary = `${summary.slice(0, COMPACT_SUMMARY_MAX_CHARS)}…（摘要超长，已截尾）`;
+      }
+      // 压缩边界 = 除最近 keepRows 条对话行之外的全部：这几行逐字保留，
+      // 模型看得见最新来回的原话；其余由摘要接管。
+      const keptFrom = candidates[candidates.length - keepRows];
+      session.contextSummary = summary;
+      session.contextSummaryCoveredThroughRowId = keptFrom ? keptFrom.rowId - 1 : coveredThrough;
+      session.omittedEarlyRows = undefined;
+      appendMarker({
+        type: "compact",
+        origin: params.origin,
+        status: "success",
+        tokensBefore,
+        tokensAfter: estimateHistoryTokens(session),
+      });
+      say(
+        `上下文已压缩（${params.origin === "auto" ? "自动" : "手动"}）：摘要替换早期 ${
+          candidates.length - keepRows
+        } 条对话行的历史占用（估算 ${tokensBefore} → ${estimateHistoryTokens(session)} token）`,
+      );
+      persistSession(session);
+      return "success";
+    } catch (e) {
+      const cancelled = abort.signal.aborted || (e as Error)?.message === "aborted";
+      appendMarker({
+        type: "compact",
+        origin: params.origin,
+        status: cancelled ? "cancelled" : "failed",
+        tokensBefore,
+      });
+      say(
+        `上下文压缩${cancelled ? "被中断" : "失败"}（${String((e as Error)?.message ?? e)}）：` +
+          "本轮退回兜底截断，历史不静默丢弃",
+      );
+      persistSession(session);
+      return cancelled ? "cancelled" : "failed";
+    } finally {
+      if (session.compactRun?.turnId === markerTurnId) session.compactRun = undefined;
+      // 任何终态都要撤回 pendingCommands（成功/失败/中断/空转都算）。manual 路径下
+      // publishPendingCommand(false) 自带一帧 control（把 availability/inputRouting 扳回空闲）；
+      // 自动压缩没有命令条目，但要补发 control 帧 —— 否则 UI 停在压缩期间收到的
+      // inputRouting=enqueue/compact=busy 那一拍上不动。
+      publishPendingCommand(false);
+      if (params.origin === "auto") {
+        updateState(session, { revision: session.revision + 1, control: session.control });
+      }
+    }
   }
 
   /**
@@ -1223,6 +1608,15 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       );
     }
     lines.push(`Workspace path on device: ${workspacePath}`);
+    // 0.8.0（工作区真路径线）：MANAGE 授予后选文件夹直发 /sdcard/… 真路径——告诉模型这就是
+    // 用户目录本体，它写的每个字节都是真文件、Bash 的 cwd 也在这里，没有 /mnt staging 与回写。
+    if (engine && /^\/(sdcard|storage)(\/|$)/.test(workspacePath)) {
+      lines.push(
+        `Your workspace IS the user's real folder ${workspacePath} — it is not a mirror or a virtual ` +
+          `mount: file tools and Bash read and write the actual files there, and everything you write is ` +
+          `immediately visible in the phone's Files app. There is no /mnt staging for this workspace.`,
+      );
+    }
     // 全部文件访问已授予（0.7.4）：告诉模型真实路径就在手边——不然它不知道能直接读写
     // /sdcard，更不会知道"下载文件夹"= /sdcard/Download（用户点名的"找不到下载文件夹"）。
     // Node harness 没有 zcodeDevice 桥 → 这一句不出现，systemPrompt 逐字不变（回归不受影响）。
@@ -1300,6 +1694,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     outcome:
       | { kind: "success"; text: string; model: string }
       | { kind: "empty" }
+      /** 0.7.4 插话失忆修复：被打断收口时，服务端副本里这条 assistant 行的 text 必须带着
+       *  已生成的半截正文。正文增量此前只走 row.delta（session.rows 的 text 永远停在开轮
+       *  预建的空串），下一轮 historyMessages 按 row.text 取历史时把这条整行跳过 —— 模型
+       *  "完全忘记做到一半的工作"。现在 onDelta 同步累加行内 text（与 reasoning 行同法），
+       *  这里保持"非 success 不动文本"的旧形状即可，半截正文已经在 assistant.text 里。 */
       | { kind: "interrupted" }
       | { kind: "failed"; code: string; message: string; source: "provider" | "runtime" | "network" },
   ): void {
@@ -1330,10 +1729,14 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           : outcome.kind === "interrupted"
             ? "interrupted"
             : "complete";
+      // 0.7.4 行为修正：success 不再用整轮 `streamed` 覆盖行内 text。正文增量现在实时同步
+      // 进服务端副本（onDelta 行内累加，插话失忆修复的落点），每行只持有自己的文本；
+      // 若仍用整轮拼接覆盖最后一行，中间叙述行 + 末行重复 = 下一轮历史把同一段话喂两遍。
+      // interrupted/failed 同样保持行内已累加的半截正文 —— 那正是"模型知道自己说到哪儿"的依据。
       upsertRow(session, {
         ...assistant,
         state,
-        ...(outcome.kind === "success" ? { text: outcome.text, model: outcome.model } : {}),
+        ...(outcome.kind === "success" ? { model: outcome.model } : {}),
       });
     }
 
@@ -1905,6 +2308,21 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     // 写了个死循环"。达到上限后不再续，正常收口——宁可少续一次，不在这里制造新的无界循环。
     let stopHookContinues = 0;
     const MAX_STOP_HOOK_CONTINUES = 5;
+    // ── 自动压缩（0.7.4，症状②接线）──
+    // 装配本轮 transcript 之前先看水位：估算占用 ≥ 阈值就把早期段压成摘要。
+    // 失败/中断不打死本轮：runCompact 自己收 marker，历史退回兜底截断（带省略标记），
+    // 本轮照常跑 —— 上下文问题绝不能再变成对话不可用。
+    const compactTriggerTokens = options.compactTriggerTokens ?? COMPACT_TRIGGER_TOKENS;
+    if (options.compactEnabled !== false && estimateHistoryTokens(session) >= compactTriggerTokens) {
+      say(
+        `上下文估算 ${estimateHistoryTokens(session)} token ≥ 阈值 ${compactTriggerTokens}，开轮前自动压缩`,
+      );
+      await runCompact(session, { origin: "auto", selection: params.selection ?? session.config.modelSelection ?? null });
+      if (signal.aborted) {
+        settleTurn(session, handles, { kind: "interrupted" });
+        return;
+      }
+    }
     // 本轮私有的模型 transcript：历史 + 每步的 assistant(tool_calls)/tool(结果)。
     // 循环第二步起模型必须看得见"自己调了什么、拿到什么"，否则只会重复调用。
     // 执行模式（0.7.2）：本轮所有审批/禁写判据的唯一来源（提交时已落进 session.config）。
@@ -2000,6 +2418,12 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                 currentAssistantRowId = rowId;
                 handles.assistantRowId = rowId; // settleTurn / DSML / 截断标注都跟最新一行走
               }
+              // 服务端副本同步累加（0.7.4 插话失忆修复，与上面 reasoning 行同法）：row.delta
+              // 只走线，session.rows 里这条正文行的 text 不跟着变的话，被打断收口后行内永远
+              // 停在开轮预建的空串，下一轮 historyMessages 按 row.text 取历史时整行跳过 ——
+              // 模型"完全忘记做到一半的工作重新开始"。文本在此实时入账。
+              const aRow = session.rows.find((r) => r.rowId === currentAssistantRowId);
+              if (aRow && aRow.kind === "assistantText") aRow.text += piece;
               stageDelta(session, {
                 op: "row.delta",
                 rowId: currentAssistantRowId,
@@ -2037,6 +2461,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         roundUsage.outputTokens += result.usage?.outputTokens ?? 0;
         session.cumulative.inputTokens += result.usage?.inputTokens ?? 0;
         session.cumulative.outputTokens += result.usage?.outputTokens ?? 0;
+        // 网关报回的输入水位是下一轮自动压缩触发估算的最新基线（每步刷新，取本轮最后一次）。
+        if (result.usage?.inputTokens) session.lastPromptTokens = result.usage.inputTokens;
 
         if (result.toolCalls.length === 0) {
           // GLM 方言兜底（0.4.8）：模型偶发把工具调用写成 DSML 标记文本而不是 tool_calls JSON，
@@ -2712,6 +3138,44 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       case "sendText": {
         const text = String(payload.text ?? "").trim();
         if (!text) return ackFor(envelope, session, "rejected", { reasonCode: "mobile.input.empty" });
+        // ── "/compact" 输入前缀（0.7.4，症状②）──
+        // 桌面 composer 把 "/compact" 解析成 compact 维护命令（v4/slashCommands），端侧
+        // 这条 sendText 前缀是"原文直发"路径的兜底：路由到**同一个** runCompact。
+        // 乐观气泡的收口凭据（头部规则 3）：先落一条带 commandId 的 realUser userInput 行
+        // ——用户确实发了这句话，如实留痕；随后就地压缩，不开模型轮。
+        if (/^\/compact(\s|$)/.test(text)) {
+          if (session.run) {
+            return ackFor(envelope, session, "rejected", {
+              reasonCode: "mobile.p0.busy",
+              message: "当前轮还在跑，等它收口后再压缩（或先按停止）。",
+            });
+          }
+          const maintenanceTurnId = newId("compactturn");
+          const rowId = takeRowId(session);
+          appendRow(session, {
+            rowId,
+            turnId: maintenanceTurnId,
+            entityId: String(rowId),
+            createdAt: now(),
+            createdAtSeq: session.seq,
+            kind: "userInput",
+            text,
+            origin: "realUser",
+            sourceCommandId: envelope.commandId,
+            visibility: "visible",
+          });
+          await runCompact(session, {
+            origin: "manual",
+            selection: session.config.modelSelection ?? null,
+            sourceCommandId: envelope.commandId,
+            clientId: envelope.clientId,
+          }).then((outcome) => afterCompactSettled(session, outcome));
+          const ack = ackFor(envelope, session, "accepted", {
+            result: { type: "inputAccepted", delivery: "startNow", inputId: String(rowId) },
+          });
+          commandResults.set(commandKey(envelope), ack);
+          return ack;
+        }
         // 执行模式（0.7.2）：这次提交带的模式意图落进会话配置——UI 工具栏读 config.mode
         // 显示"当前值"，运行侧读同一份决定审批与禁写。之前这里整个字段被丢掉，
         // 选择器点了没有任何效果（用户报的"访问调节功能无效"）。
@@ -2723,8 +3187,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         const modelSelection =
           (payload.modelSelection as ModelSelectionValue | undefined) ?? undefined;
 
-        // ── 空闲路径（含 held/choice）──
-        if (!session.run && !session.pendingStartNow) {
+        // ── 空闲路径（含 held/choice）。0.7.4：压缩进行中 = 忙（输入路由已在快照上说 enqueue），
+        // 走下面的入队/抢占分支，绝不在压缩改历史水位的同时开出新轮。──
+        if (!session.run && !session.compactRun && !session.pendingStartNow) {
           const hasQueued = session.queue.items.length > 0;
           if (hasQueued && !session.queue.autoDrain && requestedDelivery !== "startNow") {
             // held（completed + 队列非空 + autoDrain=false）：不静默入队也不静默丢弃，
@@ -2886,6 +3351,12 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           session.pendingStartNow = { ...item, dispatch: { state: "promoting" } };
           emitQueue(session, "立即发送：打断当前轮");
           session.run.abort.abort();
+        } else if (session.compactRun) {
+          // 压缩进行中（0.7.4）：用户按"立即发送"= 打断压缩（marker 如实收 cancelled，历史不动），
+          // 这条排到"下一个就跑"，由 afterCompactSettled 起跑 —— 与打断对话轮同一语义。
+          session.pendingStartNow = { ...item, dispatch: { state: "promoting" } };
+          emitQueue(session, "立即发送：打断压缩");
+          session.compactRun.abort.abort();
         } else {
           // 空闲：直接开跑（startQueuedItem 自己出队 + 发帧）。
           startQueuedItem(session, item);
@@ -2900,16 +3371,55 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         session.queue.autoDrain = autoDrain;
         if (autoDrain) session.queue.pauseReason = undefined;
         emitQueue(session, autoDrain ? "恢复自动排空" : "暂停自动排空");
-        // 空闲（不是刚被 stop 的收口路径）时点恢复：队列里还有待跑项就立刻开跑。
-        if (autoDrain && !session.run && !session.pendingStartNow) {
+        // 空闲（不是刚被 stop 的收口路径；压缩进行中也不算空闲，0.7.4）时点恢复：
+        // 队列里还有待跑项就立刻开跑。
+        if (autoDrain && !session.run && !session.compactRun && !session.pendingStartNow) {
           const next = session.queue.items.find((candidate) => candidate.dispatch.state === "queued");
           if (next) startQueuedItem(session, next);
         }
         return ackFor(envelope, session, "accepted");
       }
+      case "compact": {
+        // v4 维护命令（0.7.4 已接，UI 的 context usage 面板入口）。协议说"忙时进 FIFO"，
+        // 端侧的队列只承载 sendText 输入（queueItemSchema.kind 是闭集），维护命令无处挂；
+        // 如实回 busy 拒绝——availability.compact 在忙时本来就是关的，正常 UI 走不到这条。
+        if (session.run) {
+          return ackFor(envelope, session, "rejected", {
+            reasonCode: "mobile.p0.busy",
+            message: "当前轮还在跑，等它收口后再压缩。",
+          });
+        }
+        const outcome = await runCompact(session, {
+          origin: "manual",
+          selection: session.config.modelSelection ?? null,
+          sourceCommandId: envelope.commandId,
+          clientId: envelope.clientId,
+        });
+        afterCompactSettled(session, outcome);
+        const ack = ackFor(envelope, session, "accepted", {
+          message:
+            outcome === "success"
+              ? "已压缩上下文"
+              : outcome === "noop"
+                ? "当前上下文还太短，没有可压缩的早期段落"
+                : outcome === "cancelled"
+                  ? "压缩被中断，上下文未变动"
+                  : "压缩失败，本轮起历史按兜底截断送模型（不静默丢弃）",
+        });
+        commandResults.set(commandKey(envelope), ack);
+        return ack;
+      }
       case "stop": {
         const run = session.run;
-        if (!run) return ackFor(envelope, session, "noop", { reasonCode: "mobile.stop.idle" });
+        // 压缩进行中按停止 = 中断压缩（marker 如实收 cancelled，历史不动，退回兜底截断），
+        // 不是"停对话"——0.7.4：stop 对 compactRun 同样有效，绝不出现"停止键按不动"。
+        if (!run) {
+          if (session.compactRun) {
+            session.compactRun.abort.abort();
+            return ackFor(envelope, session, "accepted");
+          }
+          return ackFor(envelope, session, "noop", { reasonCode: "mobile.stop.idle" });
+        }
         const expected = payload.expectedForegroundExecutionId as string | undefined;
         if (expected && expected !== run.executionId) {
           return ackFor(envelope, session, "rejected", { reasonCode: "stale.stopTarget" });
@@ -3226,16 +3736,34 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       sessionId: string;
       limit: number;
       beforeRowId?: number;
-    }): Promise<{ rows: ConversationRow[]; hasMore: boolean }> {
-      // 翻页读历史行：内存 miss 时也去库里还原（workspacePath 这条通路没有，
-      // restoreSession 会用持久化记录里存的那份）。
+    }): Promise<{
+      rows: ConversationRow[];
+      hasMore: boolean;
+      atLogEpoch: string;
+      atSeq: number;
+      atRevision: number;
+    }> {
+      // 翻页读历史行（0.7.4 展示层完整回放的承重件，症状④）：内存 miss 时也去库里还原
+      // （workspacePath 这条通路没有，restoreSession 会用持久化记录里存的那份）。
+      // 返回形状必须带 atLogEpoch/atSeq/atRevision：上游 store 的 loadOlder 按
+      // result.atLogEpoch === 本地 snapshot.logEpoch 校验整页（conversationProjectionStore.ts:1005），
+      // 缺键 = 校验失败 = 每页被**整体丢弃** —— "更早历史"永远翻不出来，时间线只剩尾窗。
+      // rows 按 rowId 升序（协议约定），session.rows 本身即全序，切页保持原序。
       const session = sessionOrRestore(params.sessionId, "");
-      if (!session || session.missing) return { rows: [], hasMore: false };
+      if (!session || session.missing) {
+        return { rows: [], hasMore: false, atLogEpoch: session?.logEpoch ?? "missing", atSeq: 0, atRevision: 0 };
+      }
       const before = params.beforeRowId ?? Number.MAX_SAFE_INTEGER;
       const eligible = session.rows.filter((r) => r.rowId < before);
       const limit = Math.min(params.limit, PROTOCOL_V4_LIMITS.rowsRangeMaxLimit);
       const page = eligible.slice(-limit);
-      return { rows: page, hasMore: eligible.length > page.length };
+      return {
+        rows: page,
+        hasMore: eligible.length > page.length,
+        atLogEpoch: session.logEpoch,
+        atSeq: session.seq,
+        atRevision: session.revision,
+      };
     },
 
     // ── 会话状态快照（任务索引的回源口）──
@@ -3371,7 +3899,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
      */
     async disposeWorkspace(params: { workspacePath: string }): Promise<void> {
       for (const session of sessions.values()) {
-        if (session.workspacePath === params.workspacePath) session.run?.abort.abort();
+        if (session.workspacePath === params.workspacePath) {
+          session.run?.abort.abort();
+          // 0.7.4：压缩流同样要随 workspace 收场（marker 在 runCompact 的 catch 里如实收 cancelled）。
+          session.compactRun?.abort.abort();
+        }
       }
     },
 
@@ -3380,7 +3912,10 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = null;
       pendingDeltas.clear();
-      for (const session of sessions.values()) session.run?.abort.abort();
+      for (const session of sessions.values()) {
+        session.run?.abort.abort();
+        session.compactRun?.abort.abort();
+      }
       subscriptions.clear();
       indexSubs.clear();
       configSubs.clear();

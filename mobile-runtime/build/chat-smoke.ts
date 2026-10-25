@@ -55,6 +55,10 @@ let cutOnceArmed = false;
 /** cutMany 模式：前 CUT_MANY 次请求各发两片就掐线，之后正常——旧版 MAX_CONTINUATIONS=3
  *  会在第 3 次续写后放弃、整轮带"截断标注"收口；0.7.0 去上限后应一路续到成功。 */
 let cutManyRemaining = 0;
+/** 判据 13（自动压缩）用：mock 认出"上下文压缩引擎"系统提示的请求后回这段固定摘要。
+ *  agent.ts 的 runCompact 请求里必含 "context-compaction engine"（压缩 system 提示的原文），
+ *  这一条识别只存在于自检 mock，产品代码零 mock 痕迹。置 null 时压缩请求走正常流。 */
+let compactionSummaryText: string | null = null;
 const CUT_MANY = 5;
 
 /** 一个足够真的 OpenAI Chat Completions SSE 端点（协议细节按 model-stream.ts 的解析面来）。 */
@@ -87,6 +91,34 @@ function startMock(): Promise<{ url: string; close(): void }> {
           send({ success: false, providerCode: 50001, message: "套餐额度不足，请换一个模型" });
           send("[DONE]");
           res.end();
+          return;
+        }
+        // 判据 13 的仪器：压缩请求（系统提示含 "context-compaction engine"）回固定摘要，
+        // 与正常对话流区分开——自动压缩发生在对话轮装配前，那条流的回复必须是另一段文本。
+        if (
+          compactionSummaryText !== null &&
+          JSON.stringify(body).includes("context-compaction engine")
+        ) {
+          const done = (content: string) => {
+            send({
+              id: "chatcmpl-smoke",
+              object: "chat.completion.chunk",
+              created: 1,
+              model: "mock-model",
+              choices: [{ index: 0, delta: { content }, finish_reason: null }],
+            });
+            send({
+              id: "chatcmpl-smoke",
+              object: "chat.completion.chunk",
+              created: 1,
+              model: "mock-model",
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+              usage: { prompt_tokens: 900, completion_tokens: 30, total_tokens: 930 },
+            });
+            send("[DONE]");
+            res.end();
+          };
+          done(compactionSummaryText);
           return;
         }
         const pieces = mockMode === "slow" ? ["慢", "慢", "慢", "慢", "慢"] : [..."端侧对话自检：一、二、三"];
@@ -300,6 +332,7 @@ function makeRig(
     onDiagnostic?: (message: string) => void;
   }) => Promise<unknown>,
   toolEngineFactory?: (workspacePath: string) => Promise<unknown>,
+  agentOptions?: Record<string, unknown>,
 ) {
   const counts = { subscribe: 0, resync: 0, commands: 0 };
   const diagnostics: string[] = [];
@@ -327,6 +360,7 @@ function makeRig(
       ...(sessionStore !== undefined ? { sessionStore } : {}),
       ...(hookRuntimeFactory ? { hookRuntimeFactory: hookRuntimeFactory as never } : {}),
       ...(toolEngineFactory ? { toolEngine: toolEngineFactory as never } : {}),
+      ...(agentOptions ?? {}),
     }),
     "mobile:zcodeAgentService",
   );
@@ -1489,6 +1523,239 @@ async function main() {
     );
     rigReason.dispose();
     mockMode = "stream";
+
+    // ── 判据 12：插话不失忆（0.7.4 症状①）──
+    // 被打断的半截正文必须进**下一轮**发给模型的 messages。旧行为：正文只走 row.delta，
+    // session.rows 的行内 text 永远停在开轮预建的空串，historyMessages 跳过它 → 下一轮
+    // 模型看不见自己上一轮说到哪儿，"完全忘记做到一半的工作重新开始"。
+    mockMode = "slow";
+    requestLog = [];
+    const rigP = makeRig(mock.url);
+    const sP = await openSession(rigP);
+    await sendTurn(rigP, sP.store, sP.sessionId, "慢慢说第一句").ack;
+    await waitFor(
+      () => assistantRows(sP.store).some((r: { text?: string }) => (r.text ?? "").length > 0),
+      "停止前没有拿到任何增量",
+    );
+    const stopA = (await rigP.transport.sendCommand(
+      createCommandEnvelope({ type: "stop", sessionId: sP.sessionId, payload: {} }),
+    )) as { status: string };
+    check("插前：停止被 accepted", stopA.status === "accepted", JSON.stringify(stopA));
+    await waitFor(() => settle(sP.store), "被打断的这一轮没有落到终态", 8000, describe(rigP, sP.store));
+    requestLog = [];
+    const contA = sendTurn(rigP, sP.store, sP.sessionId, "接着上一句说");
+    await contA.ack;
+    await waitFor(() => settle(sP.store) && userRows(sP.store).length >= 2, "第二句没有跑完");
+    {
+      const secondBody = requestLog[0]?.body as {
+        messages?: Array<{ role?: string; content?: string }>;
+      };
+      const msgs = secondBody?.messages ?? [];
+      const partialKept = msgs.some(
+        (m) => m.role === "assistant" && (m.content ?? "").startsWith("慢"),
+      );
+      check(
+        "打断后下一轮 messages 含半截 assistant 正文（插话不失忆，症状①判据 a）",
+        partialKept,
+        JSON.stringify(msgs.map((m) => `${m.role}:${(m.content ?? "").slice(0, 12)}`)),
+      );
+      const noEmptyAssistant = msgs.every(
+        (m) => !(m.role === "assistant" && (m.content ?? "") === ""),
+      );
+      check(
+        "下一轮历史里没有空气泡 assistant（半截正文真的落了账）",
+        noEmptyAssistant,
+        JSON.stringify(msgs.map((m) => `${m.role}:${(m.content ?? "").length}`)),
+      );
+    }
+    rigP.dispose();
+    mockMode = "stream";
+
+    // ── 判据 13：/compact 前缀 + compact 命令（0.7.4 症状②手动路径）──
+    // keepRecentRows=1 让两三句历史就够出压缩边界（判据只看接线，不看摘要质量）。
+    const SUMMARY_TEXT = "【压缩摘要】前两轮工作已归档";
+    compactionSummaryText = SUMMARY_TEXT;
+    const rigC = makeRig(mock.url, undefined, undefined, undefined, { compactKeepRecentRows: 1 });
+    const sC = await openSession(rigC);
+    for (const t of ["历史甲一句", "历史乙一句"]) {
+      const r = sendTurn(rigC, sC.store, sC.sessionId, t);
+      await r.ack;
+      await waitFor(() => settle(sC.store) && userRows(sC.store).length >= (t === "历史甲一句" ? 1 : 2), `「${t}」没跑完`);
+    }
+    check(
+      "空闲时 availability.compact 开着（入口不再是假按钮）",
+      sC.store.getState().snapshot?.availability.compact.allowed === true,
+      JSON.stringify(sC.store.getState().snapshot?.availability.compact),
+    );
+    requestLog = [];
+    const slash = sendTurn(rigC, sC.store, sC.sessionId, "/compact");
+    const slashAck = (await slash.ack) as { status: string };
+    check("sendText '/compact' 被 accepted", slashAck.status === "accepted", JSON.stringify(slashAck));
+    await waitFor(
+      () =>
+        rowsOf(sC.store).some(
+          (r: { kind: string; marker?: { type?: string; status?: string } }) =>
+            r.kind === "timelineMarker" && r.marker?.type === "compact" && r.marker?.status === "success",
+        ),
+      "压缩的 marker 系统行没有落成 success",
+      8000,
+      describe(rigC, sC.store),
+    );
+    check(
+      "时间线落了 timelineMarker(compact) 系统行（协议里的'已压缩上下文'行）",
+      rowsOf(sC.store).some(
+        (r: { kind: string; marker?: { type?: string } }) =>
+          r.kind === "timelineMarker" && r.marker?.type === "compact",
+      ),
+      JSON.stringify(rowsOf(sC.store).map((r: { kind: string }) => r.kind)),
+    );
+    check(
+      "压缩请求真的发给当前模型（mock 认出 context-compaction 指令）",
+      requestLog.some((r) => JSON.stringify(r.body).includes("context-compaction engine")),
+      JSON.stringify(requestLog.map((r) => r.path)),
+    );
+    check(
+      "/compact 的乐观气泡退场（userInput 行带回 commandId，输入没被吞）",
+      sC.store.getState().optimisticCommands.length === 0 &&
+        userRows(sC.store).some((r: { text?: string }) => r.text === "/compact"),
+      JSON.stringify(sC.store.getState().optimisticCommands),
+    );
+    requestLog = [];
+    const afterC = sendTurn(rigC, sC.store, sC.sessionId, "压缩后继续说");
+    await afterC.ack;
+    await waitFor(() => settle(sC.store) && userRows(sC.store).length >= 4, "压缩后这一轮没跑完");
+    {
+      const body = requestLog[0]?.body as { messages?: Array<{ role?: string; content?: string }> };
+      const msgs = body?.messages ?? [];
+      const text = JSON.stringify(msgs);
+      check(
+        "压缩后下一轮 messages 含摘要文本（摘要替换 transcript 前部）",
+        text.includes(SUMMARY_TEXT),
+        text.slice(0, 400),
+      );
+      check(
+        "压缩后早期原文不再逐字送模型（被摘要顶替）",
+        !text.includes("历史甲一句"),
+        text.slice(0, 400),
+      );
+    }
+    // v4 compact 维护命令（UI 的 context usage 面板入口）同一路由
+    const cmdAck = (await rigC.transport.sendCommand(
+      createCommandEnvelope({ type: "compact", sessionId: sC.sessionId, payload: {} }),
+    )) as { status: string };
+    check(
+      "compact 维护命令被 accepted（不再是 P0 rejected）",
+      cmdAck.status === "accepted",
+      JSON.stringify(cmdAck),
+    );
+    compactionSummaryText = null;
+    rigC.dispose();
+
+    // ── 判据 14：自动压缩接上（0.7.4 症状②自动路径）──
+    // 注入极小阈值（50 token 估算）：三四句短对话就逼出开轮前自动压缩；缺省 60k 的判据
+    // 由代码走同一条 runCompact，这里只测接线与收场。
+    compactionSummaryText = "【自动压缩摘要】更早的来回已归档";
+    const rigAuto = makeRig(mock.url, undefined, undefined, undefined, {
+      compactTriggerTokens: 10,
+      compactKeepRecentRows: 1,
+    });
+    const sAuto = await openSession(rigAuto);
+    let autoFired = false;
+    for (const t of ["自动压第一句", "自动压第二句", "自动压第三句", "自动压第四句"]) {
+      const r = sendTurn(rigAuto, sAuto.store, sAuto.sessionId, t);
+      await r.ack;
+      await waitFor(() => settle(sAuto.store), `「${t}」没跑完`, 8000, describe(rigAuto, sAuto.store));
+      if (
+        rowsOf(sAuto.store).some(
+          (row: { kind: string; marker?: { type?: string; origin?: string } }) =>
+            row.kind === "timelineMarker" &&
+            row.marker?.type === "compact" &&
+            row.marker?.origin === "auto" &&
+            row.marker?.status === "success",
+        )
+      ) {
+        autoFired = true;
+        break;
+      }
+    }
+    check(
+      "超过估算阈值自动压缩（开轮前压成摘要 + marker 落 success）",
+      autoFired,
+      JSON.stringify(rowsOf(sAuto.store).map((row: { kind: string }) => row.kind)),
+    );
+    rigAuto.dispose();
+    compactionSummaryText = null;
+
+    // ── 判据 15：超 40 条不再无声掐断（0.7.4 症状③兜底路径）──
+    // 关掉压缩（compactEnabled:false）模拟"压缩失败/未接管"：42 条历史时旧行为是 slice(-40)
+    // 无声掐断；新行为必须注入"早期历史已省略 N 条"标记段，且送模型的历史仍封顶 40 条。
+    const rigFallback = makeRig(mock.url, undefined, undefined, undefined, { compactEnabled: false });
+    const sFB = await openSession(rigFallback);
+    const NB_TURNS = 22;
+    let omitMarkerSeen = false;
+    for (let i = 1; i <= NB_TURNS; i++) {
+      const r = sendTurn(rigFallback, sFB.store, sFB.sessionId, `兜底第${i}句`);
+      await r.ack;
+      await waitFor(() => settle(sFB.store) && userRows(sFB.store).length >= i, `第 ${i} 句没跑完`);
+      const lastBody = requestLog[requestLog.length - 1]?.body as
+        | { messages?: Array<{ role?: string; content?: string }> }
+        | undefined;
+      const msgs = lastBody?.messages ?? [];
+      const markerMsg = msgs.find((m) => (m.content ?? "").includes("早期历史已省略"));
+      if (markerMsg) {
+        omitMarkerSeen = true;
+        check(
+          "超限历史注入'早期历史已省略 N 条'标记段（不再无声掐断，症状③判据 c）",
+          /早期历史已省略 \d+ 条/.test(markerMsg.content ?? ""),
+          (markerMsg.content ?? "").slice(0, 80),
+        );
+        check(
+          "标记段之后仍保留最近 40 条对话（截断是兜底不是失踪）",
+          msgs.length === 1 + 1 + 40,
+          String(msgs.length),
+        );
+        break;
+      }
+    }
+    if (!omitMarkerSeen) {
+      check("超限历史注入省略标记（未触发）", false, `turns=${NB_TURNS} 没有出现标记段`);
+    }
+    rigFallback.dispose();
+    mockMode = "stream";
+
+    // ── 判据 16：翻页读历史行的纪元字段（0.7.4 症状④展示层回放）──
+    // store.loadOlder 按 atLogEpoch === 本地 snapshot.logEpoch 整页校验；缺字段 = 每页被
+    // 整体丢弃 = "更早的历史翻不出来"。直接打服务面验返回形状（时间线行本身全量保留已由
+    // 判据 6 的重启回放覆盖，SNAPSHOT_WINDOW_ROWS 只管尾窗不管展示集）。
+    {
+      const rigD = makeRig(mock.url);
+      const sD = await openSession(rigD);
+      const turnD = sendTurn(rigD, sD.store, sD.sessionId, "翻页用的一句");
+      await turnD.ack;
+      await waitFor(() => settle(sD.store), "这一轮没跑完");
+      const rangeResult = (await (rigD.service as Record<string, (...a: unknown[]) => Promise<unknown>>)[
+        "conversationRowsRangeV4"
+      ].call(rigD.service, {
+        workspacePath: "/work/smoke",
+        sessionId: sD.sessionId,
+        limit: 200,
+      })) as { rows: unknown[]; hasMore: boolean; atLogEpoch?: string; atSeq?: number; atRevision?: number };
+      const snap = sD.store.getState().snapshot;
+      check(
+        "rowsRange 返回带 atLogEpoch/atSeq/atRevision（loadOlder 不再整页丢弃，症状④）",
+        typeof rangeResult.atLogEpoch === "string" &&
+          rangeResult.atLogEpoch === snap?.logEpoch &&
+          typeof rangeResult.atSeq === "number" &&
+          typeof rangeResult.atRevision === "number",
+      JSON.stringify(rangeResult).slice(0, 200),
+      );
+      check(
+        "rowsRange 全量可读：时间线行都翻得回来（压缩只动历史取用，不动展示集）",
+        rangeResult.rows.length === (snap?.rows.totalCount ?? -1) && rangeResult.hasMore === false,
+        `range=${rangeResult.rows.length} total=${snap?.rows.totalCount}`,
+      );
+      rigD.dispose();
+    }
   } catch (e) {
     results.push({ name: "自检本身跑完了", ok: false, detail: String((e as Error)?.stack ?? e) });
   } finally {

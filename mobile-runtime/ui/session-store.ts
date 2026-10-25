@@ -47,6 +47,13 @@ export interface PersistedSessionState {
   nextRowId: number;
   /** 每轮的网关用量。readSession 的 snapshot 按轮报 tokens，丢了它还原后全变 0。 */
   turnUsage: Record<string, PersistedTurnUsage>;
+  /**
+   * 上下文压缩摘要（0.7.4）：覆盖 rows 中 rowId ≤ coveredThroughRowId 那段早期对话的摘要。
+   * 丢了它，重启后"已压缩"的会话要么把被摘要顶替的早期原文重新逐字送模型，要么既无摘要
+   * 又无原文。老记录没有这两个键 —— optional，还原按"未压缩"处理。
+   */
+  contextSummary?: string;
+  contextSummaryCoveredThroughRowId?: number;
   phase: SessionControl["phase"];
   lastError: SessionControl["lastError"];
 }
@@ -108,6 +115,12 @@ function parseState(raw: unknown): PersistedSessionState | null {
       },
       nextRowId: Number(parsed.nextRowId ?? parsed.rows.length + 1),
       turnUsage: (parsed.turnUsage ?? {}) as Record<string, PersistedTurnUsage>,
+      // 压缩摘要按 optional 透传（0.7.4）：老记录缺这两个键就是"未压缩"，新记录丢了它
+      // 还原出来的历史会与被摘要的原文对不上，所以这里必须带。
+      ...(typeof parsed.contextSummary === "string" ? { contextSummary: parsed.contextSummary } : {}),
+      ...(typeof parsed.contextSummaryCoveredThroughRowId === "number"
+        ? { contextSummaryCoveredThroughRowId: parsed.contextSummaryCoveredThroughRowId }
+        : {}),
       phase: parsed.phase as SessionControl["phase"],
       lastError: (parsed.lastError ?? null) as SessionControl["lastError"],
     };

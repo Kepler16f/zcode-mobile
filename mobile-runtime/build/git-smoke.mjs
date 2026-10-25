@@ -230,7 +230,11 @@ await check("⑦ 非法 action 报错：含收到值的码点形式与支持清�
 // "进了分支"即可，不真打流量。
 await check("⑧ enum/校验/分发三者同源：每个支持动作都真实分发", async () => {
   const tool = makeGitTool("/work/dispatch-probe", gitFs, undefined);
-  const enumList = tool.metadata.inputSchema.properties.action.enum;
+  // 0.8.0 回归钉：schema 必须住条目**顶层**——上游 ToolRegistry.toContracts() 只认 entry.inputSchema
+  // （registry.ts:114），嵌在 metadata 里模型就收到空参数声明（装机"未知 action：未收到"根因）。
+  expect(tool.inputSchema !== undefined, "inputSchema 不在顶层（历史错位复发？）");
+  expect(tool.metadata.inputSchema === undefined, "metadata 里不该再留一份 schema（双真相）");
+  const enumList = tool.inputSchema.properties.action.enum;
   expect(JSON.stringify(enumList) === JSON.stringify([...GIT_ACTIONS]), `enum 与 GIT_ACTIONS 漂移：${JSON.stringify(enumList)}`);
   const seen = [];
   const OID = "0123456789abcdef0123456789abcdef01234567";

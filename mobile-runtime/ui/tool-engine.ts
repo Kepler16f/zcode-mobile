@@ -105,6 +105,8 @@ interface CoreLike {
       name: string;
       description?: string;
       inputSchema?: Record<string, unknown>;
+      /** 自定义工具此前把 schema 错嵌进 metadata——类型面留口，映射处兜底读取。 */
+      metadata?: { inputSchema?: Record<string, unknown> };
     }>;
     /** 自定义工具注册（Delete 走这里；builtInTools 之外的 entry）。 */
     register(entry: unknown, options?: { silentDuplicateWarnings?: boolean }): void;
@@ -249,19 +251,21 @@ export function createToolEngineFactory(
       if (bashOn) {
         registry.register(
         {
+          // 0.8.0 事故修复：schema 住条目顶层（ToolEntry.inputSchema），不嵌 metadata——嵌了
+          // toContracts 拿 undefined，模型收到空参数声明（详见 git-tool.ts 同批注释）。
+          inputSchema: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "要删除的文件/目录（工作区相对或绝对路径）" },
+              recursive: { type: "boolean", description: "目录递归删除（默认 false）" },
+            },
+            required: ["path"],
+            additionalProperties: false,
+          },
           metadata: {
             name: DELETE_TOOL,
             description:
               "删除工作区里的文件或目录。SAF/树挂载的工作区（/mnt/… 路径）必须用这个工具——终端 rm 对这些路径既看不到也无权限。目录需 recursive=true。",
-            inputSchema: {
-              type: "object",
-              properties: {
-                path: { type: "string", description: "要删除的文件/目录（工作区相对或绝对路径）" },
-                recursive: { type: "boolean", description: "目录递归删除（默认 false）" },
-              },
-              required: ["path"],
-              additionalProperties: false,
-            },
           },
           handler: async (raw: unknown) => {
             const input = (raw ?? {}) as { path?: unknown; recursive?: unknown };
@@ -290,24 +294,25 @@ export function createToolEngineFactory(
       if (browserApi && typeof browserApi.open === "function" && browserControlEnabled()) {
         registry.register(
           {
+            // 0.8.0：schema 住顶层（同上批注释）。
+            inputSchema: {
+              type: "object",
+              properties: {
+                action: {
+                  type: "string",
+                  enum: ["open", "back", "read", "close"],
+                  description: "open=打开/跳转到 url（必填 url）；back=返回上一页；read=读取当前页面；close=关闭浏览器",
+                },
+                url: { type: "string", description: "要打开的完整地址（action=open 时必填，http/https）" },
+              },
+              required: ["action"],
+              additionalProperties: false,
+            },
             metadata: {
               name: BROWSER_TOOL,
               description:
                 "内置浏览器：打开网页并读取页面内容（标题+正文纯文本）。用户能看见浏览器页面并随时自己操作。" +
                 "只支持 http/https。适合查资料/看文档/验证线上页面；登录态与工作区文件无关。",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  action: {
-                    type: "string",
-                    enum: ["open", "back", "read", "close"],
-                    description: "open=打开/跳转到 url（必填 url）；back=返回上一页；read=读取当前页面；close=关闭浏览器",
-                  },
-                  url: { type: "string", description: "要打开的完整地址（action=open 时必填，http/https）" },
-                },
-                required: ["action"],
-                additionalProperties: false,
-              },
             },
             handler: async (raw: unknown) => {
               const input = (raw ?? {}) as { action?: unknown; url?: unknown };
@@ -348,12 +353,22 @@ export function createToolEngineFactory(
       //    速度而不是 SAF 的 30-40ms；命令前后走 Bash 同一套 staging 纪律
       //    （ensureStaging → 快照 → 命令 → diff 回写 SAF，.git 与工作区改动都落回）。
       //    首次全量物化可能较慢（进度走 say），之后命令级增量。
+      // 真路径工作区（0.7.9，MANAGE 授予后选文件夹直发 /sdcard/…）：没有 /mnt 挂载、也不在 /work，
+      // 但 FsBridge 的直通支让逐文件操作直达真实文件——git 该注册，走 native 后端、无 staging
+      // （镜像两拍对真路径是多余的：写下去就是真文件，没有"回写"这一步）。授权没给到的外部拼写
+      // 路径本就读不到，桥会拒，这里不替它兜底。
+      const externalReal = /^\/(sdcard|storage)(\/|$)/.test(workspacePath);
       const stageApiForGit = core.vfs.stage;
       const gitMount =
         !workspacePath.startsWith("/work") && stageApiForGit ? stageApiForGit.mountOf(workspacePath) : null;
-      if (workspacePath.startsWith("/work") || gitMount) {
+      if (workspacePath.startsWith("/work") || gitMount || (externalReal && (core.vfs as { native?: unknown }).native)) {
         const nativeBackend = (core.vfs as { native?: unknown }).native;
-        const gitFs = createGitFs(gitMount && nativeBackend ? nativeBackend : core.vfs);
+        // gitFs 后端：/mnt 镜像与真路径外部工作区都走 native——前者是为了私有盘速度绕开 SAF
+        // 的 30-40ms/RTT，后者因为派发层对非 /mnt 路径本就转 native（vfs.mjs implFor），直接用
+        // native 少一层派发且不经 stage.mirror（对真路径那本就是 no-op）。/work 派发层即可。
+        const gitFs = createGitFs(
+          (gitMount || externalReal) && nativeBackend ? nativeBackend : core.vfs,
+        );
         const stageControl =
           gitMount && stageApiForGit
             ? {
@@ -414,7 +429,12 @@ export function createToolEngineFactory(
       const tools: ModelToolSpec[] = registry.toContracts().map((c) => ({
         name: c.name,
         description: c.description ?? "",
-        parameters: c.inputSchema ?? { type: "object", properties: {} },
+        // 顶层 inputSchema 优先（上游契约位置）；metadata.inputSchema 是 0.8.0 前的历史错位，
+        // 留一层兜底防未来再有工具嵌错——但新写的必须住顶层。都缺才给空声明。
+        parameters:
+          c.inputSchema ??
+          (c as { metadata?: { inputSchema?: Record<string, unknown> } }).metadata?.inputSchema ??
+          { type: "object", properties: {} },
       }));
       if (tools.length === 0) {
         // 注册面变了（名字全对不上）：宁可不带工具，也不发一份空声明。

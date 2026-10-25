@@ -2,7 +2,13 @@
 // 契约来自 contracts/src/interfaces/file-system.port.ts，逐字段对齐，不自己发明返回形状。
 // 现在后端是 compat/vfs（内存）；换成 OPFS/SAF 只改 backend，调用方不动。
 
-function normalizePath(p) {
+// 0.7.9：相对路径归一必须**绑定本端口的 workspaceRoot**。写死 "/work" 是症状 1
+// （"工作区指定没有生效"）的直接来源：模型给相对路径（core 的 path-policy 会先按
+// workingDirectory 折成绝对，但 Glob 的 path、searchText 的 path 等入口仍可能带相对段进来），
+// 一旦落到 "/work/…"，越界闸把它当 /work 工作区成员放行——选了 /mnt/proj 或
+// /sdcard/Download 的会话里，文件却写进了私有盘 /work，用户看到的就是"会话没在指定文件夹里干活"。
+// 现在相对段一律落在本工作区根；非 /work 工作区里指向 /work 的绝对路径当场 permission_denied。
+function normalizePath(p, fallbackRoot = "/work") {
   const s = String(p ?? "").replace(/\\/g, "/");
   const abs = s.startsWith("/") || /^[A-Za-z]:\//.test(s);
   const out = [];
@@ -11,7 +17,7 @@ function normalizePath(p) {
     if (seg === "..") out.pop();
     else out.push(seg);
   }
-  return (abs ? "/" : "/work/") + out.join("/");
+  return (abs ? "/" : fallbackRoot.replace(/\/+$/, "") + "/") + out.join("/");
 }
 
 // core 侧用 isFileSystemPortError(e)（instanceof）分支，普通 Error 会被当成意外故障，
@@ -103,13 +109,13 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
   // 不做通配/前缀模糊匹配：批的是哪个目录就开哪个目录，最小授权面。
   const grantedRoots = [];
   function grantRoot(path) {
-    const n = normalizePath(String(path ?? ""));
+    const n = normalizePath(String(path ?? ""), root);
     if (!n || n === "/") return; // 根目录不批（等于全盘放开，那不是"询问授权"是"没有沙箱"）
     if (!grantedRoots.includes(n)) grantedRoots.push(n);
   }
   /** 撤销一次授权（"允许这一次"用完即收）：比 grantRoot 多删一项，语义对称。 */
   function revokeRoot(path) {
-    const n = normalizePath(String(path ?? ""));
+    const n = normalizePath(String(path ?? ""), root);
     const i = grantedRoots.indexOf(n);
     if (i >= 0) grantedRoots.splice(i, 1);
   }
@@ -133,7 +139,7 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
   }
 
   const guard = (p) => {
-    const n = normalizePath(p);
+    const n = normalizePath(p, root);
     // 直通真实路径（0.7.4，用户点名"别搞虚拟磁盘映射，直接改本地文件、要能找到下载文件夹"）：
     // /sdcard、/storage 原样交给 FsBridge——**授予后它就是它自己**（真实读写外部树），未授予时
     // FsBridge 抛 SecurityException→EACCES 并带"去哪授权"的引导。这里不再走 grantRoot 的会话级

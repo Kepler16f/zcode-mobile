@@ -3,11 +3,14 @@ package cn.zcode.mobile
 import android.content.Context
 import android.database.Cursor
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.provider.DocumentsContract
 import android.util.Base64
 import android.webkit.JavascriptInterface
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.FileNotFoundException
 
 /**
@@ -57,6 +60,46 @@ class TreeBridge(private val context: Context) {
         prefs.edit().putString(name, uri.toString()).putInt("$name#mode", modeFlags).apply()
         cache.put(name, uri)
         return "/mnt/$name"
+    }
+
+    /**
+     * 0.7.9（症状 2"指定了本地文件夹就不要虚拟磁盘映射"）：把 SAF 树 URI 还原成**真实本地路径**
+     * 的候选。三条硬条件，缺一不回 null：
+     *  1. MANAGE_EXTERNAL_STORAGE 已授予 —— 没授予时 java.io.File 对 /storage 直接 EACCES，
+     *     把真路径交出去等于给工具链一个"看得见摸不着"的假工作区（这正是 scoped storage 时代
+     *     必须走 DocumentFile 的原因，见本文件头注）。
+     *  2. 树是主存储卷（"primary"/"home" documentId、content://com.android.externalstorage
+     *     权威 provider）：SD 卡 / USB / 其它 app 的 provider 没有稳定的 POSIX 拼写，回 null
+     *     维持 /mnt/<名> 镜像那套。
+     *  3. 目录当场存在且可列 —— 还原错了宁可退回镜像，不交一个工具链走不通的路径。
+     * documentId 形态是 `volume:relative/path`（如 "primary:Download/我的项目"、"home" = 根）。
+     * **返回 /sdcard 拼写**，不返回 /storage/emulated/0：FsBridge.virtual() 把外部树的结果反演成
+     * /sdcard/…（0.7.4 直通支），工作区根、systemPrompt 的 "Workspace path on device"、工具回包、
+     * Bash 的 cd 与 ls 输出必须是同一串拼写——模型按返回路径再读又"找不到"就是拼写漂移的代价。
+     * file-system.mjs 的 guard 第一分支同样认 /sdcard。整条链不再有镜像、不再有 /mnt。
+     */
+    fun realPathOfExternalTree(uri: Uri): String? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        if (!Environment.isExternalStorageManager()) return null
+        if (uri.authority != "com.android.externalstorage.documents") return null
+        val docId = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull() ?: return null
+        // 只认主卷："primary"（含 "primary:<path>"）与孤立的 "home"（DocumentsUI 本地磁盘根）。
+        // "home:<别的东西>" 是 home 虚拟根下的卷级 documentId（如 home:primary、home:0000-0000/…），
+        // 它的 relative 段不是主卷相对路径——一律回 null 走 SAF 镜像；"0000-0000"/"usb" 等卷前缀
+        // 与其它 provider 同理由不直写。
+        if (docId != "home" && docId != "primary" && !docId.startsWith("primary:")) return null
+        val relative = docId.substringAfter(':', "").replace('\\', '/').trim('/')
+        if (relative.isNotEmpty()) {
+            // 逐级防 ".."/空段逃逸；任何畸形回 null（宁可退回 /mnt 镜像，不交一个越界路径）。
+            if (relative.split('/').any { it.isEmpty() || it == ".." }) return null
+        }
+        val base = runCatching { Environment.getExternalStorageDirectory().canonicalPath }.getOrNull()
+            ?: return null
+        val real = if (relative.isEmpty()) File(base) else File(base, relative.split('/').joinToString(File.separator))
+        val canonical = runCatching { real.canonicalPath }.getOrDefault(real.absolutePath)
+        if (canonical != base && !canonical.startsWith(base + File.separator)) return null
+        if (!real.isDirectory) return null
+        return if (relative.isEmpty()) "/sdcard" else "/sdcard/" + relative
     }
 
     @JavascriptInterface

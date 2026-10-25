@@ -132,8 +132,23 @@ class ExecBridge(private val context: Context) {
         return capture.second[0] ?: Captured("", 0, false)
     }
 
-    /** vfs 命名空间的路径（`/work/demo`）映射到应用私有的 workspace 目录，并挡掉 `..` 逃逸。 */
+    /**
+     * vfs 命名空间的路径（`/work/demo`）映射到应用私有的 workspace 目录，并挡掉 `..` 逃逸。
+     *
+     * 0.7.9（症状 2）：`/sdcard/…`、`/storage/…` 是**真实路径的工作区**（MANAGE 授予后文件工具
+     * 直通它自己，工作区根就是这串拼写），不能再折进私有盘 —— 折出来的
+     * workspaceRoot()/sdcard/… 在盘上不存在，Bash 当场"工作目录不存在"，整个工具面瘫在入口。
+     * 与 FsBridge 共用同一条拼写判定（ZcodePaths.isExternalStorageSpelling）。授予状态下子进程
+     * 与 app 同 uid、同挂 /sdcard 的 FUSE，cd/ls 直接可达（0.7.4 起 tool-engine 的 Bash 守卫
+     * 也按 allFilesGranted 放行同一条支路，两侧判据一致）。未授予时这里放行也只是 sh 自己报
+     * Permission denied —— 拦截职责在 JS 守卫，原生只做拼写映射，不越权裁决。
+     */
     private fun workspaceFile(path: String): File {
+        if (ZcodePaths.isExternalStorageSpelling(path)) {
+            val cleaned = path.replace('\\', '/')
+            require(cleaned.split('/').none { it == ".." }) { "非法工作目录：$path" }
+            return File(cleaned)
+        }
         val relative = path.trimStart('/').replace('\\', '/')
         require(!relative.split('/').any { it == ".." }) { "非法工作目录：$path" }
         return File(workspaceRoot(), relative)

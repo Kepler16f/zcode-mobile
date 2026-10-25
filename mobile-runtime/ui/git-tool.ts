@@ -306,6 +306,45 @@ function unknownActionError(raw: string, normalized: string): string {
 
 export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStageControl) {
   return {
+    // 0.8.0 事故修复：上游 ToolRegistry.toContracts() 从条目**顶层** inputSchema 取 schema
+    // （registry.ts:114，ToolEntry.inputSchema 是顶层必填字段）——此前 schema 嵌在 metadata 里，
+    // toContracts 拿到 undefined，发给模型的 function.parameters 退化成空对象，模型不知道有
+    // action 这个必填参数 → 不带参调用 → 装机"未知 action：未收到"。schema 必须住顶层。
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: [...GIT_ACTIONS],
+          description:
+            "动作名对大小写不敏感，首尾空白与零宽/双向字符会自动剥除。" +
+            "init=在当前工作区建 .git；clone=url 克隆到 dir（必传 url）；status=改动清单；add=暂存（path 或 '.'）；" +
+            "commit=message 提交暂存；log=最近 depth 条（默认 20）；branch=分支名列表 / ref 建分支+切换；" +
+            "remote=url 添加名为 remote 的远端 / 无 url 列出远端；push=推送当前分支到 remote（默认 origin）；" +
+            "pull=拉取并快进合并 remote 的同名分支；fetch=只取不合并",
+        },
+        url: { type: "string", description: "clone/remote 的远端地址（https，可内嵌 user:token）" },
+        dir: {
+          type: "string",
+          description:
+            "clone 目标目录（工作区相对路径）。'.' 或省略 = **附着模式**：把远端历史挂到当前工作区" +
+            "（init+origin+fetch+对齐 HEAD，不覆盖现有文件）——目录里已有文件就用这个，" +
+            "不要 clone 到子目录再搬 .git（会把仓库搬坏）",
+        },
+        path: { type: "string", description: "add 的文件/目录（'.' = 全部）" },
+        message: { type: "string", description: "commit 的提交说明" },
+        depth: { type: "number", description: "log 条数（默认 20）/ fetch 深度" },
+        ref: { type: "string", description: "branch 动作：建分支并切换；pull 动作：远端分支名（默认同名）" },
+        remote: { type: "string", description: "远端名（默认 origin）" },
+        force: { type: "boolean", description: "push/remote 的强制覆盖开关（默认 false，慎用）" },
+        username: { type: "string", description: "https 远端凭据的用户名（push/pull/fetch 用）" },
+        password: { type: "string", description: "https 远端凭据的密码/访问令牌（push/pull/fetch 用）" },
+        authorName: { type: "string", description: "commit 覆盖作者名" },
+        authorEmail: { type: "string", description: "commit 覆盖作者邮箱" },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
     metadata: {
       name: GIT_TOOL,
       description:
@@ -315,41 +354,6 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
         "大仓库首次会慢（全量镜像）。" +
         "push/pull/fetch 需要凭据的 https 远端：url 里内嵌（https://user:token@host/…）或传 username/password 参数" +
         "（GitHub/GitLab 用 PAT 当 password）；没有凭据时先向用户要令牌再调用，不要盲试。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          action: {
-            type: "string",
-            enum: [...GIT_ACTIONS],
-            description:
-              "动作名对大小写不敏感，首尾空白与零宽/双向字符会自动剥除。" +
-              "init=在当前工作区建 .git；clone=url 克隆到 dir（必传 url）；status=改动清单；add=暂存（path 或 '.'）；" +
-              "commit=message 提交暂存；log=最近 depth 条（默认 20）；branch=分支名列表 / ref 建分支+切换；" +
-              "remote=url 添加名为 remote 的远端 / 无 url 列出远端；push=推送当前分支到 remote（默认 origin）；" +
-              "pull=拉取并快进合并 remote 的同名分支；fetch=只取不合并",
-          },
-          url: { type: "string", description: "clone/remote 的远端地址（https，可内嵌 user:token）" },
-          dir: {
-            type: "string",
-            description:
-              "clone 目标目录（工作区相对路径）。'.' 或省略 = **附着模式**：把远端历史挂到当前工作区" +
-              "（init+origin+fetch+对齐 HEAD，不覆盖现有文件）——目录里已有文件就用这个，" +
-              "不要 clone 到子目录再搬 .git（会把仓库搬坏）",
-          },
-          path: { type: "string", description: "add 的文件/目录（'.' = 全部）" },
-          message: { type: "string", description: "commit 的提交说明" },
-          depth: { type: "number", description: "log 条数（默认 20）/ fetch 深度" },
-          ref: { type: "string", description: "branch 动作：建分支并切换；pull 动作：远端分支名（默认同名）" },
-          remote: { type: "string", description: "远端名（默认 origin）" },
-          force: { type: "boolean", description: "push/remote 的强制覆盖开关（默认 false，慎用）" },
-          username: { type: "string", description: "https 远端凭据的用户名（push/pull/fetch 用）" },
-          password: { type: "string", description: "https 远端凭据的密码/访问令牌（push/pull/fetch 用）" },
-          authorName: { type: "string", description: "commit 覆盖作者名" },
-          authorEmail: { type: "string", description: "commit 覆盖作者邮箱" },
-        },
-        required: ["action"],
-        additionalProperties: false,
-      },
     },
     handler: async (raw: unknown) => {
       const input = (raw ?? {}) as Record<string, unknown>;

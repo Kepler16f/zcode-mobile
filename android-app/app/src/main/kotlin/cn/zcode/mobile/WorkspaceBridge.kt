@@ -80,6 +80,18 @@ class WorkspaceBridge(
             // 拿不到持久授权：本进程内仍可读，但重启会丢。registerTree 按"未持久化"拒绝挂载，
             // 下面会如实回 null 让用户重选，而不是给一个"打开了但重启就坏"的假工作区。
         }
+        // 0.7.9（症状 2"如果我指定了本地文件夹，就不要用什么虚拟磁盘映射了"）：授予"所有文件
+        // 访问"后，主存储卷的树 URI 有真实 POSIX 拼写（/sdcard/<相对路径>）——直接把它当工作区根
+        // 交回 JS，不再 registerTree，不再 /mnt/<名> 虚拟根，不再有 vfs-stage 镜像/回写两拍。
+        // FsBridge 的直通支（0.7.4）认这条拼写并当场读写真实文件；ExecBridge 的 cwd 映射同步
+        // 放行（见 workspaceFile）。判定不成立（SD 卡/USB/其它 provider、未授权、目录不存在）时
+        // 回落到旧的 SAF 挂载——scoped storage 下那是唯一合法通路，宁可用镜像也不给假路径。
+        val realPath = treeBridge.realPathOfExternalTree(uri)
+        if (realPath != null) {
+            Log.i(TAG, "工作区走真实路径（不再挂载 /mnt）：$realPath")
+            deliver(realPath)
+            return true
+        }
         val mounted = treeBridge.registerTree(uri, grantFlags)
         deliver(if (mounted.isEmpty()) null else mounted)
         return true

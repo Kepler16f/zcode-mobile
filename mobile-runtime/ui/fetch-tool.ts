@@ -102,23 +102,26 @@ export function makeFetchTool(
     return Boolean(bridge && typeof bridge.call === "function");
   };
   return {
+    // 0.8.0 事故修复：schema 住条目顶层（ToolEntry.inputSchema），不嵌 metadata——嵌了
+    // toContracts 拿 undefined，模型收到空参数声明（详见 git-tool.ts 同批注释）。
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["fetch", "download"], description: "fetch=读取并返回内容；download=下载到工作区文件" },
+        url: { type: "string", description: "http/https 完整地址（必填）" },
+        path: { type: "string", description: "download 时的落盘路径（工作区相对，或绝对 /work、/mnt/<名>、/sdcard/…；action=download 必填）" },
+        headers: { type: "object", description: "可选请求头（string→string）" },
+      },
+      required: ["action", "url"],
+      additionalProperties: false,
+    },
     metadata: {
       name: FETCH_TOOL,
       description:
         "网络下载（内置，等效 curl/wget，无需安装）。action=fetch：GET 一个 http/https URL，把响应内容回给你（文本类给正文预览，二进制只报大小/类型不落盘）；" +
         "action=download：把 URL 的字节下载并写进工作区 path（等效 wget -O），可用于取依赖、抓文件。" +
+        "path 是工作区相对路径即可；绝对路径按当前工作区根（/work、/mnt/<名> 或 /sdcard/… 真路径工作区）解析。" +
         "只允许 http/https；工作区外的路径会被授权闸拦下按询问授权处理。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          action: { type: "string", enum: ["fetch", "download"], description: "fetch=读取并返回内容；download=下载到工作区文件" },
-          url: { type: "string", description: "http/https 完整地址（必填）" },
-          path: { type: "string", description: "download 时的落盘路径（工作区相对或绝对 /work、/mnt/…；action=download 必填）" },
-          headers: { type: "object", description: "可选请求头（string→string）" },
-        },
-        required: ["action", "url"],
-        additionalProperties: false,
-      },
     },
     handler: async (raw: unknown) => {
       if (!bridgePresent()) throw new Error("端侧没有原生 HTTP 桥（zcodeGitHttp），发不了出网请求");
