@@ -837,7 +837,10 @@ export async function runDeviceChecks(rt) {
     } catch {
       return { fail: "证人链读数坏了（JSON 解析失败）", raw: globalThis.localStorage?.getItem("zcode-mobile.topbar.diag") };
     }
+    let inputRecoveries = [];
+    try { inputRecoveries = JSON.parse(globalThis.localStorage?.getItem("zcode-mobile.input-recovery") ?? "[]"); } catch {}
     if (!diag) {
+      if (inputRecoveries.length) return { inputRecoveries, note: "记录到弹层退出后遗留的触摸锁，已自动恢复；这类冻结不会造成心跳间隔增加。" };
       return { skipped: true, reason: "UI 页从没写过顶栏证人（shell 没 boot 或 #sidebar 晚于预算挂载）——先发消息打开对话页再跑这条" };
     }
     expect(
@@ -894,6 +897,7 @@ export async function runDeviceChecks(rt) {
       // 共 2100ms、单次最慢 480ms"这类归因直接可读。旧读数没有这两个字段，缺省 null（好事）。
       bridges: diag.bridges ?? null,
       slowCalls: (diag.slowCalls ?? []).slice(0, 8),
+      inputRecoveries,
       note:
         diag.total === 0
           ? (diag.slowCalls ?? []).length

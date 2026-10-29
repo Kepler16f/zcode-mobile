@@ -35,6 +35,18 @@ await esbuild.build({
   write: true,
   logLevel: "warning",
   external: ["node:*"],
+  // window-controller 依赖 @zcode/rpc 与 @zcode/shared——这些是 pnpm workspace 包，
+  // 它们的链接挂在各包的 node_modules/@zcode 下（zcode-cli 自己那份没有）。
+  // esbuild 不读 pnpm-workspace.yaml，必须像 chat-smoke 那样把 nodePaths 指过去，
+  // 否则报 "Could not resolve @zcode/rpc"。
+  nodePaths: [
+    path.join(zcodeRoot, "packages/web/node_modules"),
+    path.join(zcodeRoot, "packages/ui/node_modules"),
+    path.join(zcodeRoot, "packages/client/node_modules"),
+    path.join(zcodeRoot, "packages/services/node_modules"),
+    path.join(zcodeRoot, "packages/shared/node_modules"),
+    path.join(zcodeRoot, "node_modules"),
+  ],
 });
 const mod = await import(pathToFileURL(tmp).href);
 fs.rmSync(tmp, { force: true });
@@ -53,6 +65,7 @@ const fakeRepo = {
   async queryTaskList(params) {
     const items = [...rows.values()]
       .filter((r) => !r.deleted)
+      .filter((r) => !params.excludeTaskIdPrefix || !r.meta.taskId.startsWith(params.excludeTaskIdPrefix))
       .filter((r) => {
         if (params.kind === "pinned") return r.pinned && !r.archived;
         if (params.kind === "archived") return r.archived;
@@ -109,10 +122,12 @@ const fakeSyncer = {
 };
 
 const diagLines = [];
+const runningSessions = new Set();
 const controller = createMobileWindowControllerService({
   taskIndexRepo: fakeRepo,
   taskIndexSyncer: fakeSyncer,
   onDiagnostic: (m) => diagLines.push(m),
+  isSessionRunning: id => runningSessions.has(id),
 });
 
 // 订阅 Controller 帧（收 delta）——必须先 subscribeControllerV4，publishDeltas 只投给已订阅的 topic
@@ -191,5 +206,14 @@ check("⑤取消归档→帧 membership.active=true", unarchDelta?.task?.members
 const timeline = await controller.listTaskList({ kind: "timeline", workspaceScopes: [{ workspacePath: WS }] });
 check("⑥timeline 不含已归档行", timeline.items.every((i) => i.taskId !== TASK_ID || !rows.get(TASK_ID).archived));
 
+rows.get(TASK_ID).meta.status = "running";
+const stale = await controller.listTaskList({kind:"timeline",workspaceScopes:[{workspacePath:WS}],sortBy:"updated"});
+check("⑦重启无运行owner：持久化running不会继续显示转圈",stale.items.find(i=>i.taskId===TASK_ID)?.liveStatus==="idle");
+runningSessions.add(TASK_ID);
+const live = await controller.listTaskList({kind:"timeline",workspaceScopes:[{workspacePath:WS}],sortBy:"updated"});
+check("⑧真实owner正在运行：侧栏显示running",live.items.find(i=>i.taskId===TASK_ID)?.liveStatus==="running");
+rows.set("mobile-subagent-legacy",{meta:{...metaBase,taskId:"mobile-subagent-legacy"},pinned:false,archived:false,deleted:false});
+const filtered=await controller.listTaskList({kind:"timeline",workspaceScopes:[{workspacePath:WS}],sortBy:"updated"});
+check("⑨旧子会话不进入任务行或分页总数",!filtered.items.some(i=>i.taskId.startsWith("mobile-subagent-"))&&filtered.total===filtered.items.length);
 console.log(`\n任务写链冒烟：${pass}/${pass + fail} PASS`);
 process.exit(fail > 0 ? 1 : 0);

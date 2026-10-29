@@ -12,14 +12,29 @@
 // 其余 OAuth/payment/企业定价请求原样放行。解析失败也原样放行——那是 fetch 自己该报的错，
 // 不该由这里吞掉或改写。
 
+export const DESKTOP_COMPATIBILITY_VERSION_KEY = "zcode-mobile.desktopCompatibilityVersion";
+export function desktopCompatibilityVersion(fallback: string): string {
+  try {return globalThis.localStorage?.getItem(DESKTOP_COMPATIBILITY_VERSION_KEY)?.trim() || fallback;} catch {return fallback;}
+}
+export function setDesktopCompatibilityVersion(version: string): void {
+  if (version && !/^\d{1,3}\.\d{1,3}\.\d{1,3}(?:[-+][\w.-]+)?$/.test(version)) throw new Error("版本号格式无效，例如3.0.0");
+  if (version) globalThis.localStorage.setItem(DESKTOP_COMPATIBILITY_VERSION_KEY,version);
+  else globalThis.localStorage.removeItem(DESKTOP_COMPATIBILITY_VERSION_KEY);
+}
 export function rewritePlatformForServer(input: string | URL): string | URL {
   try {
     const url = typeof input === "string" ? new URL(input, globalThis.location?.href ?? "https://zcode.z.ai") : new URL(input.href);
     const platform = url.searchParams.get("platform");
+    let changed = false;
+    const compatVersion = desktopCompatibilityVersion("");
+    if (compatVersion && url.searchParams.has("app_version") &&
+        (url.hostname.endsWith(".z.ai") || url.hostname.endsWith(".bigmodel.cn"))) {
+      url.searchParams.set("app_version",compatVersion);changed=true;
+    }
     // 判据收紧成"整个值就是 android，或 android-<arch>"：上游的取值永远是 `${platform}-${arch}`
     // （process 垫片报 android/arm64），而裸 startsWith("android") 会把 androidology 这种
     // 不相干的值也改写掉——冒烟里那条判据抓的就是它。
-    if (!platform || (platform !== "android" && !platform.startsWith("android-"))) return input;
+    if (!platform || (platform !== "android" && !platform.startsWith("android-"))) return changed ? url : input;
     // x64 的模拟器宿主（android-x64/android-x86_64）落到 linux-x64；真机 arm 族落到 linux-arm64。
     const mapped = /x64|x86_64/i.test(platform) ? "linux-x64" : "linux-arm64";
     url.searchParams.set("platform", mapped);

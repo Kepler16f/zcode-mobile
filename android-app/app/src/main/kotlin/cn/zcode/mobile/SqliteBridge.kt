@@ -112,8 +112,6 @@ class SqliteBridge(private val context: Context) {
     }
 
     private fun runStatement(db: SQLiteDatabase, sql: String, bound: Array<Any?>): String {
-        val statement = db.compileStatement(sql)
-        bindParams(statement, bound)
         // 与上面 pragma 的 ignoreCase 同一条纪律：TaskIndexRepo 的迁移与 upsert 发的是**大写**
         // `INSERT INTO ...`（sqlite-session-store 那侧小写混用），按小写判会把 INSERT 误投进
         // executeUpdateDelete 分支——虽然 last_insert_rowid() 兜底不至于丢 rowid，但这是"侧栏空"
@@ -122,12 +120,16 @@ class SqliteBridge(private val context: Context) {
         val isInsert = head.startsWith("insert") || head.startsWith("replace")
         val changes: Long
         val rowId: Long
-        if (isInsert) {
-            rowId = statement.executeInsert()
-            changes = db.compileStatement("SELECT changes()").simpleQueryForLong() ?: 0
-        } else {
-            changes = statement.executeUpdateDelete().toLong()
-            rowId = db.compileStatement("SELECT last_insert_rowid()").simpleQueryForLong() ?: 0
+        // 每次保存/更新都会编译语句；不关闭会随长会话持续累积原生资源，最终拖慢整个 WebView。
+        db.compileStatement(sql).use { statement ->
+            bindParams(statement, bound)
+            if (isInsert) {
+                rowId = statement.executeInsert()
+                changes = db.compileStatement("SELECT changes()").use { it.simpleQueryForLong() }
+            } else {
+                changes = statement.executeUpdateDelete().toLong()
+                rowId = db.compileStatement("SELECT last_insert_rowid()").use { it.simpleQueryForLong() }
+            }
         }
         return JSONObject().put("changes", changes).put("lastInsertRowid", rowId).toString()
     }

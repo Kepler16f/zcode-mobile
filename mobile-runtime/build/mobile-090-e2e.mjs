@@ -1,0 +1,91 @@
+import {createRequire} from "node:module";
+import assert from "node:assert/strict";
+import {readFileSync,writeFileSync} from "node:fs";
+import {startChatdev} from "./chatdev.mjs";
+const require=createRequire(new URL("../../zcode/apps/zcode-cli/package.json",import.meta.url));
+const {chromium}=require("playwright-core");
+const host=await startChatdev(8996);
+const browser=await chromium.launch({executablePath:"C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"});
+const page=await browser.newPage({viewport:{width:393,height:851},isMobile:true,hasTouch:true});
+const errors=[];page.on("pageerror",e=>errors.push(String(e)));
+const missingFonts=[];page.on("response",r=>{if(r.status()>=400&&/KaTeX/.test(r.url()))missingFonts.push(r.url());});
+page.on("console",m=>{if(/shiki|highlight|CodeViewer/i.test(m.text()))console.log("HIGHLIGHT",m.type(),m.text().slice(0,700));});
+await page.addInitScript(()=>{globalThis.__longTasks=[];new PerformanceObserver(list=>{globalThis.__longTasks.push(...list.getEntries().map(e=>e.duration));}).observe({type:"longtask",buffered:true});});
+try{
+  await page.goto("http://127.0.0.1:8996/?devCredentials=1",{timeout:60000});
+  for(let i=0;i<60;i++){
+    if(await page.locator('[data-testid="v4-composer-send"]').isVisible().catch(()=>false))break;
+    for(const label of ["跳过","使用 API key"]){const b=page.getByText(label,{exact:false}).first();if(await b.isVisible().catch(()=>false))await b.click().catch(()=>{});}
+    await page.waitForTimeout(300);
+  }
+  await page.waitForTimeout(1000);
+  const setup=readFileSync(new URL("./mode-probe.mjs",import.meta.url),"utf8");
+  const configure=setup.slice(setup.indexOf("// 先按真机路径"),setup.indexOf("// 打开模式菜单")).replace("/mock/stream/v1","/mock/subagent/v1");
+  await new (Object.getPrototypeOf(async()=>{}).constructor)("page","port","check",configure)(page,8996,(name,ok)=>{assert.ok(ok,name);console.log("PASS",name);});
+  await page.locator('[data-testid="v4-composer-input"]').fill("验证抽屉");
+  await page.locator('[data-testid="v4-composer-send"]').click();
+  await page.evaluate(()=>{globalThis.__longTasks=[];});
+  const child=page.locator('[data-testid*="subagent-open-side-pane"]').first();
+  await child.waitFor({timeout:20000});await child.click();
+  await page.waitForTimeout(500);
+  const drawer=page.locator('[data-testid="mobile-side-pane-drawer"]');
+  console.log("DRAWER",await drawer.boundingBox(),await drawer.getAttribute("aria-hidden"));
+  assert.equal(await drawer.getAttribute("aria-hidden"),"false");
+  assert.ok((await drawer.boundingBox()).width>350);
+  console.log("LAYOUT",await page.locator('[data-testid="v4-composer-input"]').boundingBox());
+  await page.screenshot({path:"D:/Zcode/tmp/mobile-090-drawer.png"});
+  await page.locator('[data-testid="mobile-side-pane-scrim"]').click({position:{x:4,y:300}});
+  await page.waitForTimeout(300);
+  console.log("CLOSED",await drawer.getAttribute("aria-hidden"));
+  assert.equal(await drawer.getAttribute("aria-hidden"),"true");
+  const timings=[];
+  for(let i=0;i<8;i++){
+    const t=Date.now();await page.locator('[data-testid="side-pane-toggle"]').click();await page.waitForTimeout(230);
+    await page.locator('[data-testid="mobile-side-pane-scrim"]').click({position:{x:4,y:300}});
+    await page.waitForTimeout(230);timings.push(Date.now()-t);
+  }
+  await page.locator('[data-testid="side-pane-toggle"]').click();await page.waitForTimeout(500);
+  assert.ok((await drawer.innerText()).includes("子代理长文本"),"真实子会话内容显示");
+  await drawer.locator(".katex").first().waitFor({state:"attached",timeout:15000});
+  // 长回复默认滚到底部；代码查看器按可见性才装配，把代码滚入视口再验证着色。
+  await drawer.locator('[data-language="typescript"]').first().scrollIntoViewIfNeeded();
+  await page.waitForTimeout(1500);
+  const fontCount=await page.evaluate(async()=>{const fonts=await document.fonts.load('16px KaTeX_Main');await document.fonts.ready;return fonts.length;});
+  assert.ok(fontCount>0,"KaTeX真实字体加载");assert.deepEqual(missingFonts,[]);
+  writeFileSync("D:/Zcode/tmp/mobile-090-child-dom.html",await drawer.innerHTML());
+  console.log("SHADOW",await drawer.locator("diffs-container").evaluateAll(nodes=>nodes.map(n=>({shadow:!!n.shadowRoot,html:n.shadowRoot?.innerHTML?.slice(-1600)}))));
+  console.log("TOKEN SPANS",await drawer.locator("span[style]").evaluateAll(spans=>spans.slice(0,12).map(s=>({text:s.textContent.slice(0,60),style:s.getAttribute("style")}))));
+  assert.ok(await drawer.getByText("const",{exact:true}).count(),"代码经过高亮器输出拆分的语法token");
+  console.log("PASS 去重后的代码高亮与KaTeX字体实际加载",fontCount);
+  assert.ok((await page.evaluate(()=>globalThis.__zcodeMobileMeta.taskRows())).every(row=>!row.taskId.startsWith("mobile-subagent-")),"真实子会话未进入普通任务索引");
+  await page.screenshot({path:"D:/Zcode/tmp/mobile-090-math-code.png"});
+  await page.locator('[data-testid="mobile-side-pane-scrim"]').click({position:{x:4,y:300}});
+  console.log("PASS 子代理长文本+8次开关",timings);
+  await page.setViewportSize({width:851,height:393});await page.waitForTimeout(500);
+  console.log("LANDSCAPE DRAWER COUNT",await drawer.count());
+  assert.equal(await drawer.count(),0);
+  await page.setViewportSize({width:393,height:851});await page.waitForTimeout(500);
+  await page.locator('[data-testid="web-sidebar-toggle"]').click();await page.waitForTimeout(300);
+  await page.locator('[data-testid="task-settings-button"]').click();await page.waitForTimeout(600);
+  await page.getByRole("button",{name:"常规",exact:true}).click();await page.waitForTimeout(400);
+  await page.locator('[data-testid="mobile-desktop-version"]').fill("3.14.3");
+  await page.getByRole("button",{name:"保存",exact:true}).first().click();await page.waitForTimeout(300);
+  assert.equal(await page.evaluate(()=>localStorage.getItem("zcode-mobile.desktopCompatibilityVersion")),"3.14.3");
+  console.log("PASS 桌面兼容版本通过设置持久化");
+  await page.getByRole("button",{name:"记忆",exact:true}).click();await page.waitForTimeout(400);
+  await page.screenshot({path:"D:/Zcode/tmp/mobile-090-memory.png"});
+  console.log("MEMORY",(await page.locator("body").innerText()).slice(-1400));
+  await page.getByRole("button",{name:"使用统计",exact:true}).click();await page.waitForTimeout(600);
+  await page.locator('[data-app-usage="true"]').getByText("模型用量",{exact:true}).waitFor({timeout:15000});
+  await page.screenshot({path:"D:/Zcode/tmp/mobile-090-usage.png"});
+  assert.ok(await page.locator('[data-app-usage="true"]').count(),"应用用量真实数据界面");
+  console.log("PASS 竖屏应用用量页",await page.locator('[data-app-usage="true"]').boundingBox());
+  console.log("SETTINGS BODY",(await page.locator("body").innerText()).slice(-6000));
+  console.log(await page.locator("button").evaluateAll(bs=>bs.map(b=>({text:b.innerText,title:b.title,aria:b.getAttribute("aria-label"),test:b.getAttribute("data-testid")}))));
+  console.log("BODY",(await page.locator("body").innerText()).slice(0,5000));
+  await page.screenshot({path:"D:/Zcode/tmp/mobile-090-main.png"});
+  writeFileSync("D:/Zcode/tmp/mobile-090-dom.html",await page.content());
+  console.log("ERRORS",errors);
+  assert.deepEqual(errors,[]);
+  console.log("长任务最大毫秒",await page.evaluate(()=>Math.max(0,...globalThis.__longTasks)));
+}finally{await browser.close();await host.close();}

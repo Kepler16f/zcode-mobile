@@ -12,8 +12,34 @@
 // 所以帧里只要命中 success===false 或非零 providerCode/error_code/code，或者 event: error，
 // 这里直接抛，绝不把载荷交给渲染。
 import type { ModelApiFormat } from "./provider-target.js";
+import { mobileModelFetch } from "./model-transport.js";
 
 export type { ModelApiFormat };
+
+/**
+ * 鉴权方式：端侧自己发 HTTP，所以"用哪个头带凭据"必须由配置说了算。
+ *
+ * 为什么不能一律 `Authorization: Bearer`：Azure 用 `api-key`、Google 用 `x-goog-api-key`、
+ * 还有些网关把 Key 放在 query 里。默认塞 Bearer 等于给网关**同时**递两份凭据——严格网关
+ * 直接拒（双认证），宽松网关取错那一份（拿 Bearer 里的 Key 去比 api-key，判无效）。
+ */
+export type ModelAuthMode =
+  /** Anthropic 兼容网关：`x-api-key` 与 `Authorization: Bearer` 同时发（MiniMax 等依赖这个组合）。 */
+  | "anthropic"
+  | "bearer"
+  | "x-api-key"
+  | "api-key"
+  | "x-goog-api-key"
+  /** 完全不带凭据（Key 走 query 参数等其它通道）。 */
+  | "none";
+
+/** 认证头名 → 模式。用户显式配了哪一个，就只认哪一个（大小写不敏感）。 */
+const AUTH_HEADER_MODES: ReadonlyArray<readonly [string, ModelAuthMode]> = [
+  ["authorization", "bearer"],
+  ["x-api-key", "x-api-key"],
+  ["api-key", "api-key"],
+  ["x-goog-api-key", "x-goog-api-key"],
+];
 
 /** 一次模型调用的落点：全部来自 Provider 配置快照，不接受 UI 传来的自由 URL。 */
 export interface ModelTarget {
@@ -22,6 +48,8 @@ export interface ModelTarget {
   baseUrl: string;
   apiKey: string;
   headers?: Record<string, string>;
+  /** 鉴权方式。缺省时按已配置的认证头推断，推断不出再按 apiFormat 取默认。 */
+  authMode?: ModelAuthMode;
   model: string;
   /** 设备标识：桌面把它写进 anthropic 请求的 `metadata.user_id`，端侧带同一个值。 */
   metadataUserId?: string;
@@ -36,6 +64,9 @@ export interface ModelTarget {
   reasoningValues?: readonly string[];
   /** 该模型声明的单轮输出上限（optionSpecs.maxOutputTokens.max）；agent 按它收紧默认预算。 */
   maxOutputTokensCap?: number;
+  /** 模型声明的上下文窗口；没有声明时保持未知。 */
+  contextWindow?: number;
+  inputCapabilities?: { image?: boolean; pdf?: boolean; text?: boolean };
 }
 
 /**
@@ -44,7 +75,8 @@ export interface ModelTarget {
  * 请求侧 tools→input_schema、assistant tool_calls→tool_use 块、role=tool→user+tool_result 块；
  * 响应侧 content_block_start/input_json_delta 流式累加、非流式 message.content[] 摘取。
  * 装机症状"思考完说要开始工作就被截断"的端侧半因：anthropic 格式下请求从未声明过 tools，
- * 模型无工具可调只能 end_turn）。openai-responses 的 function_call 条目形态仍**一行未接**——
+ * 模型无工具可调只能 end_turn）。openai-responses 的 function_call 条目形态也已接上
+ * （请求侧发 function 条目 tools，响应侧按 call_id 摘成 toolCalls）——
  * 没有 mock 验证过的形状不猜。
  */
 export interface ModelToolCall {
@@ -65,10 +97,47 @@ export interface ModelTurnMessage {
   /** "tool" 是工具结果回传；openai-chat-completions 原样发，anthropic-messages 折成 user+tool_result。 */
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  attachments?: Array<{ fileName: string; mime: string; dataBase64: string }>;
   /** assistant 消息带的工具调用（流式合并后的完整形状）。 */
   toolCalls?: ModelToolCall[];
   /** role==="tool" 时对应的调用 id。 */
   toolCallId?: string;
+}
+
+function attachmentText(attachment: { fileName: string; dataBase64: string }): string {
+  const binary = atob(attachment.dataBase64);
+  if (binary.length > 1024 * 1024) throw new ModelStreamError("model.attachmentTooLarge", `文本附件 ${attachment.fileName} 超过 1 MiB`);
+  const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
+  return `[附件：${attachment.fileName}]\n${new TextDecoder("utf-8", { fatal: true }).decode(bytes)}`;
+}
+
+function attachmentBlocks(message: ModelTurnMessage, format: "chat" | "anthropic" | "responses"): unknown[] | null {
+  if (!message.attachments?.length) return null;
+  const blocks: unknown[] = [];
+  if (message.content) blocks.push({ type: format === "responses" ? "input_text" : "text", text: message.content });
+  for (const attachment of message.attachments) {
+    const mime = attachment.mime.toLowerCase();
+    if (mime.startsWith("text/") || mime === "application/json") {
+      blocks.push({ type: format === "responses" ? "input_text" : "text", text: attachmentText(attachment) });
+    } else if (mime.startsWith("image/")) {
+      const dataUrl = `data:${mime};base64,${attachment.dataBase64}`;
+      blocks.push(format === "anthropic"
+        ? { type: "image", source: { type: "base64", media_type: mime, data: attachment.dataBase64 } }
+        : format === "responses"
+          ? { type: "input_image", image_url: dataUrl }
+          : { type: "image_url", image_url: { url: dataUrl } });
+    } else if (mime === "application/pdf") {
+      const dataUrl = `data:application/pdf;base64,${attachment.dataBase64}`;
+      blocks.push(format === "anthropic"
+        ? { type: "document", source: { type: "base64", media_type: mime, data: attachment.dataBase64 }, title: attachment.fileName }
+        : format === "responses"
+          ? { type: "input_file", filename: attachment.fileName, file_data: dataUrl }
+          : { type: "file", file: { filename: attachment.fileName, file_data: dataUrl } });
+    } else {
+      throw new ModelStreamError("model.attachmentUnsupported", `不支持附件类型：${attachment.mime}`);
+    }
+  }
+  return blocks;
 }
 
 export interface ModelStreamUsage {
@@ -123,6 +192,51 @@ function headerValue(
   return undefined;
 }
 
+/** 用户配的头算不算"配了"：空白值等于没配（否则会顶掉默认值又递不出凭据）。 */
+function hasConfiguredHeader(headers: Record<string, string> | undefined, name: string): boolean {
+  const value = headerValue(headers, name);
+  return value !== undefined && value.trim() !== "";
+}
+
+/** 该模式要带哪几个认证头。anthropic 是两条腿（x-api-key + Bearer），其余各一条。 */
+function authHeadersFor(mode: ModelAuthMode, apiKey: string): Array<{ name: string; value: string }> {
+  if (apiKey.trim() === "") return [];
+  switch (mode) {
+    case "anthropic":
+      return [
+        { name: "x-api-key", value: apiKey },
+        { name: "authorization", value: `Bearer ${apiKey}` },
+      ];
+    case "bearer":
+      return [{ name: "authorization", value: `Bearer ${apiKey}` }];
+    case "x-api-key":
+      return [{ name: "x-api-key", value: apiKey }];
+    case "api-key":
+      return [{ name: "api-key", value: apiKey }];
+    case "x-goog-api-key":
+      return [{ name: "x-goog-api-key", value: apiKey }];
+    case "none":
+      return [];
+  }
+}
+
+/**
+ * 鉴权方式推断。**唯一口径**：provider-target 解析时算一次落进 target，
+ * buildHeaders 直接用；这里再兜一次底，好让直接构造 ModelTarget 的调用方（自检、子代理）
+ * 得到同样的结果——两处各算一套必然漂移。
+ *
+ * 优先级：显式 authMode → 用户已配的认证头 → apiFormat 默认。
+ * 推断顺序与 AUTH_HEADER_MODES 一致：authorization → x-api-key → api-key → x-goog-api-key。
+ */
+export function inferAuthMode(
+  headers: Record<string, string> | undefined,
+  apiFormat: ModelApiFormat,
+): ModelAuthMode {
+  const configured = AUTH_HEADER_MODES.find(([name]) => hasConfiguredHeader(headers, name))?.[1];
+  if (configured) return configured;
+  return apiFormat === "anthropic-messages" ? "anthropic" : "bearer";
+}
+
 /**
  * 鉴权头与上游一致：Anthropic 兼容网关同时读 `x-api-key` 和 `Authorization: Bearer`，
  * 而 Coding Plan 的凭据是 `apiKey.secretKey` 这种带点的复合格式，只有 Bearer 那条读得通，
@@ -130,20 +244,40 @@ function headerValue(
  * 用户自己配的 `config.api.headers` 优先级最高——显式配置不该被我们盖掉。
  */
 function buildHeaders(target: ModelTarget): Record<string, string> {
-  const base: Record<string, string> = { "content-type": "application/json" };
+  const userHeaders = target.headers ?? {};
+  // 显式 authMode 优先；没配就从用户的认证头推断；再没有才按 apiFormat 取默认。
+  const mode: ModelAuthMode = target.authMode ?? inferAuthMode(userHeaders, target.apiFormat);
+
+  // 小写名 → 值。键一律小写：HTTP 头名本身大小写不敏感，而 fetch 规范会把同名不同大小写的
+  // 两个头**合并**成 "a, b"（值坏掉），所以必须在发出前就归一。
+  const out = new Map<string, string>();
+  out.set("content-type", "application/json");
   if (target.apiFormat === "anthropic-messages") {
-    base["x-api-key"] = target.apiKey;
-    base["anthropic-version"] = ANTHROPIC_VERSION;
+    // 协议头：版本可由用户在 api.headers 里覆盖（大小写不敏感），没配才用默认。
+    out.set("anthropic-version", ANTHROPIC_VERSION);
     // api.anthropic.com 对浏览器源请求要求这个自报家门头（会拒没有它的 CORS 请求）；
     // anthropic 兼容池子忽略它，无副作用——"兼容 v1/messages" 的两条腿之一。
-    base["anthropic-dangerous-direct-browser-access"] = "true";
-    if (!headerValue(target.headers, "authorization")) {
-      base["authorization"] = `Bearer ${target.apiKey}`;
-    }
-  } else if (!headerValue(target.headers, "authorization")) {
-    base["authorization"] = `Bearer ${target.apiKey}`;
+    out.set("anthropic-dangerous-direct-browser-access", "true");
   }
-  return { ...base, ...(target.headers ?? {}) };
+  // 认证头：只在有 Key、且用户没自己配认证头时才注入（避免双认证被网关拒）。
+  // 用户配了**任意**认证头 → 整套默认认证头都不注入：默认那套（尤其 anthropic 的
+  // x-api-key + Bearer 两条腿）跟用户那份叠在一起就是双认证，严格网关直接拒，
+  // 宽松网关取错那一份判凭据无效。用户既然显式配了，以他的为准。
+  // 桌面 withAnthropicAuthorizationHeader 是"按同名头让位"（只让 authorization 那一条）；
+  // 端侧要覆盖的协议族更杂（Azure api-key / Google x-goog-api-key / query 鉴权），
+  // 统一按"用户配了认证头就整套让位"处理，避免留下第二条腿变成双认证。
+  const userConfiguredAuth = AUTH_HEADER_MODES.some(([name]) => hasConfiguredHeader(userHeaders, name));
+  if (!userConfiguredAuth) {
+    for (const auth of authHeadersFor(mode, target.apiKey)) {
+      out.set(auth.name, auth.value);
+    }
+  }
+  // 用户显式配置优先，且大小写不敏感：同名（不论大小写）用用户的值覆盖默认值。
+  for (const [name, value] of Object.entries(userHeaders)) {
+    if (typeof value !== "string" || value.trim() === "") continue;
+    out.set(name.toLowerCase(), value);
+  }
+  return Object.fromEntries(out);
 }
 
 /**
@@ -266,7 +400,7 @@ function toAnthropicMessages(msgs: ModelTurnMessage[]): unknown[] {
       out.push({ role: "assistant", content: blocks });
       continue;
     }
-    out.push({ role: m.role, content: m.content });
+    out.push({ role: m.role, content: attachmentBlocks(m, "anthropic") ?? m.content });
   }
   return out;
 }
@@ -277,6 +411,15 @@ function buildRequest(
   maxOutputTokens: number,
   tools?: ModelToolSpec[],
 ): { url: string; headers: Record<string, string>; body: string } {
+  for (const message of messages) {
+    for (const attachment of message.attachments ?? []) {
+      const mime = attachment.mime.toLowerCase();
+      const unsupported = mime.startsWith("image/") ? target.inputCapabilities?.image === false
+        : mime === "application/pdf" ? target.inputCapabilities?.pdf === false
+          : target.inputCapabilities?.text === false;
+      if (unsupported) throw new ModelStreamError("model.attachmentUnsupported", `当前模型不支持附件 ${attachment.fileName}（${attachment.mime}）`);
+    }
+  }
   const url = modelRequestUrl(target);
 
   // 思考档位（0.5.1）：只在用户显式选了档位时才进请求体。
@@ -329,7 +472,18 @@ function buildRequest(
         })),
       };
     }
-    return { role: m.role, content: m.content };
+    return { role: m.role, content: attachmentBlocks(m, "chat") ?? m.content };
+  };
+
+  const toResponsesItems = (m: ModelTurnMessage): unknown[] => {
+    if (m.role === "tool") return [{ type: "function_call_output", call_id: m.toolCallId ?? "", output: m.content }];
+    if (m.role === "assistant" && m.toolCalls?.length) {
+      return [
+        ...(m.content ? [{ role: "assistant", content: m.content }] : []),
+        ...m.toolCalls.map((call) => ({ type: "function_call", call_id: call.id, name: call.name, arguments: call.arguments })),
+      ];
+    }
+    return [{ role: m.role, content: attachmentBlocks(m, "responses") ?? m.content }];
   };
 
   const body =
@@ -354,12 +508,14 @@ function buildRequest(
             stream: true,
             max_output_tokens: maxOutputTokens,
             ...reasoningSpread,
-            input: rest.map((m) => ({ role: m.role, content: m.content })),
+            input: messages.flatMap(toResponsesItems),
+            ...(tools?.length ? { tools: tools.map((t) => ({ type: "function", name: t.name, description: t.description, parameters: t.parameters, strict: false })) } : {}),
           }
         : {
             model: target.model,
             stream: true,
             max_tokens: maxOutputTokens,
+            stream_options: { include_usage: true },
             messages: messages.map(toChatMessage),
             // tools 不传时整个键缺席（不是 tools: []）——无工具路径的请求体逐字节不变。
             ...(tools && tools.length > 0
@@ -471,6 +627,7 @@ async function readLimitedText(response: Response): Promise<string> {
       }
     }
   } finally {
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
   return text;
@@ -517,9 +674,14 @@ function extractText(apiFormat: ModelApiFormat, payload: unknown): string {
     return "";
   }
   if (apiFormat === "openai-responses") {
-    return record.type === "response.output_text.delta" && typeof record.delta === "string"
-      ? record.delta
-      : "";
+    if (record.type === "response.output_text.delta" && typeof record.delta === "string") return record.delta;
+    if (Array.isArray(record.output)) {
+      return (record.output as Array<{ type?: string; content?: Array<{ type?: string; text?: unknown }> }>)
+        .flatMap((item) => item.type === "message" && Array.isArray(item.content) ? item.content : [])
+        .filter((part) => part.type === "output_text" && typeof part.text === "string")
+        .map((part) => part.text as string).join("");
+    }
+    return "";
   }
   const choices = record.choices;
   if (Array.isArray(choices)) {
@@ -587,7 +749,11 @@ function extractFinishReason(apiFormat: ModelApiFormat, payload: unknown): strin
     const response = record.response as
       | { status?: unknown; incomplete_details?: { reason?: unknown } | null }
       | undefined;
-    if (!response) return null;
+    if (!response) {
+      const details = record.incomplete_details as { reason?: unknown } | null | undefined;
+      if (details?.reason === "max_output_tokens") return "length";
+      return typeof record.status === "string" ? record.status : null;
+    }
     const reason = response.incomplete_details?.reason;
     if (typeof reason === "string" && reason) return reason === "max_output_tokens" ? "length" : reason;
     return typeof response.status === "string" ? response.status : null;
@@ -598,28 +764,40 @@ function extractFinishReason(apiFormat: ModelApiFormat, payload: unknown): strin
   return typeof finish === "string" && finish ? finish : null;
 }
 
-function extractUsage(apiFormat: ModelApiFormat, payload: unknown): ModelStreamUsage | null {
+function extractUsage(apiFormat: ModelApiFormat, payload: unknown): Partial<ModelStreamUsage> | null {
   if (typeof payload !== "object" || payload === null) return null;
   const record = payload as Record<string, unknown>;
-  if (apiFormat === "anthropic-messages") {
-    // anthropic 把末班用量放在 message_delta 里。
-    if (record.type !== "message_delta") return null;
-    const usage = record.usage as { input_tokens?: number; output_tokens?: number } | undefined;
-    return usage ? { inputTokens: usage.input_tokens ?? 0, outputTokens: usage.output_tokens ?? 0 } : null;
-  }
-  const usage = record.usage as
+  // Anthropic 流的输入和输出分别位于 message_start.message.usage 与
+  // message_delta.usage；Responses 流的用量位于 response.completed.response.usage。
+  // 非流式响应则直接放在顶层 usage。只取实际给出的字段，避免后续帧清零先前用量。
+  const message = record.message as Record<string, unknown> | undefined;
+  const response = record.response as Record<string, unknown> | undefined;
+  const rawUsage = apiFormat === "anthropic-messages" && record.type === "message_start"
+    ? message?.usage
+    : apiFormat === "openai-responses" && response?.usage
+      ? response.usage
+      : record.usage;
+  const usage = rawUsage as
     | {
         prompt_tokens?: number;
         completion_tokens?: number;
         input_tokens?: number;
         output_tokens?: number;
+        cache_read_input_tokens?: number;
+        cache_creation_input_tokens?: number;
       }
     | undefined;
   if (!usage) return null;
-  return {
-    inputTokens: usage.prompt_tokens ?? usage.input_tokens ?? 0,
-    outputTokens: usage.completion_tokens ?? usage.output_tokens ?? 0,
-  };
+  // Anthropic（包括 MiniMax 兼容接口）的 input_tokens 只含未命中缓存部分。
+  // 缓存命中的提示词仍占上下文；遗漏它会把长会话显示为每次仅增加1~几token。
+  const input = usage.prompt_tokens ?? (typeof usage.input_tokens === "number"
+    ? usage.input_tokens + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0)
+    : undefined);
+  const output = usage.completion_tokens ?? usage.output_tokens;
+  const result: Partial<ModelStreamUsage> = {};
+  if (typeof input === "number" && Number.isFinite(input) && input >= 0) result.inputTokens = input;
+  if (typeof output === "number" && Number.isFinite(output) && output >= 0) result.outputTokens = output;
+  return Object.keys(result).length ? result : null;
 }
 
 /** 非流式 JSON 载荷里 OpenAI 的一次性 tool_calls（`choices[0].message.tool_calls`，已是完整形状）。 */
@@ -712,6 +890,40 @@ function accumulateAnthropicToolCalls(
     prev.arguments += d.partial_json;
     acc.set(index, prev);
   }
+}
+
+/** Responses 的 call_id 与 item id 是不同概念；回传结果必须使用 call_id。 */
+function accumulateResponsesToolCalls(payload: Record<string, unknown>, acc: Map<number, ModelToolCall>): void {
+  const index = typeof payload.output_index === "number" ? payload.output_index : 0;
+  const item = payload.item as { type?: string; call_id?: string; name?: string; arguments?: string } | undefined;
+  if ((payload.type === "response.output_item.added" || payload.type === "response.output_item.done") && item?.type === "function_call") {
+    const previous = acc.get(index) ?? { id: "", name: "", arguments: "" };
+    acc.set(index, {
+      id: item.call_id ?? previous.id,
+      name: item.name ?? previous.name,
+      arguments: item.arguments ?? previous.arguments,
+    });
+  } else if (payload.type === "response.function_call_arguments.delta" && typeof payload.delta === "string") {
+    const previous = acc.get(index) ?? { id: "", name: "", arguments: "" };
+    previous.arguments += payload.delta;
+    acc.set(index, previous);
+  } else if (payload.type === "response.function_call_arguments.done" && typeof payload.arguments === "string") {
+    const previous = acc.get(index) ?? { id: "", name: "", arguments: "" };
+    previous.arguments = payload.arguments;
+    if (typeof payload.name === "string") previous.name = payload.name;
+    acc.set(index, previous);
+  }
+}
+
+function responsesToolCallsFromJson(payload: Record<string, unknown>): ModelToolCall[] {
+  if (!Array.isArray(payload.output)) return [];
+  return payload.output.flatMap((item: unknown) => {
+    if (!item || typeof item !== "object") return [];
+    const call = item as { type?: string; call_id?: string; name?: string; arguments?: string };
+    return call.type === "function_call" && call.call_id && call.name
+      ? [{ id: call.call_id, name: call.name, arguments: call.arguments ?? "" }]
+      : [];
+  });
 }
 
 /** 非流式整包 message（池子忽略 stream:true 的形状）：content[] 里的 tool_use 块。 */
@@ -808,8 +1020,7 @@ export async function streamModelCompletion(params: {
   let response: Response;
   try {
     armIdle(firstByteMs);
-    response = await fetch(request.url, {
-      method: "POST",
+    response = await mobileModelFetch(request.url, {
       headers: request.headers,
       body: request.body,
       signal: fetchSignal,
@@ -890,7 +1101,10 @@ export async function streamModelCompletion(params: {
       throw new ModelStreamError("model.streamError", message);
     }
     const nextUsage = extractUsage(target.apiFormat, payload);
-    if (nextUsage) usage = nextUsage;
+    if (nextUsage) usage = {
+      inputTokens: Math.max(nextUsage.inputTokens ?? 0, usage?.inputTokens ?? 0),
+      outputTokens: Math.max(nextUsage.outputTokens ?? 0, usage?.outputTokens ?? 0),
+    };
     const nextFinish = extractFinishReason(target.apiFormat, payload);
     if (nextFinish) {
       finishReason = nextFinish;
@@ -909,6 +1123,9 @@ export async function streamModelCompletion(params: {
     }
     if (target.apiFormat === "anthropic-messages" && typeof payload === "object" && payload !== null) {
       accumulateAnthropicToolCalls(payload as Record<string, unknown>, toolAcc);
+    }
+    if (target.apiFormat === "openai-responses" && typeof payload === "object" && payload !== null) {
+      accumulateResponsesToolCalls(payload as Record<string, unknown>, toolAcc);
     }
     // 思考增量先于正文的 `if (!delta) return`：GLM/DeepSeek 的思考帧常常只有
     // reasoning_content、没有 content，早退会把整帧的思考一起丢掉（0.7.3 主诉）。
@@ -954,7 +1171,7 @@ export async function streamModelCompletion(params: {
     const whole = extractText(target.apiFormat, payload);
     const wholeReasoning = extractReasoning(target.apiFormat, payload);
     const parsedUsage = extractUsage(target.apiFormat, payload);
-    if (parsedUsage) usage = parsedUsage;
+    if (parsedUsage) usage = { inputTokens: parsedUsage.inputTokens ?? 0, outputTokens: parsedUsage.outputTokens ?? 0 };
     if (wholeReasoning) {
       reasoning = wholeReasoning;
       params.onReasoning?.(wholeReasoning);
@@ -969,6 +1186,8 @@ export async function streamModelCompletion(params: {
         nonStreamToolCalls = chatToolCallsFromJson(payload as Record<string, unknown>);
       } else if (target.apiFormat === "anthropic-messages") {
         nonStreamToolCalls = anthropicToolCallsFromMessage(payload as Record<string, unknown>);
+      } else if (target.apiFormat === "openai-responses") {
+        nonStreamToolCalls = responsesToolCallsFromJson(payload as Record<string, unknown>);
       }
     }
     // 非 event-stream 的整包 JSON 天然有终点（body 读完了），不存在半截截断。
@@ -1008,6 +1227,9 @@ export async function streamModelCompletion(params: {
     if (e instanceof ModelStreamError) throw e;
     throw new ModelStreamError("model.stream", `读取模型流中断：${String((e as Error)?.message ?? e)}`);
   } finally {
+    // 解析失败也要关闭原生流，释放连接和有界队列，不能只解除 JS reader 锁。
+    clearIdle();
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 

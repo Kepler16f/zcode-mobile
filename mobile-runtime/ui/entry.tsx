@@ -17,6 +17,7 @@ import { installInsetsChannel } from "./system-insets.js";
 import { installImeLift } from "./ime-lift.js";
 import { installComposerTouchFocus } from "./composer-touch-focus.js";
 import { installJankWitness } from "./jank-witness.js";
+import { installInputRecovery } from "./input-recovery.js";
 import { installNarrowSidebarDrawer } from "./web-mobile-shell.js";
 import { createRoot } from "react-dom/client";
 import { AppErrorBoundary, Root, ZCodeIntlProvider, generateMobileDeviceFingerprint, setStreamClientId } from "@zcode/ui";
@@ -154,8 +155,12 @@ function fingerprint(): string {
 }
 
 function hideBooting() {
-  // ui.html 里那句"启动中…"是首屏前的兜底；渲染出一屏之后必须撤掉，不然它会一直盖在上面。
-  document.getElementById("booting")?.remove();
+  // ui.html 里的启动态是首屏前的兜底；渲染出一屏之后必须撤掉，不然它会一直盖在上面。
+  // 先淡出再移除：直接 remove 会让最后一段是硬切，视觉上像闪屏。
+  const el = document.getElementById("booting");
+  if (!el) return;
+  el.classList.add("leaving");
+  setTimeout(() => el.remove(), 240);
 }
 
 /**
@@ -163,8 +168,11 @@ function hideBooting() {
  * 端上出问题时唯一能回收到的就是这块文字（没有 devtools），而"白屏"本身不说明死在哪一行。
  */
 function say(step: string) {
-  const el = document.getElementById("booting");
-  if (el) el.textContent = `aZCode 端侧启动中 · ${step}`;
+  const el = document.getElementById("boot-step") ?? document.getElementById("booting");
+  if (el) el.textContent = step;
+  // 启动阶段留痕：真机上只有装机报告能回收，"卡在哪一步"要能事后读出来。
+  const trace = ((globalThis as { __zcodeBootTrace?: Array<{ at: number; step: string }> }).__zcodeBootTrace ??= []);
+  trace.push({ at: Date.now(), step });
 }
 
 /**
@@ -186,6 +194,7 @@ export async function bootMobileUi(overrides: { agentModelTargets?: ModelTargetR
   // 主线程冻结证人（0.4.10，装机"整个应用卡死"）：200ms 心跳量 gap，≥800ms 记进
   // zcode-mobile.jank.diag，自检 M13 回读。开销=一个定时器，可忽略。
   installJankWitness();
+  installInputRecovery();
   // 竖屏侧栏抽屉（0.3.8）：窄屏把 #sidebar 投影成覆盖层抽屉 + 接管上游切换按钮。
   // 观察器在 React 挂载后才找得到 #sidebar，所以这条可以在 root.render 之前挂（内部是 rAF 轮询）。
   installNarrowSidebarDrawer();
@@ -272,7 +281,7 @@ export async function bootMobileUi(overrides: { agentModelTargets?: ModelTargetR
               detail={[
                 `fs=${meta.fsEngine} · sqlite=${meta.sqliteEngine} · 会话持久化=${meta.sessionStoreEngine ?? "未启用"}`,
                 `未接入 ${meta.stubbed.length} 个服务面：${meta.stubbed.join("、")}`,
-                ...(meta.degraded.length ? [`构造失败：${meta.degraded.map((d) => `${d.name} —— ${d.error}`).join("；")}`] : []),
+                ...(meta.degraded.length ? [`服务不可用：${meta.degraded.map((d) => `${d.name} —— ${d.error}`).join("；")}`] : []),
                 // 对话真正跑起来以后，这块只在它出错时多出几行；没事的时候不多占屏幕。
                 ...(meta.agentLog.length ? [`对话记录：${meta.agentLog.slice(-3).join(" / ")}`] : []),
               ].join("\n")}
@@ -298,5 +307,6 @@ if (bootHost.__zcodeMobileSkipAutoBoot) {
   void bootMobileUi().catch((e) => {
     const host = document.getElementById("root");
     if (host) createRoot(host).render(<FailureScreen title="启动失败" detail={String((e as Error)?.stack ?? e)} />);
+    hideBooting();
   });
 }

@@ -4,9 +4,11 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
 import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -17,11 +19,17 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebSettingsCompat
+import java.io.ByteArrayInputStream
 
 class MainActivity : Activity() {
 
     private lateinit var webView: WebView
     private lateinit var pageSwitch: TextView
+    private var execBridge: ExecBridge? = null
+    private var gitHttpBridge: GitHttpBridge? = null
+    private var modelHttpBridge: ModelHttpBridge? = null
+    /** 模型桥当前是否挂在 WebView 上。自检页要摘掉模型桥（见 applyModelBridgeForPage）。 */
+    private var modelBridgeAttached = false
     private val oauthLink = OAuthLinkBridge()
     private val fileChooser by lazy { FileChooser(this) }
     // 外部工作区（SAF 树）：TreeBridge 管读写，WorkspaceBridge 管系统选择器。
@@ -51,8 +59,10 @@ class MainActivity : Activity() {
 
         webView = buildWebView()
 
-        // 自检页必须一直够得着：装机复测的回收路径就是"打开自检 → 复制报告"，
-        // 而它不该占用真界面的视觉，所以做成贴角的小牌，默认只有一行小字。
+        // 自检页的能力保留，但入口默认隐藏（0.9.1，用户点名"可以隐藏自检测试入口了"）：
+        // 贴角小牌长期占着真界面，装机用户不需要它。
+        // 回收路径改为显式开关：adb 以 --ez showSelfcheck true 启动本 Activity 即恢复入口，
+        // 诊断能力没丢，但普通用户看不到。
         pageSwitch = TextView(this).apply {
             text = TEXT_SELFCHECK
             setTextColor(Color.parseColor("#9A9A9A"))
@@ -64,6 +74,11 @@ class MainActivity : Activity() {
             setOnClickListener {
                 val target = if (webView.url?.startsWith(UI_PAGE) == true) SELFCHECK_PAGE else UI_PAGE
                 webView.loadUrl(target)
+            }
+            visibility = if (intent?.getBooleanExtra(EXTRA_SHOW_SELFCHECK, false) == true) {
+                View.VISIBLE
+            } else {
+                View.GONE
             }
         }
 
@@ -141,7 +156,11 @@ class MainActivity : Activity() {
             // 0.3.6 那份（顶栏被透明化后旧 JS 不懂垫边 ⇒ "状态栏还是遮挡"；旧 JS 的命名参数还没修
             // ⇒ "侧栏还是空"，两条症状一次解释）。端侧没有网络资源可缓存，整条 HTTP 缓存都是
             // 过期风险，直接关死：每次读的都是 APK 里这份，装机即最新。
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            // 混合内容一律禁掉：页面本身全 HTTPS（走 asset loader，https://appassets.androidplatform.net），
+            // 没有任何 http:// 子资源的正当需求。而 ALWAYS_ALLOW 会让被注入的脚本能加载 http:// 子资源，
+            // 把 WebView 的攻击面整个扩开。注意这只管 WebView 的资源加载——模型请求走的是原生
+            // HttpURLConnection（ModelHttpBridge），由 manifest 的 usesCleartextTraffic 决定，与这里无关。
+            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
             // R11：本地页面不需要、也不该顺手摸应用私有目录里的其它文件，所以 file:// 访问与
             // 新窗口一律关掉。
             settings.allowFileAccess = false
@@ -157,12 +176,34 @@ class MainActivity : Activity() {
             settings.allowContentAccess = true
 
             webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                    if (!request.isForMainFrame) return true
+                    if (isTrustedPage(request.url)) return false
+                    // 外链交给系统浏览器，不让它进入带文件和凭据接口的 WebView。
+                    if (request.url.scheme == "https" || request.url.scheme == "http") {
+                        runCatching { startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+                    }
+                    return true
+                }
+
                 override fun shouldInterceptRequest(
                     view: WebView,
                     request: WebResourceRequest,
-                ): WebResourceResponse? = assetLoader.shouldInterceptRequest(request.url)
+                ): WebResourceResponse? {
+                    if (request.isForMainFrame && !isTrustedPage(request.url)) {
+                        return WebResourceResponse("text/plain", "utf-8", 403, "Forbidden", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+                    }
+                    val response = assetLoader.shouldInterceptRequest(request.url) ?: return null
+                    if (request.isForMainFrame) {
+                        // JSInterface 会向每个 frame 暴露，禁止嵌入 frame 和 object 以关闭旁路。
+                        response.responseHeaders = (response.responseHeaders ?: emptyMap()) +
+                            ("Content-Security-Policy" to "frame-src 'none'; object-src 'none'")
+                    }
+                    return response
+                }
 
                 override fun onPageFinished(view: WebView, url: String) {
+                    applyModelBridgeForPage(url)
                     syncSwitchLabel(url)
                 }
 
@@ -194,7 +235,8 @@ class MainActivity : Activity() {
             addJavascriptInterface(DeviceProbe(applicationContext), "zcodeDevice")
             // L1 执行能力：真机自检已证明这个 WebView 能派生 /system/bin/sh，这里把它接上
             // ExecutionPort。argv 形态不经过 shell，参数拼不出第二条命令。
-            addJavascriptInterface(ExecBridge(applicationContext), "zcodeExec")
+            execBridge = ExecBridge(applicationContext)
+            addJavascriptInterface(execBridge!!, "zcodeExec")
             // 真盘文件桥：真机实测这个 WebView 没有 OPFS（navigator.storage.getDirectory() 抛
             // TypeError），vfs 只能落到应用私有目录，否则 Write/Edit 的结果重启就没了。
             addJavascriptInterface(FsBridge(applicationContext), "zcodeFs")
@@ -215,16 +257,50 @@ class MainActivity : Activity() {
             addJavascriptInterface(BrowserBridge(applicationContext), "zcodeBrowser")
             // Git 传输 HTTP 桥（0.6.7）：isomorphic-git 的 fetch 传输在 WebView 里被 CORS
             // 全拦（git 端点普遍不答 CORS，GitHub 也是），改走原生 HttpURLConnection。
-            addJavascriptInterface(GitHttpBridge(), "zcodeGitHttp")
+            gitHttpBridge = GitHttpBridge()
+            addJavascriptInterface(gitHttpBridge!!, "zcodeGitHttp")
+            modelHttpBridge = ModelHttpBridge()
+            // 默认挂着模型桥：真界面从第一帧脚本执行起就要能发模型请求，不能等 onPageFinished
+            // （那个时机既晚、又可能不触发，缺桥会直接变成「原生模型桥不可用」）。
+            addJavascriptInterface(modelHttpBridge!!, "zcodeModelHttp")
+            modelBridgeAttached = true
             loadUrl(UI_PAGE)
         }
+
+    /**
+     * 自检页不碰模型网络，就不给它模型桥。
+     *
+     * 为什么：addJavascriptInterface 是**全页面**注入的，自检页（/assets/mobile/selfcheck.html）
+     * 也会拿到 zcodeModelHttp —— 那是个能对任意 URL 发 POST 并把响应读回来的通道，暴露给一个
+     * 只用来跑自检清单的页面没有道理。真界面要用时再挂上。
+     */
+    private fun applyModelBridgeForPage(url: String) {
+        val bridge = modelHttpBridge ?: return
+        val needed = isUiPage(url)
+        // 只做「自检页摘掉」和「真界面补回」两件事；默认状态（挂着）不被动过。
+        if (!needed && modelBridgeAttached) {
+            bridge.cancelAll()
+            webView.removeJavascriptInterface("zcodeModelHttp")
+            modelBridgeAttached = false
+        } else if (needed && !modelBridgeAttached) {
+            webView.addJavascriptInterface(bridge, "zcodeModelHttp")
+            modelBridgeAttached = true
+        }
+    }
+
+    /** 真界面的 asset URL 判定（UI_PAGE 是 https://appassets.androidplatform.net/assets/ui/ui.html）。 */
+    private fun isUiPage(url: String): Boolean = url.startsWith(UI_PAGE)
 
     /** 渲染进程死亡后的原地重建：摘掉死 WebView、按同一份配置造新的、回到原 URL。 */
     private fun rebuildWebView() {
         if (!::webView.isInitialized) return
         val stale = webView
         val parent = stale.parent as? android.view.ViewGroup ?: return
-        val url = stale.url ?: UI_PAGE
+        val url = stale.url?.takeIf { isTrustedPage(Uri.parse(it)) } ?: UI_PAGE
+        // 渲染进程失效后没有调用者接收旧任务，必须先终止，避免后台继续改文件。
+        execBridge?.cancelAll()
+        gitHttpBridge?.cancelAll()
+        modelHttpBridge?.cancelAll()
         parent.removeView(stale)
         stale.destroy()
         webView = buildWebView()
@@ -330,6 +406,13 @@ class MainActivity : Activity() {
         deliverOAuthLink(intent)
     }
 
+    override fun onDestroy() {
+        execBridge?.cancelAll()
+        gitHttpBridge?.cancelAll()
+        modelHttpBridge?.cancelAll()
+        super.onDestroy()
+    }
+
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         // 附件选择的结果从这里回给 WebView。没接住的那一半表现是"选完文件回到 App，输入框是空的"。
@@ -363,6 +446,10 @@ class MainActivity : Activity() {
         FrameLayout.LayoutParams.MATCH_PARENT,
     )
 
+    private fun isTrustedPage(uri: Uri): Boolean =
+        uri.scheme == "https" && uri.host == "appassets.androidplatform.net" && uri.port == -1 &&
+            uri.path in setOf("/assets/ui/ui.html", "/assets/mobile/selfcheck.html")
+
     override fun onBackPressed() {
         // 0.4.9 三级返回（用户点名"从边缘滑动触发返回键也是收起"）：
         // ①竖屏抽屉展开 → 收起抽屉（移动端抽屉标准语义，也是"卡住没法回去"的第三条退路）；
@@ -370,7 +457,7 @@ class MainActivity : Activity() {
         // ③默认（退出应用）。
         if (uiChrome.drawerOpen && ::webView.isInitialized) {
             webView.evaluateJavascript(
-                "document.querySelector('[data-testid=\"web-sidebar-toggle\"]')?.click()",
+                "(document.querySelector('[data-testid=\"mobile-side-pane-scrim\"]') || document.querySelector('[data-testid=\"web-sidebar-toggle\"]'))?.click()",
                 null,
             )
             return
@@ -385,5 +472,7 @@ class MainActivity : Activity() {
         const val SELFCHECK_PAGE = "$ASSET_ROOT/mobile/selfcheck.html"
         const val TEXT_SELFCHECK = "自检"
         const val TEXT_BACK = "返回界面"
+        /** adb shell am start -n cn.zcode.mobile/.MainActivity --ez showSelfcheck true */
+        const val EXTRA_SHOW_SELFCHECK = "showSelfcheck"
     }
 }

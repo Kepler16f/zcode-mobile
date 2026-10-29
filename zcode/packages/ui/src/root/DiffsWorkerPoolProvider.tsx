@@ -5,6 +5,7 @@ import {
   type WorkerInitializationRenderOptions,
 } from "@pierre/diffs/react";
 import { createDiffsWorkerHighlighterOptions } from "@/lib/diffsHighlighterEngine.js";
+import { useOptionalPlatform } from "@/hooks/usePlatform.js";
 import { logger } from "@/logger.js";
 import { DEFAULT_CODE_PREVIEW_SETTINGS } from "@/store/index.js";
 import { useZCodeStore } from "@/store/StoreProvider.js";
@@ -60,6 +61,7 @@ function WorkerRenderOptionsSync({
 }
 
 export function DiffsWorkerPoolProvider({ children }: { children: ReactNode }) {
+  const platform = useOptionalPlatform();
   const codePreviewSettings = useZCodeStore(
     (state) => state.codePreviewSettings ?? DEFAULT_CODE_PREVIEW_SETTINGS,
   );
@@ -74,7 +76,13 @@ export function DiffsWorkerPoolProvider({ children }: { children: ReactNode }) {
   );
 
   const poolSize = useMemo(() => resolveWorkerPoolSize(), []);
-  const canUseWorkerPool = typeof window !== "undefined" && typeof Worker !== "undefined";
+  // 手机端不建池：WorkerPoolManager 构造即初始化高亮器（主线程编译 WASM + 最多 4 个 Worker），
+  // 那是"一打开应用就卡住"的根因。端侧改为无池路径：@pierre/diffs 会在第一次渲染代码块时
+  // 才惰性建高亮器，没打开代码块就完全不碰这条链。
+  const canUseWorkerPool =
+    platform?.supportsBackgroundHighlighting !== false &&
+    typeof window !== "undefined" &&
+    typeof Worker !== "undefined";
 
   if (!canUseWorkerPool) {
     return <>{children}</>;

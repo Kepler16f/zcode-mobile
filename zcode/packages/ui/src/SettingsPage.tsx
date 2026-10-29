@@ -1828,7 +1828,7 @@ export function SettingsPage({
                               memoryEnabled={memoryEnabled}
                               memoryService={localHostServices.memoryService}
                               onMemoryEnabledChange={handleMemoryEnabledChange}
-                              projectMemoryViewerAvailable={Boolean(isDesktop)}
+                              projectMemoryViewerAvailable={Boolean(isDesktop || platform?.supportsProjectMemory)}
                               workspaceDisplayNames={memoryWorkspaceDisplayNames}
                             />
                           </ServiceProvider>

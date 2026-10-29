@@ -23,12 +23,12 @@ export function createMobileExecutionPort(deps = {}) {
   function fail(error, startedAt) {
     const now = new Date();
     return {
-      status: "spawn_error",
+      status: error.type === "cancelled" ? "cancelled" : error.type === "timeout" ? "timed_out" : "spawn_error",
       stdout: stream("", deps.maxInlineBytes ?? 64 * 1024),
       stderr: stream("", deps.maxInlineBytes ?? 64 * 1024),
       durationMs: Math.max(0, Math.round(now.getTime() - startedAt.getTime())),
-      timedOut: false,
-      cancelled: false,
+      timedOut: error.type === "timeout",
+      cancelled: error.type === "cancelled",
       startedAt,
       completedAt: now,
       error,
@@ -62,9 +62,8 @@ export function createMobileExecutionPort(deps = {}) {
           env: request.env,
           stdin: request.stdin,
           timeoutMs: request.timeoutMs,
-          // 同步原生桥做不到中途取消：@JavascriptInterface 是阻塞调用，signal 传下去也没有
-          // 任何东西在监听，所以这里不写"可取消"的假象，只按 timeoutMs 收口。
-          signal: undefined,
+          // 把运行期间的取消传到原生任务；旧桥仅保留启动前取消语义。
+          signal: options.signal,
         });
       } catch (e) {
         const message = String(e?.message ?? e);

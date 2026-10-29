@@ -14,6 +14,7 @@ import android.widget.TextView
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import org.json.JSONObject
 
 /**
  * 内置浏览器（0.6.0，用户点名"接入内置浏览器功能"）。
@@ -30,6 +31,28 @@ import java.util.concurrent.atomic.AtomicReference
  *  - 所有等待都有超时（默认 20s）：页面挂死时工具如实报错，模型换姿势，不无限挂。
  */
 class BrowserBridge(private val context: Context) {
+    private val jobs = AsyncBridgeJobs()
+
+    @JavascriptInterface
+    fun start(request: String): String = jobs.start { job ->
+        val worker = Thread.currentThread()
+        job.onCancel { worker.interrupt() }
+        val input = JSONObject(request)
+        val text = when (input.getString("action")) {
+            "open" -> open(JSONObject().put("url", input.getString("url")).toString())
+            "back" -> back()
+            "read" -> read()
+            "close" -> close()
+            else -> throw IllegalArgumentException("未知浏览器操作")
+        }
+        JSONObject().put("content", text).toString()
+    }
+
+    @JavascriptInterface
+    fun poll(id: String): String = jobs.poll(id)
+
+    @JavascriptInterface
+    fun cancel(id: String): Boolean = jobs.cancel(id)
 
     companion object {
         /** 当前活动的浏览器页；navigate/read 复用它，null = 没开过或用户已关。 */

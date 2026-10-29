@@ -1,0 +1,37 @@
+// 原生本地别名与 SAF 指向同一份文件，不能用两个独立内存盘模拟。
+import assert from "node:assert/strict";
+import {makeFakeFsBridge} from "./selfcheck.mjs";
+const fs = makeFakeFsBridge();
+const local = p => typeof p === "string" ? p.replace(/^\/mnt\/fake(?=\/|$)/, "/sdcard/Download/project") : p;
+let treeCalls = 0;
+globalThis.zcodeFs = fs;
+globalThis.zcodeTree = {call(raw) {
+  treeCalls++;
+  const req = JSON.parse(raw);
+  for (const key of ["path", "to"]) if (key in req) req[key] = local(req[key]);
+  return fs.call(JSON.stringify(req));
+}};
+globalThis.zcodeWorkspace = {localTreeAliases: () => JSON.stringify({"/mnt/fake": "/sdcard/Download/project"})};
+const vfs = await import("../compat/vfs.mjs");
+const tree = await import("../compat/vfs-tree.mjs");
+vfs.setFsEngine("native");
+vfs.mkdir("/mnt/fake", {recursive:true});
+vfs.writeFile("/mnt/fake/note.md", "hello", {});
+assert.equal(treeCalls, 0, "本地别名写入不再同步调用 SAF 桥");
+assert.equal(tree.readFileSync("/mnt/fake/note.md", "utf8"), "hello");
+vfs.writeFile("/mnt/fake/note.md", "!", {flag:"a"});
+assert.equal(tree.readFileSync("/mnt/fake/note.md", "utf8"), "hello!", "追加不能写入两遍");
+const before = treeCalls;
+vfs.renameSync("/mnt/fake/note.md", "/sdcard/Download/project/moved.md");
+assert.equal(vfs.existsSync("/mnt/fake/note.md"), false);
+assert.equal(vfs.readFileSync("/mnt/fake/moved.md", "utf8"), "hello!");
+vfs.unlinkSync("/mnt/fake/moved.md");
+vfs.mkdir("/mnt/fake/sub", {});
+vfs.rmdir("/mnt/fake/sub");
+assert.equal(treeCalls, before, "重命名、删除和建目录均不执行二次 SAF 操作");
+vfs.writeFile("/sdcard/Download/project/from-git.txt", "commit", {});
+assert.equal(tree.readFileSync("/mnt/fake/from-git.txt", "utf8"), "commit");
+globalThis.zcodeTree = {call() { throw new Error("SAF permission revoked"); }};
+vfs.writeFile("/mnt/fake/from-git.txt", "!", {flag:"a"});
+assert.equal(vfs.readFileSync("/mnt/fake/from-git.txt", "utf8"), "commit!");
+console.log("PASS 同文件双路径可见、追加一次、重命名删除一次、Git直写可见、SAF撤权不影响本地授权");

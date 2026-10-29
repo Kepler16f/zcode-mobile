@@ -231,7 +231,7 @@ await check("非流式一次性 JSON 也认 message.tool_calls", async () => {
   }
 });
 
-await check("openai-responses 零波及：请求体不带 tools，结果 toolCalls 恒空（该格式仍不猜工具载荷）", async () => {
+await check("openai-responses 工具载荷：请求体带 function 条目 tools，文本流 toolCalls 空", async () => {
   const { captured, restore } = mockFetch([{ type: "response.output_text.delta", delta: "hi" }]);
   try {
     const r = await streamModelCompletion({
@@ -240,9 +240,34 @@ await check("openai-responses 零波及：请求体不带 tools，结果 toolCal
       tools: [{ name: "Read", description: "d", parameters: {} }],
       onDelta: () => {},
     });
-    eq("tools" in captured.body, false, "responses 不该带 tools");
+    // 0.7.x 工具载荷补齐后 responses 也声明 tools（此前只有 anthropic 有）。
+    // 不声明的话模型永远只能"说要开始工作"然后 end_turn——装机截断症状的端侧半因。
+    eq("tools" in captured.body, true, "responses 该带 tools");
+    eq(captured.body.tools[0]?.type, "function", "responses 的 tools 条目形状不对");
+    eq(captured.body.tools[0]?.name, "Read", "responses 的 tools 条目缺 name");
     eq(r.toolCalls, [], "responses toolCalls 空");
     eq(r.text, "hi", "responses 文本照旧");
+  } finally {
+    restore();
+  }
+  return { ok: true };
+});
+
+await check("openai-responses 工具调用：function_call 条目按 call_id 摘成 toolCalls", async () => {
+  const { captured, restore } = mockFetch([
+    { type: "response.output_item.done", item: { type: "function_call", call_id: "call_1", name: "Read", arguments: "{\"path\":\"a.txt\"}" } },
+  ]);
+  try {
+    const r = await streamModelCompletion({
+      target: TARGET("openai-responses"),
+      messages: [{ role: "user", content: "x" }],
+      tools: [{ name: "Read", description: "d", parameters: {} }],
+      onDelta: () => {},
+    });
+    eq(r.toolCalls.length, 1, `responses 工具调用数不对：${JSON.stringify(r.toolCalls)}`);
+    eq(r.toolCalls[0]?.name, "Read", "responses 工具名不对");
+    // call_id 与 item id 是不同概念：回传结果必须用 call_id，否则上游认不出这条调用。
+    eq(r.toolCalls[0]?.id, "call_1", `responses 工具 id 应取 call_id：${r.toolCalls[0]?.id}`);
   } finally {
     restore();
   }

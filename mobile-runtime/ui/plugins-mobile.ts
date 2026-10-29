@@ -17,6 +17,9 @@
 // 旗子的消费方：tool-engine 的 Browser 工具注册 + 缓存失效（浏览器采样同一旗子）。
 
 const BROWSER_CONTROL_KEY = "zcode-mobile.browserControl";
+export function browserControlAvailable(): boolean {
+  return typeof (globalThis as { zcodeBrowser?: { open?: unknown } }).zcodeBrowser?.open === "function";
+}
 /** 旗子变化广播：tool-engine 的引擎缓存按它失效，开/关在下一轮对话生效。 */
 export const BROWSER_CONTROL_EVENT = "zcode-mobile:browser-control-changed";
 
@@ -33,10 +36,14 @@ export function browserControlEnabled(): boolean {
 }
 
 export function setBrowserControlEnabled(enabled: boolean): void {
+  if (enabled && !browserControlAvailable()) throw new Error("此宿主没有 Browser 原生桥，无法开启浏览器控制。");
   try {
-    globalThis.localStorage?.setItem(BROWSER_CONTROL_KEY, enabled ? "1" : "0");
+    if (!globalThis.localStorage) throw new Error("localStorage 不可用");
+    globalThis.localStorage.setItem(BROWSER_CONTROL_KEY, enabled ? "1" : "0");
+    if (globalThis.localStorage.getItem(BROWSER_CONTROL_KEY) !== (enabled ? "1" : "0")) throw new Error("写入后读取不一致");
   } catch {
-    // 存不下也要把事件发出去：这一轮的开关先按内存态生效，重启后回到默认（默认开）。
+    // 引擎只读持久化值；写入失败继续报告成功会让设置页与真实工具注册状态分裂。
+    throw new Error("浏览器控制设置保存失败，开关未生效。");
   }
   try {
     globalThis.dispatchEvent?.(new CustomEvent(BROWSER_CONTROL_EVENT, { detail: { enabled } }));
@@ -46,11 +53,11 @@ export function setBrowserControlEnabled(enabled: boolean): void {
 }
 
 /** 内建浏览器控制条目的投影（形状 = @zcode/shared 的 ZCodePluginInfo，字段一个不多一个不少）。 */
-export function builtinBrowserPluginInfo(enabled = browserControlEnabled()) {
+export function builtinBrowserPluginInfo(enabled = browserControlEnabled() && browserControlAvailable()) {
   return {
     id: BUILTIN_BROWSER_PLUGIN_ID,
     name: "browser-use",
-    description: "端侧内置浏览器控制：让模型通过内置浏览器（Browser 工具）访问和操作网页。",
+    description: browserControlAvailable() ? "端侧内置浏览器控制：让模型通过内置浏览器（Browser 工具）访问和操作网页。" : "此宿主没有 Browser 原生桥，浏览器控制不可用。",
     version: "builtin",
     enabled,
     source: "builtin",

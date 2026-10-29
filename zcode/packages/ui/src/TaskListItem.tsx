@@ -385,7 +385,7 @@ export const MemoTaskItem = memo(function TaskListItem({
   const workspaceLabel = getPathLeaf(task.workspacePath);
   const taskItemKey = `${buildTaskWorkspaceKey(task.workspacePath, task.workspaceIdentity)}:${task.taskId}`;
   // 工作流运行行：标题下的第二条通道，
-  // 与前置 16px 槽（error > unread > spinner）互不占位。只在会话带 run 摘要时挂组件。
+  // 与前置 16px 槽（error > spinner > unread）互不占位。只在会话带 run 摘要时挂组件。
   const hasWorkflowRunLines = taskActivity?.workflowActivity !== undefined;
   const workflowRunLinesNode = hasWorkflowRunLines ? (
     <TaskWorkflowRunLines

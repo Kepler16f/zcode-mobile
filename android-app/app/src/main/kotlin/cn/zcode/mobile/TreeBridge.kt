@@ -98,8 +98,8 @@ class TreeBridge(private val context: Context) {
         val real = if (relative.isEmpty()) File(base) else File(base, relative.split('/').joinToString(File.separator))
         val canonical = runCatching { real.canonicalPath }.getOrDefault(real.absolutePath)
         if (canonical != base && !canonical.startsWith(base + File.separator)) return null
-        if (!real.isDirectory) return null
-        return if (relative.isEmpty()) "/sdcard" else "/sdcard/" + relative
+        if (!real.isDirectory || real.list() == null) return null
+        return "/sdcard" + canonical.removePrefix(base)
     }
 
     @JavascriptInterface

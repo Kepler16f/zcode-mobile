@@ -1,7 +1,7 @@
 // server-compat.ts 的契约冒烟：platform 改写的判据来自 2026-10-07 的实测记录——
 // 服务端对 android-* 回 {"code":3001,"msg":"parameter error"}，对 linux-arm64 回 code:0
 // 且 data.configs.startPlanPreview 齐全。改写的边界：只动带 platform 参数且值以 android 开头的。
-import { rewritePlatformForServer } from "../ui/server-compat.ts";
+import { rewritePlatformForServer,setDesktopCompatibilityVersion,desktopCompatibilityVersion } from "../ui/server-compat.ts";
 
 const results = [];
 const check = (name, fn) => {
@@ -64,6 +64,23 @@ check("platform=androidology 这种前缀撞车的值不误伤（要整个值以
   if (q(out).get("platform") !== "androidology") throw new Error("误改写");
 });
 
+check("兼容版本持久化只影响官方已有版本字段，清空恢复真实缺省",()=>{
+  const descriptor=Object.getOwnPropertyDescriptor(globalThis,"localStorage");
+  const data=new Map();Object.defineProperty(globalThis,"localStorage",{configurable:true,value:{
+    getItem:k=>data.get(k)??null,setItem:(k,v)=>data.set(k,v),removeItem:k=>data.delete(k),
+  }});
+  try{
+    setDesktopCompatibilityVersion("3.14.3");
+    if(desktopCompatibilityVersion("0.9.0")!=="3.14.3")throw new Error("保存未生效");
+    const official=rewritePlatformForServer("https://zcode.z.ai/api?app_version=old");
+    if(q(official).get("app_version")!=="3.14.3")throw new Error("官方版本字段未改写");
+    const other=rewritePlatformForServer("https://custom.invalid/api?app_version=old");
+    if(q(other).get("app_version")!=="old")throw new Error("误改第三方请求");
+    let rejected=false;try{setDesktopCompatibilityVersion("bad-version");}catch{rejected=true;}
+    if(!rejected)throw new Error("无效版本未拒绝");
+    setDesktopCompatibilityVersion("");if(desktopCompatibilityVersion("0.9.0")!=="0.9.0")throw new Error("没有恢复缺省");
+  }finally{if(descriptor)Object.defineProperty(globalThis,"localStorage",descriptor);else delete globalThis.localStorage;}
+});
 const failed = results.filter((r) => !r.ok);
 for (const r of results) {
   process.stdout.write(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `  → ${r.why}`}\n`);

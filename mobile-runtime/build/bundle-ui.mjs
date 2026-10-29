@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { compatPlugin } from "../compat/build-plugin.mjs";
 import { buildToyboxRegistry } from "./gen-toybox-registry.mjs";
+import {mobileShikiDependency,mobileDiffsWorker,relocateCssAssets,assertShikiConsistency} from "./mobile-ui-assets.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "../..");
@@ -20,6 +21,10 @@ const uiSrc = path.join(zcodeRoot, "packages/ui/src");
 const servicesSrc = path.join(zcodeRoot, "packages/services/src");
 
 const dev = process.argv.includes("--dev");
+// 单独重打界面也必须与完整构建采用同一环境，避免上游loader缺省为test。
+const buildEnvironment = process.env.ZCODE_ENV?.trim().toLowerCase() || "production";
+if (buildEnvironment !== "production" && buildEnvironment !== "test") throw new Error("ZCODE_ENV 只能是 production 或 test");
+process.env.ZCODE_ENV = buildEnvironment;
 const outdir = path.join(here, "dist-ui");
 
 // services/src/index.ts:88 写明根入口故意不导工厂，所以上游自己也是按实现文件路径深引的
@@ -61,6 +66,8 @@ const assetUrl = {
 };
 
 const trimmedRegistry = buildToyboxRegistry();
+const shikiDependency=mobileShikiDependency(zcodeRoot);
+const diffsWorker=mobileDiffsWorker(zcodeRoot);
 
 // 随包模型清单：直接调上游构建脚本，不在这里重新实现"读哪个 env、校验哪套 schema"。
 // 它失败就让构建失败——宁可构建报错，也不要装到手机上才发现模型列表是空的。
@@ -91,11 +98,12 @@ function clearOutdir(dir) {
       failures.push(`${name}: ${e.code ?? e.message}`);
     }
   }
-  if (failures.length) console.warn(`dist-ui 里有 ${failures.length} 项删不掉（宿主占用）：${failures.slice(0, 3).join(", ")}`);
+  // 旧哈希文件删不掉时不能继续：否则新旧资源会同时进入 APK，体积随构建增长。
+  if (failures.length) throw new Error(`dist-ui 里有 ${failures.length} 项删不掉（宿主占用）：${failures.slice(0, 3).join(", ")}`);
 }
 
 const result = await esbuild.build({
-  entryPoints: [path.join(root, "mobile-runtime/ui/entry.tsx")],
+  entryPoints: {entry:path.join(root,"mobile-runtime/ui/entry.tsx"),"workers/diffs.worker":diffsWorker.entry},
   outdir,
   bundle: true,
   splitting: true,
@@ -138,13 +146,34 @@ const result = await esbuild.build({
     ".webp": "file", ".mp3": "file", ".woff": "file", ".woff2": "file", ".ttf": "file",
     ".wasm": "file", ".css": "css",
   },
-  plugins: [deepImport, assetUrl, compatPlugin({ external: ["typescript"], bashRegistryOverride: trimmedRegistry.file })],
+  plugins: [deepImport, assetUrl, shikiDependency.plugin, diffsWorker.plugin, compatPlugin({ external: ["typescript"], bashRegistryOverride: trimmedRegistry.file })],
 });
 
 // 和 bundle.mjs 同一条断言：registry 裁剪要是被别的路径又引进来，bundle 会安静地涨回 5 MB。
 const upstreamRegistry = Object.keys(result.metafile.inputs).filter((k) =>
   /generated[\\/]bash-command-registry\.js$/.test(k),
 );
+// 把模块图落盘：版本混搭这类问题只有在「每个包实际解析到哪个绝对路径」这层才看得见，
+// 光看产物文件看不出 shiki/@shikijs 到底进了哪个实例。
+if (process.env.ZCODE_UI_METAFILE) {
+  const fspMeta = await import("node:fs/promises");
+  await fspMeta.mkdir(path.dirname(process.env.ZCODE_UI_METAFILE), { recursive: true });
+  await fspMeta.writeFile(process.env.ZCODE_UI_METAFILE, JSON.stringify(result.metafile, null, 2));
+  console.log(`模块图：${process.env.ZCODE_UI_METAFILE}`);
+}
+const languageInputs=Object.keys(result.metafile.inputs).filter(k=>/[/\\]@shikijs[/\\]langs[/\\]/.test(k));
+if(languageInputs.some(k=>!path.resolve(k).startsWith(shikiDependency.languageRoot+path.sep))) {
+  throw new Error("Shiki语言资源重复实例重新进入移动模块图");
+}
+// 全量核对：只查 langs 是不够的——core/transformers/themes 混进来同样会让
+// 高亮器在运行时才炸。这里按包名逐个核对版本，混搭直接让构建失败。
+const shikiVersions=assertShikiConsistency(zcodeRoot,Object.keys(result.metafile.inputs));
+console.log(`移动Shiki依赖：${shikiDependency.version}，语言模块 ${languageInputs.length} 个，单一依赖根`);
+console.log(`移动Shiki版本集：${shikiVersions.join(", ")}`);
+if(!Object.values(result.metafile.outputs).some(output=>Object.entries(output.inputs??{}).some(([name,info])=>
+  /@pierre[/\\]diffs[/\\]dist[/\\]worker[/\\]worker\.js$/.test(name)&&info.bytesInOutput>0))) {
+  throw new Error("高亮Worker消息处理器被tree-shaking移除，不能发布空Worker");
+}
 if (upstreamRegistry.length > 0) {
   throw new Error(`bash-command-registry 的裁剪没生效：${upstreamRegistry.join(", ")}`);
 }
@@ -171,7 +200,7 @@ const materialIcons = path.join(zcodeRoot, "packages/web/dist/material-icons");
 if (existsSync(materialIcons)) {
   await fsp.cp(materialIcons, path.join(outdir, "material-icons"), { recursive: true });
 } else {
-  process.stderr.write("警告：packages/web/dist/material-icons 不存在，文件图标将 404（先跑上游 vite build）\n");
+  throw new Error("packages/web/dist/material-icons 不存在：先构建上游 Web，不能打出缺失图标的包");
 }
 // Tailwind 产物：上游 Vite 生成的那一份 css，按名字找（哈希在文件名里）。
 const webDistAssets = path.join(zcodeRoot, "packages/web/dist/assets");
@@ -186,10 +215,13 @@ if (existsSync(webDistAssets)) {
       postcss,
       onDiagnostic: (d) => process.stderr.write(`[dark-rebind] ${d}\n`),
     });
-    await fsp.writeFile(path.join(outdir, "zcode-ui.css"), rebound);
-  } else process.stderr.write("警告：packages/web/dist 里没有找到 Tailwind css，UI 会没有样式（先跑上游 vite build）\n");
+    const assets=await relocateCssAssets({css:rebound,sourceCssFile:path.join(webDistAssets,css),
+      sourceRoot:path.dirname(webDistAssets),outdir});
+    await fsp.writeFile(path.join(outdir, "zcode-ui.css"), assets.css);
+    console.log(`CSS本地资源完整复制：${assets.copied.length} 个`);
+  } else throw new Error("packages/web/dist 里没有 Tailwind CSS：先构建上游 Web");
 } else {
-  process.stderr.write("警告：packages/web/dist 不存在，UI 会没有样式（先跑上游 vite build）\n");
+  throw new Error("packages/web/dist 不存在：先构建上游 Web");
 }
 
 process.stdout.write(

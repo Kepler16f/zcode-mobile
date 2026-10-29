@@ -15,6 +15,13 @@ import * as memory from "./vfs-memory.mjs";
 import * as native from "./vfs-native.mjs";
 import * as tree from "./vfs-tree.mjs";
 import * as stage from "./vfs-stage.mjs";
+// localTreeAliases 指向同一真实文件，不能再写 SAF：追加会重复，删除/重命名会二次失败。
+import { localWorkspacePath } from "./workspace-aliases.mjs";
+const aliasedNative = new Proxy(native, {get(target, key) {
+  const fn = target[key];
+  if (typeof fn !== 'function') return fn;
+  return (path, ...args) => fn(localWorkspacePath(path), ...args);
+}});
 
 export const NotFound = memory.NotFound;
 
@@ -39,6 +46,7 @@ function impl() {
 
 /** 路径派发：`/mnt/` 前缀进 SAF 树后端；其余按当前 engine。自检报告里 treeEngine() 单列这一路的可用性。 */
 function implFor(p) {
+  if (localWorkspacePath(p) !== p) return aliasedNative;
   return String(p ?? "").startsWith("/mnt/") ? tree : impl();
 }
 
@@ -50,18 +58,18 @@ export const toPath = (p) => implFor(p).toPath(p);
 export const mkdir = (p, opts, syscall) => {
   const r = implFor(p).mkdir(p, opts, syscall);
   // 终端 staging 写入透传（0.5.0，见 vfs-stage.mjs）：staging 没就绪时是 no-op。
-  stage.mirror("mkdir", p, {});
+  stage.mirror("mkdir", localWorkspacePath(p), {});
   return r;
 };
 export const writeFile = (p, data, opts, syscall) => {
   const r = implFor(p).writeFile(p, data, opts, syscall);
-  stage.mirror("write", p, { data, opts });
+  stage.mirror("write", localWorkspacePath(p), { data, opts });
   return r;
 };
 export const readFileSync = (p, opts) => implFor(p).readFileSync(p, opts);
 /** 一批路径可能混合前缀：分组各走各的后端，再拼回原顺序（契约是"等长数组、单项不抛"）。 */
 export const readMany = (paths) => {
-  const list = (paths ?? []).map((p) => String(p ?? ""));
+  const list = (paths ?? []).map((p) => localWorkspacePath(String(p ?? "")));
   const treeIdx = [];
   const otherIdx = [];
   list.forEach((p, i) => (p.startsWith("/mnt/") ? treeIdx : otherIdx).push(i));
@@ -84,27 +92,30 @@ export const lstatSync = (p) => implFor(p).lstatSync(p);
 export const readdirSync = (p, opts) => implFor(p).readdirSync(p, opts);
 export const unlinkSync = (p) => {
   const r = implFor(p).unlinkSync(p);
-  stage.mirror("unlink", p, {});
+  stage.mirror("unlink", localWorkspacePath(p), {});
   return r;
 };
 export const rmdir = (p) => {
   const r = implFor(p).rmdir(p);
-  stage.mirror("rmdir", p, {});
+  stage.mirror("rmdir", localWorkspacePath(p), {});
   return r;
 };
 export const rmSync = (p, opts) => {
   const r = implFor(p).rmSync(p, opts);
-  stage.mirror("rm", p, { recursive: opts?.recursive, force: opts?.force });
+  stage.mirror("rm", localWorkspacePath(p), { recursive: opts?.recursive, force: opts?.force });
   return r;
 };
 /** rename 看两端：任一端在树上就走树后端（跨树移动由 TreeBridge 如实报 EXDEV，不在这里偷偷换后端）。 */
 export const renameSync = (a, b) => {
+  a = localWorkspacePath(a);
+  b = localWorkspacePath(b);
   const useTree = String(a).startsWith("/mnt/") || String(b).startsWith("/mnt/");
   const r = (useTree ? tree : impl()).renameSync(a, b);
   stage.mirror("rename", a, { to: b });
   return r;
 };
-export const symlinkSync = (t, p) => implFor(p).symlinkSync(t, p);
+
+export const symlinkSync = (t, p) => implFor(p).symlinkSync(localWorkspacePath(t), localWorkspacePath(p));
 export const readlinkSync = (p) => implFor(p).readlinkSync(p);
 export const realpathSync = (p) => implFor(p).realpathSync(p);
 export const accessSync = (p, mode) => implFor(p).accessSync(p, mode);

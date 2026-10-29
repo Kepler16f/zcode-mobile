@@ -1,5 +1,7 @@
 /* eslint-disable max-lines -- Side pane 当前集中承载 tabs、browser/git/code-viewer 内容；完整拆分需按 pane 功能边界继续推进。 */
 import { ServiceProvider } from "@/hooks/useServices.js";
+import { createPortal } from "react-dom";
+import { usePortraitSideDrawer } from "@/hooks/usePortraitSideDrawer.js";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from "react";
 import type { PanelImperativeHandle } from "react-resizable-panels";
 import type { IServiceAccessor } from "@zcode/services";
@@ -402,6 +404,7 @@ export function AnimatedSidePanePanel({
   onSelectGitSource: (value: GitChangeSourceId) => void;
 }) {
   const { intl } = useZCodeIntl();
+  const portraitDrawer = usePortraitSideDrawer();
   const isOfficeMode = useIsOfficeMode();
   const developerToolsEnabled = useDeveloperToolsVisibility();
   const isDragCollapsible = !isVisible;
@@ -507,6 +510,11 @@ export function AnimatedSidePanePanel({
       window.clearTimeout(widthUnlockTimerRef.current);
       widthUnlockTimerRef.current = null;
     }
+    // 抽屉只做transform动画，不能跟随分栏宽度锁定反复排版两棵会话树。
+    if (portraitDrawer) {
+      setLockedContentWidthPx(null);
+      return;
+    }
 
     if (previousIsVisible && !isVisible) {
       const currentPanelWidthPx = Math.round(
@@ -530,7 +538,7 @@ export function AnimatedSidePanePanel({
         widthUnlockTimerRef.current = null;
       }, SIDE_PANE_CONTENT_WIDTH_LOCK_DURATION_MS);
     }
-  }, [isVisible, panelElementRef]);
+  }, [isVisible, panelElementRef, portraitDrawer]);
 
   useEffect(() => {
     return () => {
@@ -1338,7 +1346,7 @@ export function AnimatedSidePanePanel({
 
   return (
     <>
-      {isVisible ? (
+      {isVisible && !portraitDrawer ? (
         <ResizableHandle
           data-workspace-side-pane-resize-handle="true"
           className={cn(
@@ -1354,17 +1362,17 @@ export function AnimatedSidePanePanel({
       <ResizablePanel
         id="browser"
         panelRef={panelRef}
-        elementRef={panelElementRef}
+        elementRef={portraitDrawer ? undefined : panelElementRef}
         defaultSize={panelLayout.defaultSize}
-        minSize={panelLayout.minSize}
-        maxSize={panelLayout.maxSize}
+        minSize={portraitDrawer ? "0px" : panelLayout.minSize}
+        maxSize={portraitDrawer ? "0px" : panelLayout.maxSize}
         collapsedSize={panelLayout.collapsedSize}
         // 右侧面板常驻声明成 collapsible 时，拖到最小宽度会被库判定为 collapse。
         // 这里改成只在显式关闭时允许折叠，避免用户只是想拖到最小宽度时面板自动收起。
         collapsible={isDragCollapsible}
         // preview/side pane 收起时没有 ResizableHandle，但库仍会暴露 collapsed panel 边缘拖拽区。
         // 收起后禁用面板 resize target，避免用户绕过显式开关从右侧边缘拖出面板。
-        disabled={isResizeDisabled}
+        disabled={isResizeDisabled || portraitDrawer}
         className={cn(
           "!overflow-hidden transition-opacity duration-200 ease-out",
           // 截图期间 panel 仍保持 opacity=1，避免 opacity=0 让 Chromium 丢弃 guest
@@ -1372,8 +1380,32 @@ export function AnimatedSidePanePanel({
           isVisible || isScreenshotSurfaceActive ? "opacity-100" : "pointer-events-none opacity-0",
         )}
       >
-        {panelContent}
+        {portraitDrawer ? null : panelContent}
       </ResizablePanel>
+      {portraitDrawer
+        ? createPortal(
+            <div data-mobile-side-drawer="true" className="fixed inset-0 z-40 pointer-events-none">
+              {isVisible ? (
+                <div
+                  data-testid="mobile-side-pane-scrim"
+                  className="absolute inset-0 bg-black/40 pointer-events-auto"
+                  onClick={onCloseSidePane}
+                />
+              ) : null}
+              <div
+                ref={panelElementRef}
+                data-testid="mobile-side-pane-drawer"
+                aria-hidden={!isVisible}
+                inert={!isVisible}
+                className="absolute right-0 top-0 h-full w-[min(94vw,32rem)] bg-background shadow-xl transition-transform duration-200 ease-out pointer-events-auto"
+                style={{ transform: isVisible ? "translateX(0)" : "translateX(105%)" }}
+              >
+                {panelContent}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
     </>
   );
 }

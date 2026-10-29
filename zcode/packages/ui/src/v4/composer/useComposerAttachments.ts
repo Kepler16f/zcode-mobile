@@ -764,6 +764,7 @@ export function useComposerAttachments(
           const attachment = await platform.createTempTextAttachment?.({
             text,
             filename: createClipboardTextAttachmentFilenameForDate(),
+            workspacePath,
           });
           if (!attachment) throw new Error("当前平台不支持临时文本附件");
           addPreparedAttachments([createClipboardTextPathComposerAttachment(text, attachment)]);
@@ -778,7 +779,7 @@ export function useComposerAttachments(
         }
       })();
     },
-    [addAttachmentFiles, addPreparedAttachments, disabled, intl, platform],
+    [addAttachmentFiles, addPreparedAttachments, disabled, intl, platform, workspacePath],
   );
 
   const clearDragFeedbackTimer = useCallback(() => {

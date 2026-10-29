@@ -26,9 +26,12 @@
     // 不用 baseUrl：TS 6 已经把它标成弃用（TS5101），而 5.x 起 paths 可以直接按本文件所在目录解析。
     // 下面所有 target 都相对 mobile-runtime/，所以同时指得到 zcode/（上游包源码）。
     "paths": {
-      "@zcode/rpc": ["../zcode/packages/rpc/src/index.ts"],
+      "@modelcontextprotocol/client": ["../zcode/node_modules/@modelcontextprotocol/client"],
+      // RPC 与 UI 自己是 composite 工程，消费其声明以保留各自的编译选项；
+      // 直接拖入源码会把端侧的 verbatimModuleSyntax 等规则强加到不同工程。
+      "@zcode/rpc": ["../zcode/packages/rpc/dist/index.d.ts"],
       "@zcode/client": ["../zcode/packages/client/src/index.ts"],
-      "@zcode/ui": ["../zcode/packages/ui/src/index.ts"],
+      "@zcode/ui": ["../zcode/packages/ui/dist/index.d.ts"],
       "@zcode/provider": ["../zcode/packages/provider/src/index.ts"],
       "@zcode/provider-node": ["../zcode/packages/provider-node/src/index.ts"],
       "@zcode/shared": ["../zcode/packages/shared/src/index.ts"],

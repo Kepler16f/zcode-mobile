@@ -196,6 +196,53 @@ check(
   JSON.stringify(corruptListed),
 );
 
+// 旧版大会话：正文超过 Android 单个 CursorWindow 通常可容纳的大小。
+const LARGE_DB = "/work/.zcode/smoke-large.sqlite";
+{
+  const raw = DatabaseSync(LARGE_DB);
+  raw.exec("CREATE TABLE mobile_sessions (session_id TEXT PRIMARY KEY, workspace_path TEXT NOT NULL, summary TEXT NOT NULL, state TEXT NOT NULL, updated_at INTEGER NOT NULL)");
+  const insert = raw.prepare("INSERT INTO mobile_sessions VALUES (?, ?, ?, ?, ?)");
+  for (let i = 0; i < 205; i++) {
+    const entry = makeEntry(`legacy-${i}`);
+    if (i === 0) entry.state.rows[0].text = "大段历史😀".repeat(400000);
+    insert.run(entry.sessionId, entry.workspacePath, JSON.stringify(entry.summary), JSON.stringify(entry.state), i + 1);
+  }
+  raw.close();
+}
+const largeStore = createMobileSessionStore({ dbPath: LARGE_DB });
+let migrationTicks = 0;
+const heartbeat = setInterval(() => { migrationTicks++; }, 0);
+const usageRead = largeStore.listUsageStates();
+check("用量面板并发读取共用同一次旧数据迁移", usageRead === largeStore.listUsageStates());
+const facts = await usageRead;
+clearInterval(heartbeat);
+check("用量统计不受侧栏200会话上限截断", facts.length === 205, String(facts.length));
+const large = facts.find(entry => entry.sessionId === "legacy-0");
+check("多MB旧会话分块读取后只保留统计字段", JSON.stringify(large.state).length < 5000 && large.state.rows[0].usageChars > 2000000);
+check("迁移长历史时界面计时器仍可运行", migrationTicks > 20, String(migrationTicks));
+const again = await largeStore.listUsageStates();
+check("迁移后的投影保留真实轮次用量", JSON.stringify(again[0].state.turnUsage) === JSON.stringify(facts[0].state.turnUsage));
+
+// 读用量让出主线程时保存新会话：不能混拼正文或覆盖新投影。
+const racingStore = createMobileSessionStore({dbPath:"/work/.zcode/smoke-racing.sqlite"});
+const oldEntry = makeEntry("racing");
+oldEntry.state.rows[2].text = "旧正文".repeat(100000);
+racingStore.save(oldEntry);
+const newEntry = makeEntry("racing", {state:{cumulative:{inputTokens:123,outputTokens:456},turnUsage:{t1:{inputTokens:123,outputTokens:456}}}});
+const reading = racingStore.listUsageStates();
+setTimeout(() => { racingStore.save(newEntry); racingStore.saveUsageProjection(newEntry); }, 0);
+const raced = await reading;
+check("分块读取与收轮并发时返回新版本", raced[0]?.state.cumulative.inputTokens === 123);
+check("旧迁移不能覆盖新投影", (await racingStore.listUsageStates())[0]?.state.cumulative.outputTokens === 456);
+const originalNow = Date.now;
+try {
+  Date.now = () => originalNow() + 100000;
+  const frozen = Date.now(); Date.now = () => frozen;
+  racingStore.save(oldEntry); racingStore.saveUsageProjection(oldEntry);
+  racingStore.save(newEntry);
+  check("同毫秒保存使旧投影失效", (await racingStore.listUsageStates())[0]?.state.cumulative.inputTokens === 123);
+} finally { Date.now = originalNow; }
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) {
   process.stdout.write(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok || !r.detail ? "" : `  → ${r.detail}`}\n`);

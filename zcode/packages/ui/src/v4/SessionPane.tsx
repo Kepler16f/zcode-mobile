@@ -3526,12 +3526,15 @@ export function SessionPane({
     ],
   );
 
-  // 模式与模型一样属于下一次 Submission；选择时只更新 Composer。
+  // 移动宿主还支持更新正在运行的会话；仅更新草稿会使界面显示完全访问而执行侧仍等待审批。
   const handleSwitchMode = useCallback(
     (mode: string) => {
       handleDraftSwitchMode(mode);
+      if (platform?.supportsLiveExecutionMode && sessionId) {
+        void configCommandBarrier.enqueue(() => dispatchConfigCas("switchCollaborationMode", { mode }));
+      }
     },
-    [handleDraftSwitchMode],
+    [handleDraftSwitchMode, platform, sessionId, configCommandBarrier, dispatchConfigCas],
   );
 
   // context usage 面板的压缩入口（命令文本 = "/compact"，复用 slash 解析路径）。

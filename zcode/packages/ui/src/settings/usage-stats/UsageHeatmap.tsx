@@ -365,23 +365,25 @@ export function UsageHeatmap({
           </Tabs>
         </div>
 
-        <div>
-          <div className="grid w-full gap-x-0.5" style={HEATMAP_GRID_STYLE}>
-            {displayColumns.map((column) => (
-              <HeatmapColumn key={column.key} column={column} mode={mode} />
-            ))}
-          </div>
-          <div className="mt-3 grid w-full gap-x-0.5" style={HEATMAP_GRID_STYLE}>
-            {monthLabels.map((label) => (
-              <div
-                key={label.key}
-                data-usage-heatmap-month-label
-                className="min-w-0 truncate text-ui-sm text-foreground-subtle"
-                style={{ gridColumn: `span ${label.span}` }}
-              >
-                {label.label}
-              </div>
-            ))}
+        <div className="overflow-x-auto" data-usage-heatmap-scroll="true">
+          <div className="min-w-[28rem]">
+            <div className="grid w-full gap-x-0.5" style={HEATMAP_GRID_STYLE}>
+              {displayColumns.map((column) => (
+                <HeatmapColumn key={column.key} column={column} mode={mode} />
+              ))}
+            </div>
+            <div className="mt-3 grid w-full gap-x-0.5" style={HEATMAP_GRID_STYLE}>
+              {monthLabels.map((label) => (
+                <div
+                  key={label.key}
+                  data-usage-heatmap-month-label
+                  className="min-w-0 truncate text-ui-sm text-foreground-subtle"
+                  style={{ gridColumn: `span ${label.span}` }}
+                >
+                  {label.label}
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       </div>

@@ -46,12 +46,18 @@ function asNumber(value: unknown): number {
 /** 时间戳 → 该时区的 YYYY-MM-DD（热力/按天归桶的唯一真相；不用本地时区免得跨时区机器算错天）。 */
 function dayKey(ms: number, timeZone: string): string {
   try {
-    const parts = new Intl.DateTimeFormat("en-CA", {
+    let formatter = dayFormatters.get(timeZone);
+    if (!formatter) {
+      formatter = new Intl.DateTimeFormat("en-CA", {
       timeZone,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
-    }).formatToParts(new Date(ms));
+      });
+      if (dayFormatters.size >= 8) dayFormatters.clear();
+      dayFormatters.set(timeZone, formatter);
+    }
+    const parts = formatter.formatToParts(new Date(ms));
     const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
     return `${get("year")}-${get("month")}-${get("day")}`;
   } catch {
@@ -61,6 +67,7 @@ function dayKey(ms: number, timeZone: string): string {
     return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
   }
 }
+const dayFormatters = new Map<string, Intl.DateTimeFormat>();
 
 /** 一次会话里的"轮"聚合：以 turnId 归并 rows，取该轮的用量、模型、消息、工具、时间。 */
 interface TurnFact {
@@ -75,18 +82,6 @@ interface TurnFact {
   toolCalls: number;
   toolErrors: number;
   failed: boolean;
-}
-
-function rowsOfKind(state: PersistedSessionState, kind: string): Row[] {
-  return (state.rows as Row[]).filter((r) => r?.kind === kind);
-}
-
-function modelOfTurn(state: PersistedSessionState, turnId: string): string | null {
-  for (const r of rowsOfKind(state, "assistantText")) {
-    if (r.turnId === turnId && typeof r.model === "string" && r.model) return r.model;
-  }
-  const cfg = state.config as { model?: unknown } | undefined;
-  return typeof cfg?.model === "string" && cfg.model ? cfg.model : null;
 }
 
 /** 把一条持久化会话摊成一串轮事实（轮是 UI 与统计的共同单位，与桌面 product turn 一致）。 */
@@ -116,7 +111,7 @@ function turnsOf(state: PersistedSessionState): TurnFact[] {
       if (end) endedAt = Math.max(endedAt, end);
       if (row.kind === "userInput" || row.kind === "assistantText") {
         messages += 1;
-        chars += typeof row.text === "string" ? row.text.length : 0;
+        chars += typeof row.usageChars === "number" ? row.usageChars : typeof row.text === "string" ? row.text.length : 0;
       }
       if (row.kind === "toolCall") {
         toolCalls += 1;
@@ -134,7 +129,8 @@ function turnsOf(state: PersistedSessionState): TurnFact[] {
       outputTokens: asNumber(usage?.outputTokens),
       chars,
       messages,
-      model: modelOfTurn(state, turnId),
+      // 请求已经切换模型时会话config可能仍是旧模型，历史不能据此改归属。
+      model: usage?.modelId ?? (rows.find(row => row.kind === "assistantText" && typeof row.model === "string" && row.model)?.model as string | undefined) ?? null,
       toolCalls,
       toolErrors,
       failed,
@@ -386,7 +382,7 @@ export function createMobileUsageStatsService(deps: {
     async getAppUsageSnapshot(request: { range?: UsageStatsRange; timeZone?: string }) {
       const range: UsageStatsRange = request?.range ?? "all";
       const tz = request?.timeZone || timeZone();
-      const entries = deps.sessionStore ? deps.sessionStore.listAllStates() : [];
+      const entries = deps.sessionStore ? await (deps.sessionStore.listUsageStates?.() ?? deps.sessionStore.listAllStates()) : [];
       const agg = aggregate(entries, range, tz);
       const streak = computeStreak(agg.byDay, agg.lastDay);
       const heatmap = buildHeatmap(agg, tz);
@@ -446,7 +442,7 @@ export function createMobileUsageStatsService(deps: {
     async getSnapshot(request: { range?: UsageStatsRange; dataSource?: string; timeZone?: string }) {
       const range: UsageStatsRange = request?.range ?? "all";
       const tz = request?.timeZone || timeZone();
-      const entries = deps.sessionStore ? deps.sessionStore.listAllStates() : [];
+      const entries = deps.sessionStore ? await (deps.sessionStore.listUsageStates?.() ?? deps.sessionStore.listAllStates()) : [];
       const agg = aggregate(entries, range, tz);
       const days = [...agg.byDay.entries()].sort(([a], [b]) => (a < b ? -1 : 1));
       const total = agg.inputTokens + agg.outputTokens;

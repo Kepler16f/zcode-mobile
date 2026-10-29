@@ -28,8 +28,11 @@ import { conversationTopic } from "@zcode/shared/zcode-protocol-v4";
 import { createCommandEnvelope } from "@/v4/commandFactory.js";
 import { createAgentConversationTransport } from "@/v4/agentConversationTransport.js";
 import { ConversationProjectionStore } from "@/v4/conversationProjectionStore.js";
+import { deriveTaskLeadingIndicator } from "@/lib/taskListItemPresentation.js";
+import { buildTaskListItemIdentityKey } from "@/v4/taskListItemStabilization.js";
 
 import { createMobileAgentService } from "../ui/agent.js";
+import { planCompactPass, planCompactPasses } from "../ui/compact.js";
 import { createMobileHookRuntime } from "../ui/hooks-mobile.js";
 import { createConfiguredHookRunner } from "../../zcode/apps/zcode-cli/packages/core/src/hooks/configured-runner.js";
 import { createMobileExecutionPort } from "../ports/execution.mjs";
@@ -48,6 +51,7 @@ let requestLog: Array<{ path: string; body: unknown }> = [];
 let holdMs = 1200;
 /** 判据 10 用：下一次模型回复改成一个工具调用（用一次就复位，后续请求回普通文本）。 */
 let mockToolCall: { name: string; arguments: string } | null = null;
+let mockToolQueue: Array<{ name: string; arguments: string }> = [];
 let toolCallSent = false;
 /** cutOnce 模式的"只砍第一次"开关：第一次请求发两片就掐线（复刻切后台连接被杀），
  *  之后的请求按正常流走——自动续写的新请求必须能拿到完整回复。 */
@@ -59,6 +63,12 @@ let cutManyRemaining = 0;
  *  agent.ts 的 runCompact 请求里必含 "context-compaction engine"（压缩 system 提示的原文），
  *  这一条识别只存在于自检 mock，产品代码零 mock 痕迹。置 null 时压缩请求走正常流。 */
 let compactionSummaryText: string | null = null;
+let compactionFinishReason = "stop";
+/** 判据 17 用：压缩请求的序号。摘要文本里的 "{n}" 会被换成第几次压缩请求，
+ *  用来验证"分段摘要时前一段的摘要带进了后一段"。 */
+let compactionRequestCount = 0;
+/** 判据 18 用：压缩请求一律 500（模拟"网关拒绝摘要请求"），用来验证自动压缩的熔断。 */
+let compactionFails = false;
 const CUT_MANY = 5;
 
 /** 一个足够真的 OpenAI Chat Completions SSE 端点（协议细节按 model-stream.ts 的解析面来）。 */
@@ -85,6 +95,17 @@ function startMock(): Promise<{ url: string; close(): void }> {
           res.end(JSON.stringify({ error: { message: "网关 500：模型服务不可用" } }));
           return;
         }
+        // 判据 13/17 的仪器：压缩请求（系统提示含 "context-compaction engine"）走另一条路，
+        // 与正常对话流区分开——自动压缩发生在对话轮装配前，那条流的回复必须是另一段文本。
+        const isCompactionRequest = JSON.stringify(body).includes("context-compaction engine");
+        if (isCompactionRequest && compactionFails) {
+          // 400 而不是 500：5xx 会被流层当"这一枪没打响"重试（每次压缩就发 3 次请求），
+          // 这里要的是"一次摘要请求真的失败了"，不是"重连几次能成"。
+          // 这条分支必须在 SSE 的 200 头之前——头都发出去了就改不了状态码了。
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "网关 400：摘要请求被拒绝" } }));
+          return;
+        }
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
         const send = (obj: unknown) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
         if (mockMode === "businessError") {
@@ -93,12 +114,8 @@ function startMock(): Promise<{ url: string; close(): void }> {
           res.end();
           return;
         }
-        // 判据 13 的仪器：压缩请求（系统提示含 "context-compaction engine"）回固定摘要，
-        // 与正常对话流区分开——自动压缩发生在对话轮装配前，那条流的回复必须是另一段文本。
-        if (
-          compactionSummaryText !== null &&
-          JSON.stringify(body).includes("context-compaction engine")
-        ) {
+        if (compactionSummaryText !== null && isCompactionRequest) {
+          compactionRequestCount += 1;
           const done = (content: string) => {
             send({
               id: "chatcmpl-smoke",
@@ -112,13 +129,13 @@ function startMock(): Promise<{ url: string; close(): void }> {
               object: "chat.completion.chunk",
               created: 1,
               model: "mock-model",
-              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+              choices: [{ index: 0, delta: {}, finish_reason: compactionFinishReason }],
               usage: { prompt_tokens: 900, completion_tokens: 30, total_tokens: 930 },
             });
             send("[DONE]");
             res.end();
           };
-          done(compactionSummaryText);
+          done(compactionSummaryText.replace(/\{n\}/g, String(compactionRequestCount)));
           return;
         }
         const pieces = mockMode === "slow" ? ["慢", "慢", "慢", "慢", "慢"] : [..."端侧对话自检：一、二、三"];
@@ -214,7 +231,9 @@ function startMock(): Promise<{ url: string; close(): void }> {
         }
         // 一次性工具调用（判据 10 的执行模式场景）：第一次请求回一个 tool_call（finish=tool_calls），
         // 后续请求按普通文本回——正好复刻"模型要动手 → agent 按模式放行/拦截 → 再收口"。
-        if (mockToolCall && !toolCallSent) {
+        const queuedCall = mockToolQueue.shift();
+        const nextToolCall = queuedCall ?? (mockToolCall && !toolCallSent ? mockToolCall : null);
+        if (nextToolCall) {
           toolCallSent = true;
           send({
             id: "chatcmpl-smoke",
@@ -230,7 +249,7 @@ function startMock(): Promise<{ url: string; close(): void }> {
                       index: 0,
                       id: "call-mode-1",
                       type: "function",
-                      function: { name: mockToolCall.name, arguments: mockToolCall.arguments },
+                      function: { name: nextToolCall.name, arguments: nextToolCall.arguments },
                     },
                   ],
                 },
@@ -334,6 +353,7 @@ function makeRig(
   toolEngineFactory?: (workspacePath: string) => Promise<unknown>,
   agentOptions?: Record<string, unknown>,
 ) {
+  const testContextWindow = (agentOptions as { testContextWindow?: number } | undefined)?.testContextWindow;
   const counts = { subscribe: 0, resync: 0, commands: 0 };
   const diagnostics: string[] = [];
   const frames: string[] = [];
@@ -346,7 +366,7 @@ function makeRig(
             {
               providerId: "mock-provider",
               executable: true,
-              models: [{ modelId: "mock-model" }],
+              models: [{ modelId: "mock-model", ...(testContextWindow ? { config: { properties: { contextWindow: testContextWindow } } } : {}) }],
               config: {
                 api: { type: "openai-chat-completions", baseUrl },
                 access: { type: "personal-api-key", apiKey: "sk-mock" },
@@ -443,6 +463,21 @@ async function openSession(rig: Rig): Promise<{ store: ConversationProjectionSto
   return { store, sessionId };
 }
 
+async function openExistingSession(rig: Rig, sessionId: string): Promise<ConversationProjectionStore> {
+  const store = new ConversationProjectionStore(conversationTopic(sessionId), rig.transport);
+  rig.transport.onFrame((frame, context) => {
+    if (frame.topic === store.topic) store.handleFrame(frame, context);
+  });
+  await store.connect();
+  await waitFor(
+    () => store.getState().snapshot !== null,
+    `订阅子会话 ${sessionId} 后没有收到 snapshot`,
+    4000,
+    () => ({ frames: rig.frames, faults: rig.faults, agentDiag: rig.diagnostics }),
+  );
+  return store;
+}
+
 const settle = (store: ConversationProjectionStore) => {
   const phase = store.getState().snapshot?.control.phase;
   return phase !== undefined && phase !== "running" && phase !== "draft" && phase !== "prewarming";
@@ -484,6 +519,32 @@ async function main() {
   const mock = await startMock();
   const results: Array<{ name: string; ok: boolean; detail: string }> = [];
   const check = (name: string, ok: boolean, detail: string) => results.push({ name, ok, detail });
+  const indicatorTask = {
+    taskId: "indicator-task",
+    traceId: "indicator-trace",
+    title: "indicator",
+    workspacePath: "/work/a",
+    createdAt: 1,
+    updatedAt: 1,
+    mode: "build" as const,
+    unreadAt: 2,
+  };
+  const indicatorActivity = (phase: "draft" | "prewarming" | "running" | "completedSuccess" | "completedInterrupted" | "error") => ({
+    phase,
+    lastActivityAt: 1,
+    hasBackgroundWork: false,
+  });
+  check("侧栏实时运行态优先显示旋转动画（包括未读任务）",
+    deriveTaskLeadingIndicator(indicatorTask, indicatorActivity("running")) === "loading" &&
+    deriveTaskLeadingIndicator(indicatorTask, indicatorActivity("prewarming")) === "loading");
+  check("侧栏失败状态优先显示错误，结束后停止动画并保留未读状态",
+    deriveTaskLeadingIndicator(indicatorTask, indicatorActivity("error")) === "error" &&
+    deriveTaskLeadingIndicator(indicatorTask, indicatorActivity("completedSuccess")) === "unread" &&
+    deriveTaskLeadingIndicator({ ...indicatorTask, unreadAt: undefined }, indicatorActivity("completedInterrupted")) === "none");
+  check("上次落盘的 running 不会在未收到当前 workspace 活动时继续转圈",
+    deriveTaskLeadingIndicator({ ...indicatorTask, unreadAt: undefined, status: "running" }, null) === "none" &&
+    buildTaskListItemIdentityKey({ ...indicatorTask, workspacePath: "/work/a" }) !==
+      buildTaskListItemIdentityKey({ ...indicatorTask, workspacePath: "/work/b" }));
   // 超时必须把"卡在哪一层"一起带出来：没有这份读数，一条"第一轮没有落到终态"等于没说。
   const describe = (rig: Rig, store: ConversationProjectionStore) => () => ({
     status: store.getState().status,
@@ -543,6 +604,8 @@ async function main() {
       JSON.stringify(store.getState().snapshot?.usage.cumulative),
     );
     check("装配侧没有 protocol fault", rig.faults.length === 0, JSON.stringify(rig.faults));
+    check("上下文占用为最新请求输入加输出token，不是请求次数", store.getState().snapshot?.usage.contextWindow?.usedTokens === 18,
+      JSON.stringify(store.getState().snapshot?.usage));
     check("订阅只发生一次", rig.counts.subscribe === 1, String(rig.counts.subscribe));
     check("没有 resync（seq 记账是对的）", rig.counts.resync === 0, String(rig.counts.resync));
 
@@ -769,6 +832,7 @@ async function main() {
     await waitFor(
       () =>
         settle(sQ.store) &&
+        requestLog.length >= 2 &&
         userRows(sQ.store).some((r: { text?: string }) => r.text === "队列乙"),
       "第一轮收口后没有自动排空队列乙",
       10000,
@@ -1048,7 +1112,7 @@ async function main() {
     const listed = await plugins.listPlugins({ workspacePath: "/work/smoke" });
     check(
       "listPlugins 返回内建 browser-use 条目（不再 EUNSUPPORTED）",
-      listed.plugins.some((p) => p.id === "browser-use@zcode-plugins-official" && p.enabled === true),
+      listed.plugins.some((p) => p.id === "browser-use@zcode-plugins-official" && p.enabled === false),
       JSON.stringify(listed),
     );
     const overview = await plugins.getPluginsOverview({ workspacePath: "/work/smoke" });
@@ -1068,6 +1132,8 @@ async function main() {
       off.enabled === false && afterOff.plugins[0]?.enabled === false,
       JSON.stringify({ off, listed: afterOff.plugins.map((p) => p.enabled) }),
     );
+    const browserBackup = (globalThis as { zcodeBrowser?: unknown }).zcodeBrowser;
+    (globalThis as { zcodeBrowser?: unknown }).zcodeBrowser = { open() {} };
     const backOn = await plugins.setPluginEnabled({
       workspacePath: "/work/smoke",
       pluginId: "browser-use@zcode-plugins-official",
@@ -1079,6 +1145,8 @@ async function main() {
       .then(() => false)
       .catch(() => true);
     check("未知插件 id 明确报错（不装成设置成功）", unknownRejected === true);
+    if (browserBackup === undefined) delete (globalThis as { zcodeBrowser?: unknown }).zcodeBrowser;
+    else (globalThis as { zcodeBrowser?: unknown }).zcodeBrowser = browserBackup;
     rigPlug.dispose();
     if (storageBackup === undefined) delete (globalThis as { localStorage?: unknown }).localStorage;
     else (globalThis as { localStorage?: unknown }).localStorage = storageBackup;
@@ -1321,6 +1389,7 @@ async function main() {
         engine: {
           tools: [
             { name: "Write", description: "写文件", inputSchema: { type: "object", properties: {} } },
+            { name: "Edit", description: "编辑文件", inputSchema: { type: "object", properties: {} } },
             { name: "Delete", description: "删文件", inputSchema: { type: "object", properties: {} } },
             { name: "Bash", description: "跑命令", inputSchema: { type: "object", properties: {} } },
           ],
@@ -1334,6 +1403,70 @@ async function main() {
         },
       };
     };
+
+    // sessions-index 必须随审批挂起/解除同步投影交互摘要，但不能夹带工具参数或弹窗 payload。
+    const approvalIndexEngine = makeFakeEngine();
+    mockToolCall = { name: "Bash", arguments: '{"command":"echo secret-command"}' };
+    toolCallSent = false;
+    const rigApprovalIndex = makeRig(mock.url, undefined, undefined, async () => approvalIndexEngine.engine);
+    const sApprovalIndex = await openSession(rigApprovalIndex);
+    const indexService = rigApprovalIndex.service as unknown as {
+      onDynamicSessionsIndexFrame(): (listener: (wire: { frame?: { payload?: {
+        kind?: string;
+        snapshot?: { sessions?: Array<Record<string, unknown>> };
+        deltas?: Array<{ op: string; session?: Record<string, unknown> }>;
+      } } }) => void) => { dispose(): void };
+      subscribeSessionsIndexV4(params: { workspacePath: string }): Promise<unknown>;
+    };
+    const approvalIndexFrames: Array<Record<string, unknown>> = [];
+    const offApprovalIndex = indexService.onDynamicSessionsIndexFrame()((wire) => {
+      const payload = wire.frame?.payload;
+      if (payload?.kind === "snapshot") {
+        for (const summary of payload.snapshot?.sessions ?? []) approvalIndexFrames.push(summary);
+      } else {
+        for (const delta of payload?.deltas ?? []) {
+          if (delta.op === "session.upserted" && delta.session) approvalIndexFrames.push(delta.session);
+        }
+      }
+    });
+    await indexService.subscribeSessionsIndexV4({ workspacePath: "/work/smoke" });
+    await rigApprovalIndex.transport.sendCommand(createCommandEnvelope({
+      type: "sendText", sessionId: sApprovalIndex.sessionId,
+      payload: { text: "审批等待状态", mode: "build" },
+    }));
+    await waitFor(
+      () => approvalIndexFrames.some(summary => summary.sessionId === sApprovalIndex.sessionId &&
+        (summary.pendingInteractionSummary as { permissionCount?: number } | undefined)?.permissionCount === 1),
+      "审批等待时 sessions-index 未发布权限摘要", 8000,
+      () => ({ frames: approvalIndexFrames, pending: sApprovalIndex.store.getState().snapshot?.pendingInteractions }),
+    );
+    const waitingSummary = approvalIndexFrames.findLast(summary => summary.sessionId === sApprovalIndex.sessionId &&
+      (summary.pendingInteractionSummary as { permissionCount?: number } | undefined)?.permissionCount === 1);
+    check("真实 sessions-index 订阅在审批出现时发布权限计数且不含敏感 payload",
+      (waitingSummary?.pendingInteractionSummary as { permissionCount?: number } | undefined)?.permissionCount === 1 &&
+      (waitingSummary?.pendingInteraction as { kind?: string } | undefined)?.kind === "permission" &&
+      !JSON.stringify(waitingSummary).includes("secret-command") &&
+      !("detail" in (waitingSummary?.pendingInteraction as Record<string, unknown> ?? {})) &&
+      !("toolName" in (waitingSummary?.pendingInteraction as Record<string, unknown> ?? {})),
+      JSON.stringify(waitingSummary));
+    const approvalIndexInteraction = sApprovalIndex.store.getState().snapshot?.pendingInteractions[0];
+    await rigApprovalIndex.transport.sendCommand(createCommandEnvelope({
+      type: "resolveInteraction", sessionId: sApprovalIndex.sessionId,
+      payload: { interactionId: approvalIndexInteraction?.interactionId, answer: { optionId: "allow_once" } },
+    }));
+    await waitFor(() => settle(sApprovalIndex.store) &&
+      approvalIndexFrames.some(summary => summary.sessionId === sApprovalIndex.sessionId &&
+        (summary.pendingInteractionSummary as { permissionCount?: number } | undefined)?.permissionCount === 0 &&
+        summary.phase === "completedSuccess"),
+    "审批处理后 sessions-index 权限计数没有清零", 10000,
+    () => ({ frames: approvalIndexFrames, phase: sApprovalIndex.store.getState().snapshot?.control.phase }));
+    check("审批处理后真实 sessions-index 摘要清零并收口非运行态",
+      approvalIndexFrames.some(summary => summary.sessionId === sApprovalIndex.sessionId &&
+        (summary.pendingInteractionSummary as { permissionCount?: number } | undefined)?.permissionCount === 0 &&
+        summary.phase === "completedSuccess") && approvalIndexEngine.calls.includes("Bash"));
+    offApprovalIndex.dispose();
+    mockToolCall = null;
+    rigApprovalIndex.dispose();
 
     // 计划模式：Write 不执行（拦在入口），理由回给模型。
     requestLog = [];
@@ -1399,6 +1532,155 @@ async function main() {
     mockToolCall = null;
     rigPlan.dispose();
 
+    // Skills/Agent 穿过真实主轮、模型往返、子工具 Hook、结果回收。
+    requestLog = [];
+    const childCalls: string[] = [];
+    const childHooks: string[] = [];
+    const childEngine = {
+      tools: [{ name: "Read", description: "read", parameters: { type: "object", properties: {} } }],
+      approvalRequired: () => false,
+      execute: async (call: { name: string }) => { childCalls.push(call.name); return { content: "ACTUAL_CHILD_READ", isError: false }; },
+      grantRoot: () => {}, revokeRoot: () => {},
+    };
+    const skill = { id: "skill-1", name: "audit", description: "audit", body: "AUDIT_SKILL_INSTRUCTIONS", path: "/work/smoke/.zcode/skills/audit/SKILL.md", scope: "workspace", enabled: true };
+    const profile = { id: "agent-1", name: "general-purpose", description: "child", systemPrompt: "ACTUAL_CHILD_PROFILE", path: "builtin:general-purpose", scope: "built-in", source: "built-in", enabled: true, tools: ["Read"] };
+    const capabilityServices = {
+      skillsService: { list: async () => ({ skills: [skill], diagnostics: [] }) },
+      subagentsService: { list: async () => ({ agents: [profile], diagnostics: [] }) },
+    };
+    const childHookFactory = async () => ({ enabled: true, diagnostics: [], run: async (event: string, input: { toolName?: string }) => {
+      if (input.toolName) childHooks.push(`${event}:${input.toolName}`);
+      return {};
+    } });
+    mockToolQueue = [
+      { name: "Agent", arguments: '{"prompt":"Inspect"}' },
+      { name: "Read", arguments: '{"file_path":"a.txt"}' },
+    ];
+    const childSessionStore = makeMemorySessionStore();
+    const rigChild = makeRig(mock.url, childSessionStore, childHookFactory, async () => childEngine, { capabilities: capabilityServices });
+    const sChild = await openSession(rigChild);
+    await rigChild.transport.sendCommand(createCommandEnvelope({ type: "sendText", sessionId: sChild.sessionId,
+      payload: { text: "请按 $audit 检查", mode: "build" } }));
+    await waitFor(() => settle(sChild.store), "子代理主轮没有落到终态", 10000, describe(rigChild, sChild.store));
+    check("Skills 被发现并注入主轮", JSON.stringify(requestLog[0]?.body).includes("AUDIT_SKILL_INSTRUCTIONS"));
+    check("主模型实际收到 Agent 和 Skill 工具", JSON.stringify(requestLog[0]?.body).includes('"name":"Agent"') && JSON.stringify(requestLog[0]?.body).includes('"name":"Skill"'));
+    check("子代理工具进入同一 Hook 与引擎", childCalls.includes("Read") && childHooks.includes("PreToolUse:Read") && childHooks.includes("PostToolUse:Read"), JSON.stringify({ childCalls, childHooks }));
+    check("子代理收到真实工具结果", requestLog.some(req => JSON.stringify(req.body).includes("ACTUAL_CHILD_READ")));
+    // 子代理回包是一段 JSON 字符串，进请求体时会被二次转义（\"agentType\"），所以不能拿
+    // 未转义的字面量去搜整段 body——那样搜不到不代表没送到。改成顺着 messages 找父轮的
+    // tool 消息，再看它的 content 里有没有子代理的真实结果字段。
+    const parentSawSubagentResult = requestLog.some(req => {
+      const messages = (req.body as { messages?: Array<{ role?: string; content?: unknown }> })?.messages;
+      if (!Array.isArray(messages)) return false;
+      return messages.some(m => m?.role === "tool" && typeof m.content === "string"
+        && m.content.includes("agentType") && m.content.includes("general-purpose")
+        && m.content.includes("completed"));
+    });
+    check("主轮收到子代理实际结果", parentSawSubagentResult,
+      JSON.stringify(requestLog.map(r => (r.body as { messages?: Array<{ role?: string; content?: unknown }> })?.messages)).slice(0, 3000));
+    const subagentRow = rowsOf(sChild.store).find((row: { kind: string }) => row.kind === "subagent") as
+      | { childSessionId?: string; status?: string }
+      | undefined;
+    const childSessionId = subagentRow?.childSessionId;
+    check("Agent 结果行关联真实 childSessionId 并收口成功",
+      Boolean(childSessionId) && subagentRow?.status === "success", JSON.stringify(subagentRow));
+    const childStore = childSessionId ? await openExistingSession(rigChild, childSessionId) : null;
+    const childRows = childStore?.getState().snapshot?.rows.window ?? [];
+    check("子会话 conversation snapshot 可读用户提示、回答与工具结果",
+      childRows.some((row: { kind: string; text?: string }) => row.kind === "userInput" && row.text === "Inspect") &&
+      childRows.some((row: { kind: string; text?: string }) => row.kind === "assistantText" && Boolean(row.text)) &&
+      childRows.some((row: { kind: string; toolName?: string; status?: string; output?: { text?: string } }) =>
+        row.kind === "toolCall" && row.toolName === "Read" && row.status === "success" && row.output?.text === "ACTUAL_CHILD_READ"),
+      JSON.stringify(childRows.map((row: { kind: string; toolName?: string; status?: string }) => ({ kind: row.kind, toolName: row.toolName, status: row.status }))));
+    if (childStore && childSessionId) {
+      await childStore.close();
+      const resubscribedChild = await openExistingSession(rigChild, childSessionId);
+      check("同一 childSessionId 重订阅后仍能读取子会话行",
+        (resubscribedChild.getState().snapshot?.rows.window.length ?? 0) >= childRows.length);
+      await resubscribedChild.close();
+      const childAgent = rigChild.service as unknown as {
+        subscribeConversationV4(params: { workspacePath: string; sessionId: string }): Promise<unknown>;
+      };
+      let workspaceRejected = false;
+      try {
+        await childAgent.subscribeConversationV4({ workspacePath: "/work/other", sessionId: childSessionId });
+      } catch (error) {
+        workspaceRejected = String(error).includes("workspaceMismatch");
+      }
+      check("childSessionId 不能从其他工作区订阅", workspaceRejected);
+      rigChild.dispose();
+      const rigChildRestart = makeRig(mock.url, childSessionStore);
+      const recoveredChild = await openExistingSession(rigChildRestart, childSessionId);
+      const recoveredRows = recoveredChild.getState().snapshot?.rows.window ?? [];
+      check("重启后 childSessionId 恢复用户、回答和工具历史",
+        recoveredRows.some((row: { kind: string; text?: string }) => row.kind === "userInput" && row.text === "Inspect") &&
+        recoveredRows.some((row: { kind: string; toolName?: string; status?: string; output?: { text?: string } }) =>
+          row.kind === "toolCall" && row.toolName === "Read" && row.status === "success" && row.output?.text === "ACTUAL_CHILD_READ"),
+        JSON.stringify(recoveredRows.map((row: { kind: string; toolName?: string; status?: string }) => ({ kind: row.kind, toolName: row.toolName, status: row.status }))));
+      await recoveredChild.close();
+      rigChildRestart.dispose();
+    } else {
+      rigChild.dispose();
+    }
+
+    // 子代理写入与主 Agent 共用同一执行模式、审批选项和目标记忆。
+    const approvalChildCalls: string[] = [];
+    const approvalChildEngine = {
+      tools: [{ name: "Write", description: "write", inputSchema: { type: "object", properties: {} } }],
+      approvalRequired: () => false,
+      execute: async (call: { name: string; arguments: string }) => {
+        approvalChildCalls.push(call.arguments);
+        return { content: "CHILD_WRITE_OK", isError: false };
+      },
+      grantRoot: () => {}, revokeRoot: () => {},
+    };
+    const approvalChildProfile = { ...profile, tools: ["Write"] };
+    const approvalChildCapabilities = {
+      skillsService: capabilityServices.skillsService,
+      subagentsService: { list: async () => ({ skills: [], agents: [approvalChildProfile], diagnostics: [] }) },
+    };
+    const rigApprovalChild = makeRig(mock.url, undefined, childHookFactory, async () => approvalChildEngine,
+      { capabilities: approvalChildCapabilities });
+    const sApprovalChild = await openSession(rigApprovalChild);
+    const sendChildWrite = async (args: string, index: number) => {
+      mockToolQueue = [
+        { name: "Agent", arguments: '{"prompt":"write a file"}' },
+        { name: "Write", arguments: args },
+      ];
+      await rigApprovalChild.transport.sendCommand(createCommandEnvelope({
+        type: "sendText", sessionId: sApprovalChild.sessionId,
+        payload: { text: `child write ${index}`, mode: "build" },
+      }));
+    };
+    await sendChildWrite('{"file_path":"/work/child.txt","content":"first"}', 1);
+    await waitFor(() => (sApprovalChild.store.getState().snapshot?.pendingInteractions.length ?? 0) > 0,
+      "子代理的 build Write 没有弹审批", 10000, describe(rigApprovalChild, sApprovalChild.store));
+    let childInteraction = sApprovalChild.store.getState().snapshot?.pendingInteractions[0];
+    check("子代理：build Write 进入与主 Agent 相同的审批弹窗", Boolean(childInteraction));
+    await rigApprovalChild.transport.sendCommand(createCommandEnvelope({
+      type: "resolveInteraction", sessionId: sApprovalChild.sessionId,
+      payload: { interactionId: childInteraction?.interactionId, answer: { optionId: "allow_always" } },
+    }));
+    await waitFor(() => settle(sApprovalChild.store), "子代理 allow_always 后没有收口", 10000, describe(rigApprovalChild, sApprovalChild.store));
+    check("子代理：始终允许确实执行了 Write", approvalChildCalls.length === 1);
+    await sendChildWrite('{"file_path":"/work/child.txt","content":"second"}', 2);
+    await waitFor(() => settle(sApprovalChild.store) && approvalChildCalls.length === 2,
+      "子代理同目标始终允许没有放行", 10000, describe(rigApprovalChild, sApprovalChild.store));
+    check("子代理：始终允许按目标生效", approvalChildCalls.length === 2 &&
+      (sApprovalChild.store.getState().snapshot?.pendingInteractions.length ?? -1) === 0);
+    await sendChildWrite('{"file_path":"/work/other-child.txt","content":"third"}', 3);
+    await waitFor(() => (sApprovalChild.store.getState().snapshot?.pendingInteractions.length ?? 0) > 0,
+      "子代理 allow_always 错误放行了另一个目标", 10000, describe(rigApprovalChild, sApprovalChild.store));
+    childInteraction = sApprovalChild.store.getState().snapshot?.pendingInteractions[0];
+    await rigApprovalChild.transport.sendCommand(createCommandEnvelope({
+      type: "resolveInteraction", sessionId: sApprovalChild.sessionId,
+      payload: { interactionId: childInteraction?.interactionId, answer: { optionId: "deny" } },
+    }));
+    await waitFor(() => settle(sApprovalChild.store), "子代理拒绝后没有收口", 10000, describe(rigApprovalChild, sApprovalChild.store));
+    check("子代理：拒绝不执行另一目标", approvalChildCalls.length === 2);
+    mockToolQueue = [];
+    rigApprovalChild.dispose();
+
     // 变更前确认（build）：Delete 要弹审批；拒绝后不执行。
     requestLog = [];
     const fakeBuild = makeFakeEngine();
@@ -1434,6 +1716,57 @@ async function main() {
       !fakeBuild.calls.includes("Delete"),
       JSON.stringify(fakeBuild.calls),
     );
+    for (const [name, args, optionId] of [
+      ["Write", '{"file_path":"/work/new.txt","content":"new"}', "allow_once"],
+      ["Edit", '{"file_path":"/work/edit.txt","old_string":"old","new_string":"new"}', "allow_always"],
+    ] as const) {
+      mockToolCall = { name, arguments: args };
+      toolCallSent = false;
+      await rigBuild.transport.sendCommand(createCommandEnvelope({
+        type: "sendText", sessionId: sBuild.sessionId,
+        payload: { text: `${name} should ask`, mode: "build" },
+      }));
+      await waitFor(
+        () => (sBuild.store.getState().snapshot?.pendingInteractions.length ?? 0) > 0,
+        `变更前确认模式下 ${name} 没有弹审批`, 8000, describe(rigBuild, sBuild.store),
+      );
+      const interaction = sBuild.store.getState().snapshot?.pendingInteractions[0];
+      const detail = interaction?.payload.kind === "permission" ? interaction.payload.detail : undefined;
+      check(
+        `变更前确认：${name} 弹窗带桌面文件预览入参`,
+        Boolean(detail && typeof detail === "object" && "file_path" in detail),
+        JSON.stringify(detail),
+      );
+      await rigBuild.transport.sendCommand(createCommandEnvelope({
+        type: "resolveInteraction", sessionId: sBuild.sessionId,
+        payload: { interactionId: interaction?.interactionId, answer: { optionId } },
+      }));
+      await waitFor(() => settle(sBuild.store), `${name} 审批后本轮没有收口`, 10000, describe(rigBuild, sBuild.store));
+      check(`变更前确认：${name} 选择 ${optionId} 后执行`, fakeBuild.calls.includes(name), JSON.stringify(fakeBuild.calls));
+    }
+    // allow_always 只记住本工具+目标；同目标放行，新目标必须再问。
+    mockToolCall = { name: "Edit", arguments: '{"file_path":"/work/edit.txt","old_string":"old","new_string":"new"}' };
+    toolCallSent = false;
+    await rigBuild.transport.sendCommand(createCommandEnvelope({
+      type: "sendText", sessionId: sBuild.sessionId, payload: { text: "same edit", mode: "build" },
+    }));
+    await waitFor(() => settle(sBuild.store), "始终允许的同目标 Edit 没有收口", 10000, describe(rigBuild, sBuild.store));
+    check("始终允许仅放行同一工具与目标", fakeBuild.calls.filter((name) => name === "Edit").length === 2 &&
+      (sBuild.store.getState().snapshot?.pendingInteractions.length ?? -1) === 0);
+    mockToolCall = { name: "Edit", arguments: '{"file_path":"/work/other.txt","old_string":"old","new_string":"new"}' };
+    toolCallSent = false;
+    await rigBuild.transport.sendCommand(createCommandEnvelope({
+      type: "sendText", sessionId: sBuild.sessionId, payload: { text: "different edit", mode: "build" },
+    }));
+    await waitFor(() => (sBuild.store.getState().snapshot?.pendingInteractions.length ?? 0) > 0,
+      "始终允许错误地覆盖了另一个 Edit 目标", 8000, describe(rigBuild, sBuild.store));
+    const otherEdit = sBuild.store.getState().snapshot?.pendingInteractions[0];
+    await rigBuild.transport.sendCommand(createCommandEnvelope({
+      type: "resolveInteraction", sessionId: sBuild.sessionId,
+      payload: { interactionId: otherEdit?.interactionId, answer: { optionId: "deny" } },
+    }));
+    await waitFor(() => settle(sBuild.store), "拒绝其他目标的 Edit 后没有收口", 10000, describe(rigBuild, sBuild.store));
+    check("始终允许不会放行其他目标", fakeBuild.calls.filter((name) => name === "Edit").length === 2);
     mockToolCall = null;
     rigBuild.dispose();
 
@@ -1482,6 +1815,122 @@ async function main() {
         (sEdit.store.getState().snapshot?.pendingInteractions.length ?? -1) === 0,
       `calls=${JSON.stringify(fakeEdit.calls)}`,
     );
+    mockToolCall = { name: "Write", arguments: '{"file_path":"/work/auto.txt","content":"ok"}' };
+    toolCallSent = false;
+    await rigEdit.transport.sendCommand(createCommandEnvelope({
+      type: "sendText", sessionId: sEdit.sessionId, payload: { text: "write in edit mode", mode: "edit" },
+    }));
+    await waitFor(() => settle(sEdit.store), "自动编辑 Write 没有收口", 10000, describe(rigEdit, sEdit.store));
+    check("自动编辑：Write 直接执行", fakeEdit.calls.includes("Write") &&
+      (sEdit.store.getState().snapshot?.pendingInteractions.length ?? -1) === 0);
+    mockToolCall = { name: "Bash", arguments: '{"command":"echo ask"}' };
+    toolCallSent = false;
+    await rigEdit.transport.sendCommand(createCommandEnvelope({
+      type: "sendText", sessionId: sEdit.sessionId, payload: { text: "bash in edit mode", mode: "edit" },
+    }));
+    await waitFor(() => (sEdit.store.getState().snapshot?.pendingInteractions.length ?? 0) > 0,
+      "自动编辑模式 Bash 没有弹审批", 8000, describe(rigEdit, sEdit.store));
+    const editBash = sEdit.store.getState().snapshot?.pendingInteractions[0];
+    check("自动编辑：Bash 仍需审批", Boolean(editBash));
+    await rigEdit.transport.sendCommand(createCommandEnvelope({
+      type: "resolveInteraction", sessionId: sEdit.sessionId,
+      payload: { interactionId: editBash?.interactionId, answer: { optionId: "allow_once" } },
+    }));
+    await waitFor(() => settle(sEdit.store), "自动编辑 Bash 审批后没有收口", 10000, describe(rigEdit, sEdit.store));
+    check("允许一次：Bash 通过后实际执行", fakeEdit.calls.includes("Bash"));
+    // 同一轮在 PreToolUse 等待期间切到 yolo，执行闸必须读取最新会话模式，而非开轮快照。
+    let enteredPreToolUse!: () => void;
+    let releasePreToolUse!: () => void;
+    const preToolUseEntered = new Promise<void>((resolve) => { enteredPreToolUse = resolve; });
+    const preToolUseGate = new Promise<void>((resolve) => { releasePreToolUse = resolve; });
+    const rigSwitch = makeRig(mock.url, undefined, async () => ({
+      enabled: true, diagnostics: [],
+      run: async (event: string) => {
+        if (event === "PreToolUse") { enteredPreToolUse(); await preToolUseGate; }
+        return {};
+      },
+    }), async () => fakeEdit.engine);
+    const sSwitch = await openSession(rigSwitch);
+    mockToolCall = { name: "Write", arguments: '{"file_path":"/work/switched.txt","content":"ok"}' };
+    toolCallSent = false;
+    await rigSwitch.transport.sendCommand(createCommandEnvelope({
+      type: "sendText", sessionId: sSwitch.sessionId, payload: { text: "switch while running", mode: "build" },
+    }));
+    await preToolUseEntered;
+    await rigSwitch.transport.sendCommand(createCommandEnvelope({
+      type: "switchCollaborationMode", sessionId: sSwitch.sessionId,
+      baseRevision: sSwitch.store.getState().snapshot?.revision ?? 0,
+      payload: { mode: "yolo" },
+    }));
+    releasePreToolUse();
+    await waitFor(() => settle(sSwitch.store), "运行中切模式后的 Write 没有收口", 10000, describe(rigSwitch, sSwitch.store));
+    check("运行中切换到完全访问立即影响后续审批判定", fakeEdit.calls.filter((name) => name === "Write").length === 2 &&
+      (sSwitch.store.getState().snapshot?.pendingInteractions.length ?? -1) === 0);
+    mockToolCall = null;
+    rigSwitch.dispose();
+    // 已弹出的审批也必须随模式切换收口，不能只影响下一次工具调用。
+    const fakePending = makeFakeEngine();
+    const rigPending = makeRig(mock.url, undefined, undefined, async () => fakePending.engine);
+    const sPending = await openSession(rigPending);
+    mockToolCall = { name: "Write", arguments: '{"file_path":"/work/pending.txt","content":"ok"}' };
+    toolCallSent = false;
+    await rigPending.transport.sendCommand(createCommandEnvelope({
+      type: "sendText", sessionId: sPending.sessionId, payload: { text: "switch pending approval", mode: "build" },
+    }));
+    await waitFor(() => (sPending.store.getState().snapshot?.pendingInteractions.length ?? 0) === 1,
+      "未进入待审批状态", 10000, describe(rigPending, sPending.store));
+    await rigPending.transport.sendCommand(createCommandEnvelope({
+      type: "switchCollaborationMode", sessionId: sPending.sessionId,
+      baseRevision: sPending.store.getState().snapshot?.revision ?? 0, payload: { mode: "yolo" },
+    }));
+    await waitFor(() => settle(sPending.store), "切换完全访问未解除已挂起审批", 10000, describe(rigPending, sPending.store));
+    check("完全访问兑现已挂起审批，无需再点允许", fakePending.calls.includes("Write") &&
+      sPending.store.getState().snapshot?.pendingInteractions.length === 0);
+    mockToolCall = { name: "Write", arguments: '{"file_path":"/work/pending.txt","content":"ok"}' };
+    toolCallSent = false;
+    await rigPending.transport.sendCommand(createCommandEnvelope({type:"sendText",sessionId:sPending.sessionId,
+      payload:{text:"切回确认模式后相同目标也必须审批",mode:"build"}}));
+    await waitFor(()=> (sPending.store.getState().snapshot?.pendingInteractions.length ?? 0) === 1,
+      "模式自动放行错误写入了始终允许记忆",10000,describe(rigPending,sPending.store));
+    const tightenedPermission = sPending.store.getState().snapshot?.pendingInteractions[0];
+    await rigPending.transport.sendCommand(createCommandEnvelope({type:"resolveInteraction",sessionId:sPending.sessionId,
+      payload:{interactionId:tightenedPermission?.interactionId,answer:{optionId:"deny"}}}));
+    await waitFor(()=>settle(sPending.store),"拒绝后没有收口",10000,describe(rigPending,sPending.store));
+    check("模式自动放行不污染始终允许记忆，切回确认模式再次审批",fakePending.calls.length === 1);
+    rigPending.dispose();
+    // 用户复现：切换后才到达的新调用仍弹审批。第一步只读正在执行时切模式，
+    // 随后的新Write/Bash来自下一次模型请求，全程不再发送用户消息。
+    const fakeFuture = makeFakeEngine();
+    let startedRead!: () => void;
+    let releaseRead!: () => void;
+    const readStarted = new Promise<void>(resolve => { startedRead = resolve; });
+    const readGate = new Promise<void>(resolve => { releaseRead = resolve; });
+    const rigFuture = makeRig(mock.url, undefined, undefined, async () => ({
+      ...fakeFuture.engine,
+      tools: [...fakeFuture.engine.tools, { name: "Read", description: "read", inputSchema: { type: "object", properties: {} } }],
+      execute: async (call: { name: string }) => {
+        if (call.name === "Read") { startedRead(); await readGate; }
+        return fakeFuture.engine.execute(call);
+      },
+    }));
+    const sFuture = await openSession(rigFuture);
+    mockToolCall = null;
+    mockToolQueue = [
+      {name:"Read", arguments:'{"file_path":"/work/a.txt"}'},
+      {name:"Write", arguments:'{"file_path":"/work/b.txt","content":"ok"}'},
+      {name:"Bash", arguments:'{"command":"echo no-approval"}'},
+    ];
+    await rigFuture.transport.sendCommand(createCommandEnvelope({type:"sendText", sessionId:sFuture.sessionId,
+      payload:{text:"先读再写和运行命令",mode:"build"}}));
+    await readStarted;
+    await rigFuture.transport.sendCommand(createCommandEnvelope({type:"switchCollaborationMode",sessionId:sFuture.sessionId,
+      baseRevision:sFuture.store.getState().snapshot?.revision ?? 0,payload:{mode:"yolo"}}));
+    releaseRead();
+    await waitFor(()=>settle(sFuture.store),"切换后新工具调用仍在等待审批",10000,describe(rigFuture,sFuture.store));
+    check("切换完全访问后新到达的Write和Bash直接执行，不依赖再次发送消息",
+      fakeFuture.calls.join(",") === "Read,Write,Bash" && sFuture.store.getState().snapshot?.pendingInteractions.length === 0,
+      JSON.stringify(fakeFuture.calls));
+    rigFuture.dispose();
     mockToolCall = null;
     rigEdit.dispose();
 
@@ -1686,13 +2135,140 @@ async function main() {
     rigAuto.dispose();
     compactionSummaryText = null;
 
-    // ── 判据 15：超 40 条不再无声掐断（0.7.4 症状③兜底路径）──
-    // 关掉压缩（compactEnabled:false）模拟"压缩失败/未接管"：42 条历史时旧行为是 slice(-40)
-    // 无声掐断；新行为必须注入"早期历史已省略 N 条"标记段，且送模型的历史仍封顶 40 条。
+    // ── 判据 17：早期历史装不下时分段摘要，不丢历史（0.8.4）──
+    // 桌面端在摘要请求装不下时是把更早的轮次**丢掉**再重试（compact-selection.ts 的
+    // selectCompactEntriesAfterPromptTooLong）——那等于悄悄丢历史。端侧改成分段摘要：
+    // 装不下就分几段，前一段的摘要带进后一段，整段早期历史都被摘要覆盖。
+    // 这里注入极小的单段预算（compactPassInputTokens），确定性地逼出"分段"这条路径。
+    check(
+      "分段切分按整轮切、单轮超预算也不被丢掉（纯函数口径）",
+      JSON.stringify(planCompactPasses([100, 100, 900], 250)) ===
+        JSON.stringify([{ start: 0, end: 2 }, { start: 2, end: 3 }]) &&
+        planCompactPass([100, 100, 900], 250) === 2,
+      JSON.stringify(planCompactPasses([100, 100, 900], 250)),
+    );
+    compactionSummaryText = "【压缩摘要·第{n}段】";
+    compactionRequestCount = 0;
+    const chunkBody = "正文".repeat(500); // 单轮完整正文约 1000 汉字，仍能与摘要指令一起装入单段预算
+    const rigChunk = makeRig(mock.url, undefined, undefined, undefined, {
+      compactEnabled: false,       // 只测手动压缩这一条路，别让自动压缩插进来搅乱计数
+      compactKeepRecentRows: 2,    // 保留最近一轮（两行）
+      compactPassInputTokens: 2000, // 单段预算压小 → 早期段必然分段
+    });
+    const sChunk = await openSession(rigChunk);
+    const chunkTexts = ["早期第一轮", "早期第二轮", "早期第三轮", "早期第四轮"];
+    for (const t of chunkTexts) {
+      const r = sendTurn(rigChunk, sChunk.store, sChunk.sessionId, t + chunkBody);
+      await r.ack;
+      await waitFor(() => settle(sChunk.store), `「${t}」没跑完`, 8000, describe(rigChunk, sChunk.store));
+    }
+    requestLog = [];
+    const chunkSlash = sendTurn(rigChunk, sChunk.store, sChunk.sessionId, "/compact");
+    await chunkSlash.ack;
+    await waitFor(
+      () =>
+        rowsOf(sChunk.store).some(
+          (r: { kind: string; marker?: { type?: string; status?: string } }) =>
+            r.kind === "timelineMarker" && r.marker?.type === "compact" && r.marker?.status === "success",
+        ),
+      "分段摘要的 marker 没有落成 success",
+      8000,
+      describe(rigChunk, sChunk.store),
+    );
+    const chunkRequests = requestLog.filter((r) => JSON.stringify(r.body).includes("context-compaction engine"));
+    check(
+      "早期段装不下时分成多段摘要（不是一次塞不下就失败）",
+      chunkRequests.length >= 2,
+      `压缩请求数=${chunkRequests.length}`,
+    );
+    check(
+      "前一段的摘要带进了后一段（分段摘要是滚动的，不是各段独立）",
+      chunkRequests.length >= 2 &&
+        JSON.stringify(chunkRequests[1]!.body).includes("【压缩摘要·第1段】"),
+      JSON.stringify(chunkRequests[1]?.body).slice(0, 300),
+    );
+    check(
+      "最早那段原文进了第一段摘要请求（历史没有被丢掉）",
+      chunkRequests.length >= 1 && JSON.stringify(chunkRequests[0]!.body).includes("早期第一轮"),
+      JSON.stringify(chunkRequests[0]?.body).slice(0, 300),
+    );
+    check(
+      "早期段最后一段的原文进了最后一段摘要请求（整段早期历史都被摘要覆盖）",
+      chunkRequests.length >= 2 &&
+        JSON.stringify(chunkRequests[chunkRequests.length - 1]!.body).includes("早期第三轮"),
+      `压缩请求数=${chunkRequests.length}`,
+    );
+    requestLog = [];
+    const afterChunk = sendTurn(rigChunk, sChunk.store, sChunk.sessionId, "压缩后再说一句");
+    await afterChunk.ack;
+    await waitFor(() => settle(sChunk.store), "分段压缩后这一轮没跑完");
+    {
+      const body = requestLog[0]?.body as { messages?: Array<{ role?: string; content?: string }> };
+      const text = JSON.stringify(body?.messages ?? []);
+      check(
+        "分段摘要的最终摘要顶上了历史前部",
+        text.includes(`【压缩摘要·第${chunkRequests.length}段】`),
+        text.slice(0, 300),
+      );
+      check(
+        "被摘要的早期原文不再逐字送模型",
+        !text.includes("早期第一轮"),
+        text.slice(0, 300),
+      );
+    }
+    // 摘要流被模型输出上限截断时，旧摘要与未覆盖原文必须继续生效。
+    const failedBefore = rowsOf(sChunk.store).filter((row: any) => row.kind === "timelineMarker" && row.marker?.status === "failed").length;
+    compactionFinishReason = "length";
+    await sendTurn(rigChunk, sChunk.store, sChunk.sessionId, "/compact").ack;
+    await waitFor(() => rowsOf(sChunk.store).filter((row: any) => row.kind === "timelineMarker" && row.marker?.status === "failed").length > failedBefore &&
+      sChunk.store.getState().snapshot?.availability.compact.allowed === true, "被截断的摘要没有失败收口");
+    compactionFinishReason = "stop";
+    requestLog = [];
+    await sendTurn(rigChunk, sChunk.store, sChunk.sessionId, "摘要失败后继续").ack;
+    await waitFor(() => settle(sChunk.store) && requestLog.length > 0, "摘要失败后未能继续使用旧上下文");
+    const afterFailedSummary = JSON.stringify(requestLog[0]?.body);
+    check("截断摘要失败后旧摘要仍生效", afterFailedSummary.includes(`【压缩摘要·第${chunkRequests.length}段】`));
+    check("截断摘要失败不推进原文覆盖水位", afterFailedSummary.includes("早期第四轮"));
+    compactionSummaryText = null;
+    rigChunk.dispose();
+
+    // ── 判据 18：自动压缩连续失败后熔断（0.8.4）──
+    // 摘要请求连着失败就是连着失败：再自动压一次也是同样的结果，只会每轮白烧一次
+    // 全文请求（桌面端 compact/policy.ts 的 MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES 同口径）。
+    // 端侧连败 3 次就停掉自动压缩，并把这件事告诉用户。
+    compactionFails = true;
+    compactionSummaryText = null;
+    const rigFuse = makeRig(mock.url, undefined, undefined, undefined, {
+      compactTriggerTokens: 10,
+      compactKeepRecentRows: 1,
+    });
+    const sFuse = await openSession(rigFuse);
+    requestLog = [];
+    for (let i = 1; i <= 6; i++) {
+      const r = sendTurn(rigFuse, sFuse.store, sFuse.sessionId, `熔断第${i}句`);
+      await r.ack;
+      await waitFor(() => settle(sFuse.store), `第 ${i} 句没跑完`, 8000, describe(rigFuse, sFuse.store));
+    }
+    const fuseCompactRequests = requestLog.filter((r) => JSON.stringify(r.body).includes("context-compaction engine"));
+    check(
+      "自动压缩连败 3 次后不再重试（每轮白烧全文请求的止损）",
+      fuseCompactRequests.length === 3,
+      `压缩请求数=${fuseCompactRequests.length}`,
+    );
+    check(
+      "自动压缩熔断时如实告诉用户（不静默放弃）",
+      rigFuse.diagnostics.some((d: string) => d.includes("自动压缩已连续失败")),
+      JSON.stringify(rigFuse.diagnostics.slice(-4)),
+    );
+    compactionFails = false;
+    rigFuse.dispose();
+
+    // ── 判据 15：没有模型窗口配置时不再按固定条数丢弃历史 ──
+    // 关闭压缩并累积 22 轮，最后一次请求应能看到全部用户与助手消息；时间线展示与模型历史一致。
     const rigFallback = makeRig(mock.url, undefined, undefined, undefined, { compactEnabled: false });
     const sFB = await openSession(rigFallback);
     const NB_TURNS = 22;
-    let omitMarkerSeen = false;
+    let fullHistorySeen = false;
     for (let i = 1; i <= NB_TURNS; i++) {
       const r = sendTurn(rigFallback, sFB.store, sFB.sessionId, `兜底第${i}句`);
       await r.ack;
@@ -1701,25 +2277,15 @@ async function main() {
         | { messages?: Array<{ role?: string; content?: string }> }
         | undefined;
       const msgs = lastBody?.messages ?? [];
-      const markerMsg = msgs.find((m) => (m.content ?? "").includes("早期历史已省略"));
-      if (markerMsg) {
-        omitMarkerSeen = true;
-        check(
-          "超限历史注入'早期历史已省略 N 条'标记段（不再无声掐断，症状③判据 c）",
-          /早期历史已省略 \d+ 条/.test(markerMsg.content ?? ""),
-          (markerMsg.content ?? "").slice(0, 80),
-        );
-        check(
-          "标记段之后仍保留最近 40 条对话（截断是兜底不是失踪）",
-          msgs.length === 1 + 1 + 40,
-          String(msgs.length),
-        );
-        break;
+      if (i === NB_TURNS) {
+        const history = msgs.slice(1);
+        fullHistorySeen = history.filter((m) => m.role === "user").length === NB_TURNS &&
+          history.filter((m) => m.role === "assistant").length === NB_TURNS - 1 &&
+          !history.some((m) => (m.content ?? "").includes("早期历史已省略"));
+        check("无 contextWindow 时完整历史不受固定消息条数限制", fullHistorySeen, `messages=${msgs.length}`);
       }
     }
-    if (!omitMarkerSeen) {
-      check("超限历史注入省略标记（未触发）", false, `turns=${NB_TURNS} 没有出现标记段`);
-    }
+    if (!fullHistorySeen) check("无固定历史条数限制（未触发）", false, `turns=${NB_TURNS} 没有观察到完整历史`);
     rigFallback.dispose();
     mockMode = "stream";
 

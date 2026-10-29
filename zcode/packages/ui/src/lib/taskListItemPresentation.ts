@@ -15,14 +15,15 @@ export function deriveTaskLeadingIndicator(
     return "error";
   }
 
-  // unread 是 tasks-index membership 字段，蓝点必须直接读取当前
-  // query-cache row；不再回退旧 Zustand map，避免两个未读权威互相打架。
-  if (typeof task.unreadAt === "number") {
-    return "unread";
-  }
-
   if (activity?.phase === "prewarming" || activity?.phase === "running") {
     return "loading";
+  }
+
+  // unread 是 tasks-index membership 字段，蓝点必须直接读取当前
+  // query-cache row；不再回退旧 Zustand map，避免两个未读权威互相打架。
+  // 实时运行态优先于未读标记，确保正在执行的任务始终显示动画。
+  if (typeof task.unreadAt === "number") {
+    return "unread";
   }
 
   // persisted status=running 只说明上次落盘时还没收到终态，不代表新进 app 后仍在实时运行。

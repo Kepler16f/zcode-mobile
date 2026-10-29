@@ -148,6 +148,13 @@ function handleMock(req, res, mode) {
       res.end();
       return;
     }
+    // 0.9.0子代理E2E：父请求发真实Agent调用，子请求输出长文本，最后父轮正常收口。
+    const childRequest = body.messages?.some(m=>m.role==="system" && String(m.content).includes("You are a subagent;"));
+    if (mode === "subagent" && !childRequest && !body.messages?.some(m=>m.role==="tool")) {
+      sseChunk(res,{id:"parent-agent",choices:[{index:0,delta:{tool_calls:[{index:0,id:"agent-e2e",type:"function",function:{name:"Agent",arguments:JSON.stringify({subagent_type:"general-purpose",description:"检查流畅度",prompt:"输出长篇检查报告"})}}]},finish_reason:null}]});
+      sseChunk(res,{id:"parent-agent",choices:[{index:0,delta:{},finish_reason:"tool_calls"}]});
+      sseChunk(res,"[DONE]");res.end();return;
+    }
     // 工具循环模式：按请求里已有的 tool 结果数决定这一步回什么。判据的关键是
     // "没声明 tools 就退回普通流" —— 若引擎没加载（core 动态 import 失败），请求体没有 tools，
     // mock 就不会发 tool_calls，e2e 的"有工具行 / 引擎就绪"判据当场失败，绝不假通过。
@@ -227,7 +234,9 @@ function handleMock(req, res, mode) {
       res.end();
       return;
     }
-    const pieces = [...REPLY];
+    const pieces = mode === "subagent" && childRequest
+      ? ["\n\n```typescript\nconst answer: number = 42;\n```\n\n$$\\frac{x^2}{2}+\\sqrt{y}$$\n\n",...Array.from({length:120},(_,i)=>`\n\n第${i+1}项检查：${"子代理长文本与抽屉交互验证。".repeat(12)}`)]
+      : [...REPLY];
     let i = 0;
     const push = () => {
       if (abort.signal.aborted) return;

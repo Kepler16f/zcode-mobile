@@ -8,7 +8,10 @@
 //  - 提交身份端上没有 git config 可读：固定 aZCode <azcode@local>，commit 入参可覆盖。
 //  - 动态 import：entry.js 不为 git 付体积，首次调用才拉 chunk。
 import { createGitFs } from "../compat/git-fs-adapter.mjs";
+import { callNativeJob, hasNativeJobs } from "../ports/native-async.mjs";
 import { stripInvisibleChars } from "./tool-sanitize.js";
+import { scopedGitFs, gitRelativePath } from "./git-path.js";
+import { scanGitStates, sameGitVersion, stageGitPaths } from "./git-state.js";
 
 const GIT_TOOL = "Git";
 const DEFAULT_AUTHOR = { name: "aZCode", email: "azcode@local" };
@@ -26,19 +29,26 @@ export type GitActionName = (typeof GIT_ACTIONS)[number];
 
 // isomorphic-git 的命令都是 `({fs, dir, ...}) => Promise<...>`；类型面只声明用到的窄形状
 // （tsconfig 开了 noUncheckedIndexedAccess，索引签名会把每次调用判 undefined，这里点名方法）。
-type StatusRow = [string, number, number, number];
 interface LogEntry {
   oid: string;
   commit: { message: string; author: { name: string; timestamp?: number } };
 }
 interface GitModule {
   init(a: { fs: unknown; dir: string }): Promise<void>;
-  clone(a: { fs: unknown; http: unknown; dir: string; url: string; singleBranch?: boolean; depth?: number }): Promise<void>;
-  statusMatrix(a: { fs: unknown; dir: string }): Promise<StatusRow[]>;
+  clone(a: { fs: unknown; http: unknown; dir: string; url: string; singleBranch?: boolean; depth?: number; onAuth?: (url: string) => GitAuth | undefined }): Promise<void>;
+  readObject(a: any): Promise<any>;
+  getConfig(a: any): Promise<any>;
+  walk(a: any): Promise<any>;
+  TREE(a: any): any;
+  STAGE(): any;
+  WORKDIR(a: any): any;
+  hashBlob(a: any): Promise<any>;
+  isIgnored(a: any): Promise<boolean>;
   add(a: { fs: unknown; dir: string; filepath: string }): Promise<void>;
+  remove(a: { fs: unknown; dir: string; filepath: string }): Promise<void>;
   commit(a: { fs: unknown; dir: string; message: string; author: { name: string; email: string } }): Promise<string>;
   log(a: { fs: unknown; dir: string; depth?: number }): Promise<LogEntry[]>;
-  listBranches(a: { fs: unknown; dir: string }): Promise<string[]>;
+  listBranches(a: { fs: unknown; dir: string; remote?: string }): Promise<string[]>;
   currentBranch(a: { fs: unknown; dir: string; fullname?: boolean }): Promise<string | null>;
   branch(a: { fs: unknown; dir: string; ref: string; checkout?: boolean }): Promise<void>;
   push(a: {
@@ -58,9 +68,9 @@ interface GitModule {
   listRemotes(a: { fs: unknown; dir: string }): Promise<Array<{ remote: string; url: string }>>;
   /** 附着模式用：问远端默认分支（不落盘，一次 GET info/refs）。 */
   getRemoteInfo(a: { http: unknown; url: string; onAuth?: (url: string) => GitAuth | undefined }): Promise<{ HEAD?: string; refs?: { heads?: Record<string, string> } }>;
-  /** UMD 里没有 readRef（CJS 才有）——expandRef 等价（ref → oid，缺失抛 NotFoundError）。 */
-  expandRef(a: { fs: unknown; dir: string; ref: string }): Promise<string | undefined>;
-  writeRef(a: { fs: unknown; dir: string; ref: string; value: string; force?: boolean }): Promise<void>;
+  resolveRef(a: { fs: unknown; dir: string; ref: string }): Promise<string>;
+  writeRef(a: { fs: unknown; dir: string; ref: string; value: string; force?: boolean; symbolic?: boolean }): Promise<void>;
+  setConfig(a: { fs: unknown; dir: string; path: string; value: string }): Promise<void>;
 }
 
 /** https 远端凭据：username + password（GitHub/GitLab 的 PAT 当 password 用，username 任意可
@@ -81,7 +91,7 @@ interface GitAuth {
  *  分支 **self.git = factory()**，模块命名空间是空的（git-umd-smoke 钉过）。所以加载后从
  *  `self.git`（window.git）取 API——这是 UMD 的全局分支契约，各版本稳定。
  *  Node 侧（git-smoke）不经过这里，直接用裸包名 index.cjs。 */
-async function loadGit(): Promise<GitModule> {
+export async function loadGit(): Promise<GitModule> {
   const holder = globalThis as { git?: GitModule };
   if (!holder.git) {
     await import("../node_modules/isomorphic-git/index.umd.min.js");
@@ -100,14 +110,15 @@ async function loadGit(): Promise<GitModule> {
  *  ACAO、OPTIONS 预检 405），fetch 层直接 "Failed to fetch"——装机"git 工具一直 fail to
  *  fetch"的根因。原生 HttpURLConnection 没有 CORS 概念；GitHttpBridge.kt 缓冲式一发一收。
  *  返回形状与 http/web/index.js 逐字段一致（isomorphic-git 的 HttpClient 契约）。 */
-async function loadGitHttp(): Promise<unknown> {
+async function loadGitHttp(signal?: AbortSignal): Promise<unknown> {
   const holder = globalThis as { zcodeGitHttp?: { call(request: string): string } };
   if (!holder.zcodeGitHttp || typeof holder.zcodeGitHttp.call !== "function") {
     const mod: unknown = await import("../node_modules/isomorphic-git/http/web/index.js");
     const withDefault = mod as { default?: unknown };
-    return withDefault.default ?? mod;
+    const client = (withDefault.default ?? mod) as { request(req: GitHttpRequest): Promise<unknown> };
+    return { request: (req: GitHttpRequest) => client.request({ ...req, signal: signal ?? req.signal }) };
   }
-  return { request: bridgeHttpRequest };
+  return { request: (req: GitHttpRequest) => bridgeHttpRequest({ ...req, signal: signal ?? req.signal }) };
 }
 
 /** 桥传输的入参形状（isomorphic-git 会传 async iterable 的 body）。 */
@@ -151,6 +162,7 @@ async function bridgeHttpRequest(req: GitHttpRequest): Promise<{
     method: req.method,
     headers: req.headers,
     bodyBase64: bodyBytes.length > 0 ? base64FromBytes(bodyBytes) : "",
+    signal: req.signal,
   });
   const bytes = res.bodyBase64 ? bytesFromBase64(res.bodyBase64) : new Uint8Array(0);
   const headers: Record<string, string> = {};
@@ -182,6 +194,7 @@ export async function bridgeHttpRaw(req: {
   method?: string;
   headers?: Record<string, string>;
   bodyBase64?: string;
+  signal?: AbortSignal;
 }): Promise<{
   statusCode?: number;
   statusMessage?: string;
@@ -189,7 +202,7 @@ export async function bridgeHttpRaw(req: {
   bodyBase64?: string;
   error?: string;
 }> {
-  const bridge = (globalThis as { zcodeGitHttp?: { call(request: string): string } }).zcodeGitHttp;
+  const bridge = (globalThis as { zcodeGitHttp?: { call(request: string): string; start?(request: string): string; poll?(id: string): string; cancel?(id: string): boolean } }).zcodeGitHttp;
   if (!bridge || typeof bridge.call !== "function") {
     throw new Error("原生 HTTP 桥不在（zcodeGitHttp）：这台宿主发不了出网请求");
   }
@@ -199,7 +212,10 @@ export async function bridgeHttpRaw(req: {
     headers: req.headers ?? {},
     bodyBase64: req.bodyBase64 ?? "",
   });
-  const res = JSON.parse(String(bridge.call(payload))) as {
+  // 网络等待交给原生后台任务，JS 轮询时仍可渲染和取消；旧壳继续接受同步协议。
+  const res = (hasNativeJobs(bridge)
+    ? await callNativeJob(bridge, JSON.parse(payload), req.signal)
+    : JSON.parse(String(bridge.call(payload)))) as {
     error?: string;
     statusCode?: number;
     statusMessage?: string;
@@ -240,8 +256,10 @@ async function repoContext(core: GitModule, fs: unknown, dir: string) {
  *  在场并拍快照，命令后把 diff（.git + 工作区改动）回写 SAF。与 Bash 的物化两拍同一套
  *  机制（compat/vfs-stage.mjs），这里只是把调用权交给 Git 工具。 */
 export interface GitStageControl {
+  /** 仅在镜像完整且与所有文件入口互斥时设置；当前 SAF 实现尚不能提供此保证。 */
+  transactionSafe?: boolean;
   /** 命令前：确保镜像在场（首次全量物化，异步让出）。 */
-  ensure(): Promise<void>;
+  ensure(): Promise<void | { skipped?: number; failed?: number }>;
   /** 命令前（ensure 之后）：镜像快照，回写 diff 的基准。 */
   snapshot(): unknown;
   /** 命令后：把镜像 diff 落回 SAF；failed>0 时 errors 里带前三条原因。 */
@@ -323,7 +341,7 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
             "remote=url 添加名为 remote 的远端 / 无 url 列出远端；push=推送当前分支到 remote（默认 origin）；" +
             "pull=拉取并快进合并 remote 的同名分支；fetch=只取不合并",
         },
-        url: { type: "string", description: "clone/remote 的远端地址（https，可内嵌 user:token）" },
+        url: { type: "string", description: "HTTP(S) 远端地址，可内嵌 user:token（凭据仅本次使用、不保存）；不支持查询串或片段" },
         dir: {
           type: "string",
           description:
@@ -331,7 +349,8 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
             "（init+origin+fetch+对齐 HEAD，不覆盖现有文件）——目录里已有文件就用这个，" +
             "不要 clone 到子目录再搬 .git（会把仓库搬坏）",
         },
-        path: { type: "string", description: "add 的文件/目录（'.' = 全部）" },
+        path: { type: "string", description: "add 的单个文件/目录，包含空格时无需拆分（'.' = 全部）" },
+        paths: { type: "array", items: { type: "string" }, description: "add 的多个文件/目录，与 path 二选一" },
         message: { type: "string", description: "commit 的提交说明" },
         depth: { type: "number", description: "log 条数（默认 20）/ fetch 深度" },
         ref: { type: "string", description: "branch 动作：建分支并切换；pull 动作：远端分支名（默认同名）" },
@@ -350,12 +369,11 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
       description:
         `内置 git（纯 JS 实现）：${GIT_ACTIONS.join("/")}。` +
         "提交身份默认 aZCode <azcode@local>（commit 入参可传 author.name/email 覆盖）。" +
-        "SAF 工作区（/mnt/…）自动经终端镜像在私有盘上加速执行并把结果回写工作区，" +
-        "大仓库首次会慢（全量镜像）。" +
-        "push/pull/fetch 需要凭据的 https 远端：url 里内嵌（https://user:token@host/…）或传 username/password 参数" +
+        "优先使用本地文件夹；SAF 镜像在完整性和并发事务得到保障前不能执行 Git。" +
+        "clone/push/pull/fetch 需要凭据时传 username/password；URL 内嵌凭据也仅在本次使用，不会保存。" +
         "（GitHub/GitLab 用 PAT 当 password）；没有凭据时先向用户要令牌再调用，不要盲试。",
     },
-    handler: async (raw: unknown) => {
+    handler: async (raw: unknown, context?: { abortSignal?: AbortSignal }) => {
       const input = (raw ?? {}) as Record<string, unknown>;
       // action 入口归一化 + 表外短路（0.7.6 装机"未知 action"案）：非法动作直接拒——
       // 不为它付 loadGit，也不触发 SAF 镜像两拍（首次全量物化可达秒级～十秒级）。
@@ -363,6 +381,9 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
       const rawAction = typeof input.action === "string" ? input.action : "";
       const action = normalizeGitAction(rawAction);
       if (!isGitActionName(action)) throw new Error(unknownActionError(rawAction, action));
+      if (stage && stage.transactionSafe !== true) throw new Error("SAF 工作区镜像尚不能保证完整性和并发安全，Git 暂不可用；请使用本地文件夹。");
+      if (action === "add") addPaths(workspacePath, input);
+      if (action === "clone" && typeof input.dir === "string" && input.dir.trim() && ![".", "./"].includes(input.dir.trim())) cloneSubdirectory(workspacePath, input.dir.trim());
       const core = await loadGit();
       const dir = workspacePath;
       // SAF 纪律两拍（见 GitStageControl）：镜像在场 → 拍快照 → 跑命令 → diff 回写。
@@ -370,27 +391,37 @@ export function makeGitTool(workspacePath: string, fs: unknown, stage?: GitStage
       // "git 说提交了、工作区里没有 .git"这种半真状态比报错更难查。
       let snapshot: unknown = null;
       if (stage) {
-        await stage.ensure();
+        const prepared = await stage.ensure();
+        if (prepared && ((prepared.skipped ?? 0) > 0 || (prepared.failed ?? 0) > 0)) throw new Error("SAF 工作区镜像不完整，无法安全执行 Git；请使用本地文件夹。");
         snapshot = stage.snapshot();
+        if (!snapshot) throw new Error("无法创建 SAF 工作区快照，Git 未执行；请使用本地文件夹。");
       }
       let result: string | null = null;
       let failure: unknown = null;
       try {
-        result = await runGitAction(core, fs, dir, action, input);
+        result = await runGitAction(core, fs, dir, action, input, context?.abortSignal);
       } catch (e) {
         failure = e;
       }
       let wbNote = "";
       if (stage && snapshot) {
-        const wb = await stage.writeBack(snapshot);
-        if (wb && wb.failed > 0) {
-          wbNote =
-            `\n\n回写告警：${wb.failed} 处 git 改动未能写回工作区（${wb.errors.join("；")}）。` +
-            `这些改动在终端镜像里已生效，但文件工具读到的是未写回版本。`;
+        try {
+          const wb = await stage.writeBack(snapshot);
+          if (!wb || wb.failed > 0) {
+            wbNote =
+              `\n\n回写失败：${wb ? `${wb.failed} 处 git 改动未能写回工作区（${wb.errors.join("；")}）` : "无法确认回写结果"}。` +
+              `这些改动在终端镜像里已生效，但文件工具读到的是未写回版本。`;
+          }
+        } catch (e) {
+          wbNote = `\n\n回写失败：${String((e as Error)?.message ?? e)}`;
         }
       }
-      if (failure !== null) throw failure;
-      return result ? result + wbNote : result;
+      if (failure !== null) {
+        if (wbNote) throw new Error(`${String((failure as Error)?.message ?? failure)}${wbNote}`, { cause: failure });
+        throw failure;
+      }
+      if (wbNote) throw new Error(wbNote.trim());
+      return result;
     },
   };
 }
@@ -401,6 +432,77 @@ interface GitActionCtx {
   fs: unknown;
   dir: string;
   input: Record<string, unknown>;
+  signal?: AbortSignal;
+}
+
+/** 附着只针对未建仓库的目录；不能静默覆盖已有 origin 或 HEAD。 */
+async function assertNoRepository(fs: unknown, dir: string): Promise<void> {
+  const api = (fs as { promises?: { stat(path: string): Promise<unknown> } }).promises;
+  if (!api || typeof api.stat !== "function") throw new Error("文件系统不能检查已有 Git 仓库");
+  try {
+    await api.stat(`${dir}/.git`);
+  } catch (error) {
+    if ((error as { code?: string })?.code === "ENOENT") return;
+    throw error;
+  }
+  throw new Error("当前目录已有 Git 仓库；请直接使用现有仓库，不会覆盖其远端配置。");
+}
+
+/** clone 子目录始终位于工作区，禁止通过 ../ 或绝对路径写到另一工作区。 */
+function cloneSubdirectory(dir: string, raw: string): string {
+  const normalized = raw.replace(/\\/g, "/");
+  if (normalized.startsWith("/") || /^[A-Za-z]:/.test(normalized)) throw new Error("clone 目标必须是工作区内的相对路径");
+  return `${dir.replace(/\/+$/, "")}/${gitRelativePath(dir, normalized)}`;
+}
+
+function addPaths(dir: string, input: Record<string, unknown>): string[] {
+  if (input.path !== undefined && input.paths !== undefined) throw new Error("path 和 paths 只能传一个");
+  const paths = input.paths === undefined ? [input.path === undefined ? "." : input.path] : input.paths;
+  if (!Array.isArray(paths) || !paths.length || paths.some(path => typeof path !== "string" || !path)) throw new Error("add 需要非空的文件路径");
+  return paths.map(path => gitRelativePath(dir, path as string, true));
+}
+
+function redactRemoteUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch { return value.replace(/(https?:\/\/)[^/@\s]+@/gi, "$1***@"); }
+}
+
+/** URL 凭据只驻留本次调用的内存，绝不进入 clone 自动创建的 origin 配置。 */
+function parseRemoteUrl(value: string): { url: string; auth?: GitAuth } {
+  let parsed: URL;
+  try { parsed = new URL(value); } catch { throw new Error("Git 远端地址无效，请使用 HTTP(S) 地址。"); }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("Git 远端只支持 HTTP(S) 地址。");
+  if (parsed.search || parsed.hash) throw new Error("Git 远端地址不能包含查询参数或片段，请重新配置并使用用户名/密码认证。");
+  let username: string, password: string;
+  try { username = decodeURIComponent(parsed.username); password = decodeURIComponent(parsed.password); }
+  catch { throw new Error("Git 远端凭据的编码无效。"); }
+  parsed.username = "";
+  parsed.password = "";
+  return { url: parsed.toString(), ...(username || password ? { auth: { username, password } } : {}) };
+}
+
+/** 查看远端不得修改用户现有凭据；仅在内存中提取并脱敏。 */
+async function cleanConfiguredRemotes(core: GitModule, fs: unknown, dir: string, selected?: string): Promise<Array<{ remote: string; url: string; auth?: GitAuth }>> {
+  const remotes = await core.listRemotes({ fs, dir });
+  const parsed = remotes.filter(remote => !selected || remote.remote === selected).map(remote => ({
+    ...remote,
+    clean: /^https?:\/\//i.test(remote.url) ? parseRemoteUrl(remote.url) : { url: redactRemoteUrl(remote.url), auth: undefined },
+  }));
+  return parsed.map(remote => ({ remote: remote.remote, url: remote.clean.url, auth: remote.clean.auth }));
+}
+
+async function networkRemote(core: GitModule, fs: unknown, dir: string, remote: string, input: Record<string, unknown>) {
+  const remotes = await cleanConfiguredRemotes(core, fs, dir, remote);
+  const configured = remotes.find(item => item.remote === remote);
+  if (configured && !/^https?:\/\//i.test(configured.url)) throw new Error("Git 远端只支持 HTTP(S) 地址，请重新配置。");
+  const explicit = typeof input.url === "string" && input.url.trim() ? parseRemoteUrl(input.url.trim()) : undefined;
+  return { url: explicit?.url ?? configured?.url, onAuth: authFrom(input, explicit?.auth ?? configured?.auth) };
 }
 
 /**
@@ -410,15 +512,15 @@ interface GitActionCtx {
  */
 const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<string>> = {
   init: async ({ core, fs, dir }) => {
+    await assertNoRepository(fs, dir);
     await core.init({ fs, dir });
     return `已在 ${dir} 初始化 git 仓库（.git 已创建，默认分支 master）。`;
   },
-  clone: async ({ core, fs, dir, input }) => {
-    const url = typeof input.url === "string" ? input.url.trim() : "";
-    if (!url.startsWith("https://") && !url.startsWith("http://")) {
-      throw new Error(`clone 需要 http/https 地址：${url}`);
-    }
-    const http = await loadGitHttp();
+  clone: async ({ core, fs, dir, input, signal }) => {
+    const remote = parseRemoteUrl(typeof input.url === "string" ? input.url.trim() : "");
+    const { url } = remote;
+    const onAuth = authFrom(input, remote.auth);
+    const http = await loadGitHttp(signal);
     const subdir = typeof input.dir === "string" && input.dir.trim() ? input.dir.trim() : "";
     // 附着模式（0.6.8，装机"clone 到子目录再搬 .git 到根"的脆弱舞蹈）：dir="." 或省略
     // = 把历史挂到**当前目录**：init → 连 origin → fetch → 对齐 HEAD 到远端默认分支，
@@ -426,15 +528,16 @@ const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<st
     // 这正是"目录已有文件又想有 git 历史"的正解——isomorphic-git 的 clone 对非空目录
     // 会把远端文件盖下来，模型不敢用才去搬 .git，搬的过程中 refs 布局一乱就全崩。
     if (!subdir || subdir === "." || subdir === "./") {
+      await assertNoRepository(fs, dir);
       await core.init({ fs, dir });
-      await core.addRemote({ fs, dir, remote: "origin", url, force: true });
+      await core.addRemote({ fs, dir, remote: "origin", url });
       const info = await core
-        .getRemoteInfo({ http, url, onAuth: authFrom(input) })
+        .getRemoteInfo({ http, url, onAuth })
         .catch(() => ({ HEAD: undefined, refs: undefined }));
-      // HEAD 形如 "ref: refs/heads/main"；拿不到默认分支就退回 fetch 后再猜。
-      const headRef = typeof info.HEAD === "string" ? /^ref: refs\/heads\/(.+)$/.exec(info.HEAD)?.[1] : undefined;
-      await core.fetch({ fs, http, dir, remote: "origin", depth: 50, onAuth: authFrom(input) });
-      const branches = (await core.listBranches({ fs, dir })) as string[];
+      const headRef = typeof info.HEAD === "string" ? /^(?:ref:\s*)?refs\/heads\/(.+)$/.exec(info.HEAD)?.[1] : undefined;
+      const fetched = await core.fetch({ fs, http, dir, remote: "origin", depth: 50, onAuth });
+      // fetch 只建立 refs/remotes/origin/*，不自动建立 refs/heads/*。
+      const branches = (await core.listBranches({ fs, dir, remote: "origin" })).filter((branch) => branch !== "HEAD");
       const target = headRef && branches.includes(headRef)
         ? headRef
         : branches.includes("main")
@@ -443,40 +546,44 @@ const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<st
             ? "master"
             : branches[0] ?? "";
       if (target) {
-        const sha = await core.expandRef({ fs, dir, ref: `refs/heads/${target}` });
-        await core.writeRef({ fs, dir, ref: "HEAD", value: `ref: refs/heads/${target}`, force: true });
-        return `已把 ${url} 的历史挂到 ${dir}（分支 ${target} @ ${String(sha ?? "?").slice(0, 10)}，未改动现有文件；用 status 看差异）。`;
+        const sha = await core.resolveRef({ fs, dir, ref: `refs/remotes/origin/${target}` });
+        await core.writeRef({ fs, dir, ref: `refs/heads/${target}`, value: sha });
+        await core.writeRef({ fs, dir, ref: "HEAD", value: `refs/heads/${target}`, symbolic: true, force: true });
+        await core.setConfig({ fs, dir, path: `branch.${target}.remote`, value: "origin" });
+        await core.setConfig({ fs, dir, path: `branch.${target}.merge`, value: `refs/heads/${target}` });
+      return `已把 ${redactRemoteUrl(url)} 的历史挂到 ${dir}（分支 ${target} @ ${String(sha ?? "?").slice(0, 10)}，未改动现有文件；用 status 看差异）。`;
       }
-      return `已连接 ${url} 并 fetch，但本地没有可对齐的分支（远端可能是空仓库）。`;
+      return `已连接 ${redactRemoteUrl(url)} 并 fetch，但远端没有可对齐的分支${fetched.fetchHead ? `（HEAD ${fetched.fetchHead.slice(0, 10)}）` : "（远端可能是空仓库）"}。`;
     }
-    const target = `${dir}/${subdir.replace(/^\/+/, "")}`;
-    await core.clone({ fs, http, dir: target, url, singleBranch: false, depth: 50 });
+    const target = cloneSubdirectory(dir, subdir);
+    try {
+      const entries = await (fs as any).promises.readdir(target);
+      if (entries.length) throw new Error("clone 目标目录非空；为保护现有文件已取消。");
+    } catch (error) {
+      if ((error as { code?: string })?.code !== "ENOENT") throw error;
+    }
+    await core.clone({ fs, http, dir: target, url, singleBranch: false, depth: 50, onAuth });
     const branches = ((await core.listBranches({ fs, dir: target }).catch(() => [])) as string[]) ?? [];
-    return `已克隆 ${url} → ${target}（分支：${branches.slice(0, 5).join("、") || "?"}）。`;
+    return `已克隆 ${redactRemoteUrl(url)} → ${target}（分支：${branches.slice(0, 5).join("、") || "?"}）。`;
   },
   status: async ({ core, fs, dir }) => {
-    const matrix = (await core.statusMatrix({ fs, dir })) as StatusRow[];
-    // statusMatrix 行 = [file, head, workdir, stage]，各位 0/1/2（0=无 1=同 2=不同）。
-    const changed = matrix
-      .filter((row) => !(row[1] === row[2] && row[2] === row[3]))
-      .map((row) => {
-        const [file, head, workdir] = row;
-        const mark = head === 0 ? "  new file" : workdir === 0 ? "  deleted" : workdir === 2 && head === 1 ? "  modified" : "  changed";
-        return `${file}${mark}`;
-      });
+    const states = await scanGitStates({ git: core, fs, dir });
+    const changed = states.map(({ file, head, index, work, conflicted }) => {
+      const marks: string[] = [];
+      if (conflicted) marks.push("冲突");
+      else {
+        if (!sameGitVersion(head, index)) marks.push(!index ? "暂存删除" : !head ? "暂存新增" : "暂存修改");
+        if (!sameGitVersion(index, work)) marks.push(!work ? "未暂存删除" : !index ? "未跟踪" : "未暂存修改");
+      }
+      return `${file}  ${marks.join("、")}`;
+    });
     const { branch } = await repoContext(core, fs, dir);
-    return `分支：${branch}\n改动 ${changed.length} 个文件：\n${changed.slice(0, 200).join("\n") || "（干净）"}`;
+    return `分支：${branch}\n改动 ${changed.length} 个文件：\n${changed.slice(0, 200).join("\n") || "（干净）"}${changed.length > 200 ? `\n（另有 ${changed.length - 200} 个文件）` : ""}`;
   },
   add: async ({ core, fs, dir, input }) => {
-    const rawPath = typeof input.path === "string" && input.path.trim() ? input.path.trim() : ".";
-    if (rawPath === ".") {
-      await core.add({ fs, dir, filepath: "." });
-      return "已暂存全部改动（add .）。";
-    }
-    for (const p of rawPath.split(/[,\s]+/).filter(Boolean)) {
-      await core.add({ fs, dir, filepath: p.replace(/^\/+/, "") });
-    }
-    return `已暂存：${rawPath}`;
+    const paths = addPaths(dir, input);
+    await stageGitPaths({ git: core, fs, dir }, paths);
+    return `已暂存：${paths.join("、")}`;
   },
   commit: async ({ core, fs, dir, input }) => {
     const message = typeof input.message === "string" ? input.message.trim() : "";
@@ -513,21 +620,19 @@ const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<st
     const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : "";
     const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
     if (url) {
-      if (!url.startsWith("https://") && !url.startsWith("http://")) {
-        throw new Error(`remote 需要 http/https 地址：${url}`);
-      }
-      await core.addRemote({ fs, dir, remote: remoteName, url, force: input.force === true });
-      return `远端 ${remoteName} 已指向 ${url}。`;
+      const clean = parseRemoteUrl(url);
+      await core.addRemote({ fs, dir, remote: remoteName, url: clean.url, force: input.force === true });
+      return `远端 ${remoteName} 已指向 ${clean.url}。${clean.auth ? "凭据未保存，后续网络操作请提供 username/password。" : ""}`;
     }
-    const remotes = (await core.listRemotes({ fs, dir })) as Array<{ remote: string; url: string }>;
+    const remotes = await cleanConfiguredRemotes(core, fs, dir);
     return remotes.length > 0
-      ? remotes.map((r) => `${r.remote}\t${r.url}`).join("\n")
+      ? remotes.map((r) => `${r.remote}\t${r.url}${r.auth ? "（现有配置包含凭据）" : ""}`).join("\n")
       : "（还没有配置远端——用 action=remote + url 添加。）";
   },
-  push: async ({ core, fs, dir, input }) => {
-    const http = await loadGitHttp();
+  push: async ({ core, fs, dir, input, signal }) => {
+    const http = await loadGitHttp(signal);
     const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
-    const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
+    const { url, onAuth } = await networkRemote(core, fs, dir, remoteName, input);
     const branch = (await core.currentBranch({ fs, dir, fullname: false })) as string | null;
     const pushResult = (await core.push({
       fs,
@@ -537,16 +642,17 @@ const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<st
       ...(url ? { url } : {}),
       ref: branch ?? undefined,
       force: input.force === true,
-      onAuth: authFrom(input),
+      onAuth,
     })) as { ok?: boolean; refs?: Record<string, string> };
     // 凭据失败时 isomorphic-git 会抛 UnexpectedServerResponse/401——如实上抛给模型，
     // 它能拿着错误原文去向用户要令牌。
-    return `已推送 ${branch ?? "?"} → ${remoteName}${pushResult.ok === false ? "（远端返回 ok=false）" : ""}。`;
+    if (pushResult.ok === false) throw new Error("Git 推送失败：远端拒绝更新。");
+    return `已推送 ${branch ?? "?"} → ${remoteName}。`;
   },
-  pull: async ({ core, fs, dir, input }) => {
-    const http = await loadGitHttp();
+  pull: async ({ core, fs, dir, input, signal }) => {
+    const http = await loadGitHttp(signal);
     const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
-    const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
+    const { url, onAuth } = await networkRemote(core, fs, dir, remoteName, input);
     const branch = (await core.currentBranch({ fs, dir, fullname: false })) as string | null;
     const pullResult = (await core.pull({
       fs,
@@ -556,15 +662,15 @@ const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<st
       ...(url ? { url } : {}),
       ...(branch ? { ref: input.ref && typeof input.ref === "string" && input.ref.trim() ? input.ref.trim() : branch } : {}),
       fastForward: true, // 只快进：分叉时如实报错让模型决断，不静默造合并提交
-      onAuth: authFrom(input),
+      onAuth,
       author: DEFAULT_AUTHOR,
     })) as { fetchHead?: string; newHead?: string };
     return `已拉取 ${remoteName}（${branch ?? "?"}）${pullResult.newHead ? `，更新到 ${String(pullResult.newHead).slice(0, 10)}` : "，已是最新"}。`;
   },
-  fetch: async ({ core, fs, dir, input }) => {
-    const http = await loadGitHttp();
+  fetch: async ({ core, fs, dir, input, signal }) => {
+    const http = await loadGitHttp(signal);
     const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
-    const url = typeof input.url === "string" && input.url.trim() ? input.url.trim() : undefined;
+    const { url, onAuth } = await networkRemote(core, fs, dir, remoteName, input);
     const depth = typeof input.depth === "number" && input.depth > 0 ? input.depth : undefined;
     await core.fetch({
       fs,
@@ -573,7 +679,7 @@ const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<st
       remote: remoteName,
       ...(url ? { url } : {}),
       ...(depth ? { depth } : {}),
-      onAuth: authFrom(input),
+      onAuth,
     });
     return `已从 ${remoteName} 取回远端引用（未合并——用 branch/pull 落地）。`;
   },
@@ -589,14 +695,25 @@ export async function runGitAction(
   dir: string,
   action: GitActionName,
   input: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<string> {
-  return gitActionHandlers[action]({ core, fs, dir, input });
+  if (signal?.aborted) throw new DOMException("操作已取消", "AbortError");
+  try {
+    return await gitActionHandlers[action]({ core, fs: scopedGitFs(fs, dir), dir, input, signal });
+  } catch (error) {
+    let message = String((error as Error)?.message ?? error).replace(/https?:\/\/[^\s"'<>]+/gi, redactRemoteUrl);
+    for (const secret of rememberedSecrets.get(input) ?? []) message = message.split(secret).join("[已隐藏]");
+    // 不把可能包含令牌的原始异常附在 cause 中，避免上层日志再次泄露。
+    throw new Error(message);
+  }
 }
 
+const rememberedSecrets = new WeakMap<Record<string, unknown>, string[]>();
 /** 入参里的凭据 → onAuth 应答；没有就返回 undefined（服务器拒绝时错误原文上抛）。 */
-function authFrom(input: Record<string, unknown>): ((url: string) => GitAuth | undefined) | undefined {
-  const username = typeof input.username === "string" ? input.username.trim() : "";
-  const password = typeof input.password === "string" ? input.password : "";
+function authFrom(input: Record<string, unknown>, embedded?: GitAuth): ((url: string) => GitAuth | undefined) | undefined {
+  const username = typeof input.username === "string" ? input.username.trim() : embedded?.username ?? "";
+  const password = typeof input.password === "string" ? input.password : embedded?.password ?? "";
   if (!username && !password) return undefined;
+  rememberedSecrets.set(input, [...new Set([password, embedded?.password].filter((value): value is string => Boolean(value)))]);
   return () => ({ username: username || password, password });
 }

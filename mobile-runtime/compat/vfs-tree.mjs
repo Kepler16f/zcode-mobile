@@ -74,8 +74,10 @@ function callRaw(payload, path, syscall) {
 function statJSON(path) {
   try {
     return call("stat", path, {}, "stat");
-  } catch {
-    return null;
+  } catch (e) {
+    // 撤销授权或 provider 故障不是文件不存在，必须把真实错误传给调用方。
+    if (e?.code === "ENOENT") return null;
+    throw e;
   }
 }
 

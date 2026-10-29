@@ -14,7 +14,7 @@
 //     真正的值是登录时按 `apiKey.secretKey` 复合形式现取、缓存在凭据层里的
 //     （AccountProviderApiKeyResolver + accountProviderCredentialService）。桌面把它交给 CLI 前
 //     也是在这一步现取（node.ts:1507），所以端侧取同一个函数，不自建第二套。
-import type { ModelTarget } from "./model-stream.js";
+import { inferAuthMode, type ModelTarget } from "./model-stream.js";
 // 只引类型的那一句在编译期就被擦掉，不进 bundle；这个联合是上游按它查表的，自己抄一份字面量迟早会漂。
 import { normalizeProviderFamilyDomain, type ModelProviderFamilyId } from "@zcode/shared";
 
@@ -43,6 +43,7 @@ interface ProviderViewLike {
     modelId?: string;
     /** 模型级配置（桌面 RegistryModelConfigObject 的结构子集）：思考档位与输出上限在这里。 */
     config?: {
+      properties?: { contextWindow?: unknown; inputFormat?: { supportsImage?: unknown; supportsPdf?: unknown; supportsText?: unknown } };
       optionSpecs?: {
         reasoningLevel?: { values?: unknown; map?: unknown };
         maxOutputTokens?: { max?: unknown };
@@ -177,6 +178,10 @@ export async function resolveModelTarget(
     typeof optionSpecs?.maxOutputTokens?.max === "number" && optionSpecs.maxOutputTokens.max > 0
       ? optionSpecs.maxOutputTokens.max
       : undefined;
+  const configuredContextWindow = selectedModel?.config?.properties?.contextWindow;
+  const configuredInput = selectedModel?.config?.properties?.inputFormat;
+  const contextWindow = typeof configuredContextWindow === "number" && Number.isFinite(configuredContextWindow) && configuredContextWindow > 0
+    ? configuredContextWindow : undefined;
   const reasoningLevel =
     typeof selection.options?.reasoningLevel === "string" && selection.options.reasoningLevel.trim()
       ? selection.options.reasoningLevel.trim()
@@ -225,11 +230,20 @@ export async function resolveModelTarget(
     baseUrl: String(api.baseUrl),
     apiKey,
     ...(api.headers ? { headers: api.headers } : {}),
+    // 鉴权方式在这里定一次：用户配了认证头就按那一种发（不叠默认 Bearer，避免双认证被拒）；
+    // 没配再按协议取默认（anthropic 兼容要 x-api-key + Bearer 两条腿一起）。
+    authMode: inferAuthMode(api.headers, apiFormat),
     model: selection.modelId,
     // 思考档位链（0.5.1）：用户选的档位 + 模型声明的合法档位 + 单轮输出上限，全在 target 上，
     // streamModelCompletion 的 buildRequest 按它们拼请求体；没选档位时这三个键缺席，请求体不变。
     ...(reasoningLevel ? { reasoningLevel } : {}),
     ...(reasoningValues ? { reasoningValues } : {}),
     ...(maxOutputTokensCap ? { maxOutputTokensCap } : {}),
+    ...(contextWindow ? { contextWindow } : {}),
+    ...(configuredInput ? { inputCapabilities: {
+      ...(typeof configuredInput.supportsImage === "boolean" ? { image: configuredInput.supportsImage } : {}),
+      ...(typeof configuredInput.supportsPdf === "boolean" ? { pdf: configuredInput.supportsPdf } : {}),
+      ...(typeof configuredInput.supportsText === "boolean" ? { text: configuredInput.supportsText } : {}),
+    } } : {}),
   };
 }

@@ -28,7 +28,7 @@ const context = await browser.newContext({
   hasTouch: true,
 });
 const page = await context.newPage();
-await page.goto(`http://127.0.0.1:${port}/?devCredentials=1&mode=stream&override=1`, {
+await page.goto(`http://127.0.0.1:${port}/?devCredentials=1&mode=stream`, {
   waitUntil: "domcontentloaded",
   timeout: 60000,
 });
@@ -136,6 +136,9 @@ await page
   .first()
   .click({ timeout: 5000 })
   .catch(() => {});
+await page.waitForTimeout(400);
+const liveModeLog = await page.evaluate(() => globalThis.__zcodeMobileMeta?.agentLog ?? []);
+check("切换模式立即通知运行时，无需再发一条消息", liveModeLog.some(line => String(line).includes("执行模式：edit")));
 
 // 第二句：模式必须过命令通路（agentLog 的"执行模式：edit"）。
 await page.locator('[data-testid="v4-composer-input"]').click({ timeout: 5000 }).catch(() => {});
@@ -176,6 +179,20 @@ check(
 );
 const consoleErrors = await page.evaluate(() => globalThis.__zcodeMobileMeta ? "ok" : "no meta");
 check("页面上下文可读（探头自身没崩）", consoleErrors === "ok");
+
+// 用真实产物从设置入口读取已完成会话的统计，覆盖RPC、落盘和图表动态加载。
+const beforeUsageLog = await page.evaluate(() => globalThis.__zcodeMobileMeta?.agentLog ?? []);
+check("打开统计页前不扫描全部历史，避免启动探针禁用统计服务", !beforeUsageLog.some(line => String(line).includes("usage/app snapshot")));
+const sidebarToggle = page.locator('[data-testid="web-sidebar-toggle"]').first();
+if (await sidebarToggle.isVisible().catch(() => false)) await sidebarToggle.click();
+await page.locator('[data-testid="task-settings-button"]').first().click();
+await page.getByText("使用统计", {exact:true}).first().click();
+await page.waitForTimeout(1200);
+const statsText = await page.locator('body').innerText();
+const usageLog = await page.evaluate(() => globalThis.__zcodeMobileMeta?.agentLog ?? []);
+check("设置应用用量页读取到真实会话token", usageLog.some(line => /usage\/app snapshot range=all sessions=[1-9].*tokens=[1-9]/.test(String(line))), JSON.stringify(usageLog.slice(-4)));
+check("应用用量图表可见且没有加载失败", statsText.includes("每日 Token 趋势图") && statsText.includes("模型用量") && !statsText.includes("图表加载失败"));
+await page.screenshot({path:path.join(root,'tmp/usage-page-085.png')});
 
 await browser.close();
 await dev.close();

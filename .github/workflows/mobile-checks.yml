@@ -1,0 +1,73 @@
+name: Mobile checks
+
+on:
+  push:
+    paths:
+      - "mobile-runtime/**"
+      - "android-app/**"
+      - "zcode/**"
+      - ".github/workflows/mobile-checks.yml"
+  pull_request:
+    paths:
+      - "mobile-runtime/**"
+      - "android-app/**"
+      - "zcode/**"
+      - ".github/workflows/mobile-checks.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ZCODE_ENV: production
+      COREPACK_ENABLE_PROJECT_SPEC: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.14.0"
+          package-manager-cache: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - name: Install dependencies
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.33.2 --activate
+          pnpm --dir zcode install --frozen-lockfile
+          pnpm --dir zcode/apps/zcode-cli install --frozen-lockfile
+          npm ci --prefix mobile-runtime
+          mkdir -p tmp
+      - name: Type checks and lint
+        run: |
+          pnpm --dir zcode typecheck
+          pnpm --dir zcode lint
+          node zcode/node_modules/typescript/bin/tsc --noEmit -p mobile-runtime/tsconfig.json
+      - name: Build mobile bundles
+        run: node mobile-runtime/build/build-mobile.mjs
+      - name: Runtime regression checks
+        run: |
+          node mobile-runtime/build/model-native-transport-smoke.mjs
+          node mobile-runtime/build/download-git-security-smoke.mjs
+          node mobile-runtime/build/native-async-smoke.mjs
+          node mobile-runtime/build/tool-boundary-smoke.mjs
+          node mobile-runtime/build/git-panel-smoke.mjs
+          node mobile-runtime/build/responses-smoke.mjs
+          node mobile-runtime/build/runtime-reliability-smoke.mjs
+          node mobile-runtime/build/chat-smoke.mjs
+          node mobile-runtime/build/hooks-smoke.mjs
+          cd zcode
+          node --import tsx --test packages/services/test/mobileOAuthRecovery.test.ts
+      - name: Assemble debug APK
+        working-directory: android-app
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon -PappVersion=0.8.1

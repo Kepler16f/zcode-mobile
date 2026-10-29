@@ -100,11 +100,30 @@ await step("A4 真路径工作区：工作区根与共享存储直通支都放�
   const port = createPort("/sdcard/Download/proj");
   // 工作区根的绝对路径永远放行。
   await port.writeTextFile({ path: "/sdcard/Download/proj/src/i.ts", content: "1" });
-  // 0.7.4 起共享存储整棵树对已授权 app 开放（guard 第一分支 return n，系统权限是唯一开关）：
-  // 工作区外的 /sdcard 路径在文件工具层放行、由原生落真盘——本条钉住该行为不被 0.7.9 改动回退。
-  await port.createDirectory({ path: "/sdcard/Other" });
-  expect(vfs.existsSync("/sdcard/Other"), "guard 直通支被改窄：/sdcard 全盘读写退化");
-  return { direct: true };
+  // 0.8.2（工作区读取跨越收紧）：系统"所有文件访问"只表示**原生桥够得着**，不再等于
+  // 文件工具对整棵共享存储敞开。工作区外的 /sdcard 路径当场 permission_denied，
+  // 由 agent.ts 的路径审批流程问用户（允许这一次 / 本会话允许），而不是静默放行。
+  // 这条钉住的是"收紧"，不是旧版的"全盘直通"——两者不可同时成立。
+  let code = null;
+  let detail = null;
+  try {
+    await port.createDirectory({ path: "/sdcard/Other" });
+  } catch (e) {
+    code = e?.code ?? e?.name;
+    detail = e?.message ?? String(e);
+  }
+  expect(code === "permission_denied", `工作区外的 /sdcard 路径期望 permission_denied，得到 ${code}`);
+  expect(/路径越出授权工作区/.test(String(detail)), `错误文案要让上层抠出被拒路径：${detail}`);
+  expect(!vfs.existsSync("/sdcard/Other"), "被拒路径仍落盘：围栏形同虚设");
+  // 别名前缀同样收在围栏内：/storage/emulated/0 归一回 /sdcard，不因拼写不同而漏放。
+  let aliasCode = null;
+  try {
+    await port.createDirectory({ path: "/storage/emulated/0/Other" });
+  } catch (e) {
+    aliasCode = e?.code ?? e?.name;
+  }
+  expect(aliasCode === "permission_denied", `别名前缀期望 permission_denied，得到 ${aliasCode}`);
+  return { inRoot: true, outsideDenied: code, aliasDenied: aliasCode };
 });
 
 // ── B. 真路径工作区不走物化 ──
@@ -153,14 +172,27 @@ await step("C3 ExecBridge 与 FsBridge 共用 ZcodePaths 判定（两侧不再�
   const ktPred = zcodePathsSrc.match(/fun isExternalStorageSpelling[\s\S]*?\n    \}/);
   expect(ktPred, "ZcodePaths 缺共享判定");
   expect(ktPred[0].includes('first == "sdcard"') && ktPred[0].includes('first == "storage"'), `ZcodePaths 判定集合漂了：${ktPred[0]}`);
-  // ZcodePaths 判定集合必须与 guard 的**直通支**逐字一致（{sdcard, storage}）。/ext 是别名前缀，
-  // 由 extAllowed() 单独裁决、原生侧另有一道 externalRootIfGranted，不进这条对撞。
-  const directBranch = portSrc.match(/if \(([^;{]*)\) \{\r?\n      return n;\r?\n    \}/);
-  expect(directBranch, "guard 的直通支形状变了，本冒烟的钉点需要随迁");
-  const jsSet = [...new Set([...directBranch[1].matchAll(/"\/(\w+)(?:\/")?/g)].map((m) => m[1]))];
-  expect(jsSet.includes("sdcard") && jsSet.includes("storage"), `guard 直通支缺拼写：${jsSet}`);
-  expect(jsSet.length === 2, `guard 直通支多了拼写（原生 ZcodePaths 不认）：${jsSet}`);
-  return { shared: ["sdcard", "storage"] };
+  // 0.8.2（工作区读取跨越收紧）后 guard 不再有"共享存储全盘直通支"：会话只能访问选中的
+  // 工作区与用户明确批准的路径。对撞点随之改成——JS 侧的**别名归一集合**必须覆盖原生
+  // ZcodePaths 认的那两个外部拼写，否则 /storage/emulated/0/… 会被当成陌生根而绕过同一道围栏
+  // （原生按 /storage 判是真路径、JS 按陌生目录判，两侧对同一目录给出不同结论）。
+  const aliasBlock = portSrc.match(/for \(const alias of \[([^\]]*)\]\)/);
+  expect(aliasBlock, "normalizePath 的别名归一块形状变了，本冒烟的钉点需要随迁");
+  const aliasSet = [...new Set([...aliasBlock[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]))];
+  expect(aliasSet.includes("/storage/emulated/0"), `别名归一缺主卷拼写：${aliasSet}`);
+  expect(aliasSet.includes("/storage/self/primary"), `别名归一缺 /storage/self/primary：${aliasSet}`);
+  // 别名归一的**目标**必须是原生 ZcodePaths 认得的外部拼写，否则两侧对同一目录结论不一致。
+  const aliasTarget = portSrc.match(/return "(\/\w+)" \+ path\.slice/);
+  expect(aliasTarget, "别名归一的目标拼写找不到了");
+  const targetFirst = aliasTarget[1].replace(/^\//, "");
+  expect(
+    targetFirst === "sdcard" || targetFirst === "storage",
+    `别名归一的目标 ${aliasTarget[1]} 不是原生 ZcodePaths 认得的外部拼写`,
+  );
+  // 原生侧认的两个拼写，JS 侧必须都能归一到同一个外部根。
+  expect(ktPred[0].includes('first == "sdcard"'), "原生不认 /sdcard");
+  expect(ktPred[0].includes('first == "storage"'), "原生不认 /storage");
+  return { shared: ["sdcard", "storage"], aliasSet, aliasTarget: aliasTarget[1] };
 });
 
 await step("C4 冒烟自守：file-system.mjs 不再出现写死的相对段 /work/", () => {

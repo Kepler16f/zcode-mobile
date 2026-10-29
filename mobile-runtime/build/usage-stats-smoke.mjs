@@ -208,6 +208,60 @@ await check("store 为 null（持久化没起来）：空快照而不是崩", as
   return { ok: true };
 });
 
+await check("真实用量页读取轻量异步投影，不查询整段会话正文", async () => {
+  const projected = store.listAllStates().map(entry => ({ ...entry, state: { ...entry.state,
+    rows: entry.state.rows.map(row => ({ ...row, usageChars: row.text?.length ?? 0, text: undefined })),
+  } }));
+  const light = createMobileUsageStatsService({sessionStore: {
+    listUsageStates: async () => projected,
+    listAllStates() { throw new Error("大字段读取会触发CursorWindow限制"); },
+  }});
+  const result = await light.getAppUsageSnapshot({range:"all", timeZone:TZ});
+  eq(result.summary.totalTokens, 920, "token totals");
+  eq(result.models[0].requestCount, 3, "请求次数与920 tokens独立");
+});
+
+await check("统计读取瞬时失败后可刷新重试，服务不会永久降级", async () => {
+  let failedOnce = false;
+  const retryable = createMobileUsageStatsService({sessionStore:{
+    async listUsageStates() {
+      if (!failedOnce) {failedOnce = true; throw new Error("暂时无法读取");}
+      return store.listAllStates();
+    },
+  }});
+  let rejected = false;
+  try {await retryable.getAppUsageSnapshot({range:"all",timeZone:TZ});} catch {rejected = true;}
+  eq(rejected,true,"第一次失败显示错误");
+  eq((await retryable.getAppUsageSnapshot({range:"all",timeZone:TZ})).summary.totalTokens,920,"刷新恢复真实统计");
+});
+
+await check("同一会话切换模型：逐轮请求模型优先于旧配置和旧正文标签", async () => {
+  const switched = createMobileUsageStatsService({sessionStore:{listAllStates:()=>[{
+    sessionId:"switched",workspacePath:"/work/a",updatedAt:now,state:{
+      rows:[...turn("old",now-2000),...turn("new",now-1000)],
+      config:{model:"glm-4.7"},
+      turnUsage:{old:{inputTokens:20,outputTokens:10,modelId:"glm-4.7"},
+        new:{inputTokens:200,outputTokens:100,modelId:"MiniMax-M3"}},
+    },
+  }]}});
+  const snap=await switched.getAppUsageSnapshot({range:"all",timeZone:TZ});
+  eq(snap.models.find(m=>m.modelId==="glm-4.7")?.totalTokens,30,"旧模型只有旧轮token");
+  eq(snap.models.find(m=>m.modelId==="MiniMax-M3")?.totalTokens,300,"新模型独立归属");
+  eq(snap.summary.totalTokens,330,"token总量独立于2次请求");
+});
+
+await check("旧记录没有模型证据：不能从会话当前配置补写历史归属", async () => {
+  const unknown=createMobileUsageStatsService({sessionStore:{listAllStates:()=>[{
+    sessionId:"unknown",workspacePath:"/work/a",updatedAt:now,state:{
+      rows:turn("t",now).map(row=>({...row,model:undefined})),config:{model:"wrong-model"},
+      turnUsage:{t:{inputTokens:10,outputTokens:5}},
+    },
+  }]}});
+  const snap=await unknown.getAppUsageSnapshot({range:"all",timeZone:TZ});
+  eq(snap.models.some(m=>m.modelId==="wrong-model"),false,"配置不能代替历史证据");
+  eq(snap.summary.totalTokens,15,"未知模型仍保留真实token");
+});
+
 const failed = results.filter((r) => !r.ok);
 for (const r of results) process.stdout.write(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `  → ${r.why}`}\n`);
 process.stdout.write(`\n端侧用量统计冒烟：${results.length - failed.length}/${results.length} PASS\n`);

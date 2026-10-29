@@ -8,16 +8,26 @@
 // 一旦落到 "/work/…"，越界闸把它当 /work 工作区成员放行——选了 /mnt/proj 或
 // /sdcard/Download 的会话里，文件却写进了私有盘 /work，用户看到的就是"会话没在指定文件夹里干活"。
 // 现在相对段一律落在本工作区根；非 /work 工作区里指向 /work 的绝对路径当场 permission_denied。
+import { localWorkspacePath } from "../compat/workspace-aliases.mjs";
 function normalizePath(p, fallbackRoot = "/work") {
+  p = localWorkspacePath(p);
+  fallbackRoot = localWorkspacePath(fallbackRoot);
   const s = String(p ?? "").replace(/\\/g, "/");
   const abs = s.startsWith("/") || /^[A-Za-z]:\//.test(s);
+  // 相对路径的 .. 必须相对于工作区根消解，不能先在空数组里丢掉再拼根。
+  const input = abs ? s : `${fallbackRoot.replace(/\/+$/, "")}/${s}`;
   const out = [];
-  for (const seg of s.split("/")) {
+  for (const seg of input.split("/")) {
     if (!seg || seg === ".") continue;
     if (seg === "..") out.pop();
     else out.push(seg);
   }
-  return (abs ? "/" : fallbackRoot.replace(/\/+$/, "") + "/") + out.join("/");
+  const path = "/" + out.join("/");
+  // 主存储的多种拼写必须共用同一边界，不能靠别名绕过工作区检查。
+  for (const alias of ["/storage/emulated/0", "/storage/self/primary", "/ext"]) {
+    if (path === alias || path.startsWith(alias + "/")) return "/sdcard" + path.slice(alias.length);
+  }
+  return path;
 }
 
 // core 侧用 isFileSystemPortError(e)（instanceof）分支，普通 Error 会被当成意外故障，
@@ -83,15 +93,21 @@ function globToRegExp(pattern) {
 const YIELD_EVERY_ENTRIES = 32;
 const yieldToUi = () => new Promise((r) => setTimeout(r, 0));
 
-async function walk(fs, root, out = [], ctx = { n: 0 }) {
-  for (const e of fs.readdirSync(root, { withFileTypes: true })) {
+async function walk(fs, root, out = [], ctx = { n: 0 }, check = p => p) {
+  for (const e of fs.readdirSync(check(root), { withFileTypes: true })) {
     const full = (root === "/" ? "" : root) + "/" + e.name;
     if (++ctx.n >= YIELD_EVERY_ENTRIES) {
       ctx.n = 0;
       await yieldToUi();
     }
-    if (e.isDirectory()) await walk(fs, full, out, ctx);
-    else out.push(full);
+    // 遍历期间让出了主线程，目录可能被替换；每项使用前重新验证，拒绝的链接直接跳过。
+    try {
+      check(full);
+      if (e.isDirectory()) await walk(fs, full, out, ctx, check);
+      else out.push(full);
+    } catch (e) {
+      if (!["permission_denied", "ENOENT"].includes(e?.code)) throw e;
+    }
   }
   return out;
 }
@@ -99,7 +115,8 @@ async function walk(fs, root, out = [], ctx = { n: 0 }) {
 export function createMobileFileSystemPort(vfsImpl, opts = {}) {
   const FileSystemPortError = opts.FileSystemPortError;
   const err = (code, message, path, cause) => makeErr(FileSystemPortError, code, message, path, cause);
-  const root = normalizePath(opts.workspaceRoot ?? "/work");
+  const selectedRoot = normalizePath(opts.workspaceRoot ?? "/work");
+  let root = selectedRoot;
   const t0 = () => Number(performance.now());
 const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
 
@@ -109,13 +126,13 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
   // 不做通配/前缀模糊匹配：批的是哪个目录就开哪个目录，最小授权面。
   const grantedRoots = [];
   function grantRoot(path) {
-    const n = normalizePath(String(path ?? ""), root);
+    const n = resolveLinks(normalizePath(String(path ?? ""), root), p => p);
     if (!n || n === "/") return; // 根目录不批（等于全盘放开，那不是"询问授权"是"没有沙箱"）
     if (!grantedRoots.includes(n)) grantedRoots.push(n);
   }
   /** 撤销一次授权（"允许这一次"用完即收）：比 grantRoot 多删一项，语义对称。 */
   function revokeRoot(path) {
-    const n = normalizePath(String(path ?? ""), root);
+    const n = resolveLinks(normalizePath(String(path ?? ""), root), p => p);
     const i = grantedRoots.indexOf(n);
     if (i >= 0) grantedRoots.splice(i, 1);
   }
@@ -123,40 +140,63 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
     return grantedRoots.some((r) => p === r || p.startsWith(r + "/"));
   }
 
-  /**
-   * /ext 前缀（0.7.3"全部文件管理权限"）：JS 侧只放行到"原生说已授予"为止，
-   * 真正的围栏在 FsBridge.resolve（没批就 SecurityException→EACCES）。这里读一次桥的
-   * allFilesGranted 不缓存——用户中途去系统设置改了授权，下一次工具调用就得改口。
-   */
-  function extAllowed() {
-    const bridge = globalThis.zcodeDevice;
-    if (!bridge || typeof bridge.allFilesGranted !== "function") return false;
-    try {
-      return Boolean(bridge.allFilesGranted());
-    } catch {
-      return false;
-    }
-  }
-
   const guard = (p) => {
-    const n = normalizePath(p, root);
-    // 直通真实路径（0.7.4，用户点名"别搞虚拟磁盘映射，直接改本地文件、要能找到下载文件夹"）：
-    // /sdcard、/storage 原样交给 FsBridge——**授予后它就是它自己**（真实读写外部树），未授予时
-    // FsBridge 抛 SecurityException→EACCES 并带"去哪授权"的引导。这里不再走 grantRoot 的会话级
-    // 映射，也不抛 permission_denied 去弹"本会话允许该目录"——系统权限才是这条支路的唯一开关。
-    if (n === "/sdcard" || n.startsWith("/sdcard/") || n === "/storage" || n.startsWith("/storage/")) {
-      return n;
+    let n = normalizePath(p, root);
+    // 用户选中的目录本身可能是链接：保留用户使用该路径的能力，统一落到已解析的真实根。
+    if (selectedRoot !== root && (n === selectedRoot || n.startsWith(selectedRoot + "/"))) {
+      n = root + n.slice(selectedRoot.length);
     }
-    // /ext 别名（0.7.3）同理由原生裁决，grantRoot 绕不过 extAllowed()，故放 root/granted 之前判。
-    if (n === "/ext" || n.startsWith("/ext/")) {
-      if (extAllowed()) return n;
-      throw err("permission_denied", `未授予"所有文件访问"权限，/ext 不可用: ${n}`, n);
-    }
+    // 系统的全盘权限仅表示桥有能力访问；会话仍只能访问选中的目录和明确批准的路径。
     const inRoot = n === root || n.startsWith(root + "/");
     if (inRoot || isGranted(n)) return n;
     // 错误里带上路径：上层（agent.ts）拿它去问用户"模型想读这个文件，允许吗"。
     throw err("permission_denied", `路径越出授权工作区: ${n}`, n);
   };
+
+  // 下载可能覆盖已有文件，也可能经目录链接写到其它工作区。仅检查词法路径会漏掉
+  // 链接目标；逐段解析并对真实目标再次使用同一授权闸，拒绝时保留目标路径供用户授权。
+  // SAF 树自身不支持符号链接；/mnt 是虚拟容器，只有 /mnt/<挂载名> 才能交给树后端。
+  function resolveLinks(p, authorize, followFinalLink = true) {
+    let path = authorize(normalizePath(p, root));
+    if (typeof vfsImpl.lstatSync !== "function" || typeof vfsImpl.readlinkSync !== "function") {
+      throw err("unsupported", "当前文件后端不能验证下载路径中的符号链接", path);
+    }
+    let links = 0;
+    while (true) {
+      const segments = path.split("/").filter(Boolean);
+      let prefix = "";
+      let redirected = false;
+      for (let i = 0; i < segments.length; i++) {
+        const parent = prefix || "/";
+        prefix += `/${segments[i]}`;
+        // /sdcard 是 Android 的基础设施链接，normalizePath 已将其真实目标统一回此拼写。
+        if (prefix === "/mnt" || prefix === "/sdcard") continue;
+        if (!followFinalLink && i === segments.length - 1) break;
+        let st;
+        try {
+          st = vfsImpl.lstatSync(prefix);
+        } catch (e) {
+          // 此处往后的父目录都还不存在，不可能包含已有的符号链接。
+          if (e?.code === "ENOENT") break;
+          throw e;
+        }
+        if (!st.isSymbolicLink()) continue;
+        if (++links > 40) throw err("invalid_path", `符号链接层数过多: ${path}`, path);
+        const target = String(vfsImpl.readlinkSync(prefix));
+        const resolved = target.startsWith("/") ? target : `${parent}/${target}`;
+        path = authorize(normalizePath(`${resolved}/${segments.slice(i + 1).join("/")}`, root));
+        redirected = true;
+        break;
+      }
+      if (!redirected) return path;
+    }
+  }
+
+  // 用户明确选中的链接目录本身是合法根；后续边界一律按其真实目标比较。
+  root = resolveLinks(root, p => p);
+  function checkAccess(p, { followFinalLink = true } = {}) {
+    return resolveLinks(p, guard, followFinalLink);
+  }
 
   const readNode = (n, syscall) => {
     try {
@@ -178,7 +218,7 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
   };
 
   async function stat(request) {
-    const path = guard(request.path);
+    const path = checkAccess(request.path);
     if (!vfsImpl.existsSync(path)) return { path, kind: "missing", sizeBytes: 0 };
     const st = vfsImpl.statSync(path);
     return {
@@ -191,13 +231,13 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
   }
 
   async function createDirectory(request) {
-    const path = guard(request.path);
+    const path = checkAccess(request.path);
     vfsImpl.mkdir(path, { recursive: true });
     return { path };
   }
 
   async function readTextFile(request) {
-    const path = guard(request.path);
+    const path = checkAccess(request.path);
     const { st, bytes } = readBytes(path, request.maxBytes);
     const encoding = enc(request.encoding);
     const raw = decode(bytes, encoding);
@@ -216,7 +256,7 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
   }
 
   async function readBinaryFile(request) {
-    const path = guard(request.path);
+    const path = checkAccess(request.path);
     const { st, bytes } = readBytes(path, request.maxBytes);
     return { path, content: bytes, bytesRead: bytes.length, sizeBytes: st.size, revision: toRevision({ path, mtimeMs: st.mtimeMs, data: bytes }) };
   }
@@ -242,7 +282,7 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
   }
 
   async function writeTextFile(request) {
-    const path = guard(request.path);
+    const path = checkAccess(request.path);
     if (request.expectedRevision) {
       const cur = await stat({ path });
       if (cur.revision?.id !== request.expectedRevision.id) {
@@ -259,9 +299,22 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
     return { path, bytesWritten: bytes.length, revision: toRevision({ path, mtimeMs: Date.now(), data: bytes }) };
   }
 
+  async function writeBinaryFile(request) {
+    // checkAccess 在真正写入前再次运行，防止下载期间授权被撤销或路径发生变化。
+    const path = checkAccess(request.path);
+    if (request.createParents !== false) {
+      const dir = path.slice(0, path.lastIndexOf("/"));
+      if (dir) vfsImpl.mkdir(dir, { recursive: true });
+    }
+    vfsImpl.writeFile(path, request.content, {});
+    return { path, bytesWritten: request.content.length };
+  }
+
   async function removeFile(request) {
-    const path = guard(request.path);
-    if (!vfsImpl.existsSync(path)) {
+    const path = checkAccess(request.path, { followFinalLink: false });
+    let exists = true;
+    try { vfsImpl.lstatSync(path); } catch (e) { if (e?.code === "ENOENT") exists = false; else throw e; }
+    if (!exists) {
       if (request.missingOk) return { path, removed: false };
       throw err("not_found", `文件不存在: ${path}`, path);
     }
@@ -271,7 +324,7 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
 
   async function listDirectory(request) {
     const t = t0();
-    const path = guard(request.path);
+    const path = checkAccess(request.path);
     const entries = vfsImpl.readdirSync(path, { withFileTypes: true }).map((e) => ({
       kind: e.isDirectory() ? "directory" : e.isSymbolicLink() ? "symlink" : "file",
       name: e.name,
@@ -282,9 +335,9 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
 
   async function searchFiles(request) {
     const t = t0();
-    const path = guard(request.path);
+    const path = checkAccess(request.path);
     const re = globToRegExp(String(request.pattern ?? "").replace(/\\/g, "/"));
-    const all = (await walk(vfsImpl, path)).filter((p) => re.test(p.slice(path.length + 1)));
+    const all = (await walk(vfsImpl, path, [], { n: 0 }, checkAccess)).filter((p) => re.test(p.slice(path.length + 1)));
     const offset = request.offset ?? 0;
     const limit = request.maxResults ?? 2000;
     const files = all.slice(offset, offset + limit);
@@ -293,7 +346,7 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
 
   async function searchText(request) {
     const t = t0();
-    const path = guard(request.path);
+    const path = checkAccess(request.path);
     const mode = request.outputMode ?? "files_with_matches";
     const baseFlags = request.ignoreCase ? "i" : "";
     let compiled;
@@ -306,8 +359,10 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
     let walked;
     try {
       const st = vfsImpl.statSync(path);
-      walked = st.isDirectory() ? await walk(vfsImpl, path) : [path];
-    } catch {
+      walked = st.isDirectory() ? await walk(vfsImpl, path, [], { n: 0 }, checkAccess) : [path];
+    } catch (e) {
+      // 权限和 IO 故障不能伪装成搜索目录不存在。
+      if (e?.code !== "ENOENT") throw e;
       throw err("not_found", `搜索路径不存在: ${path}`, path);
     }
     const files = walked.filter((p) => !globRe || globRe.test(p.slice(path.length + 1)));
@@ -397,7 +452,11 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
     const CHUNK = treeBacked ? 64 : 256;
     for (let i = 0; i < files.length; i += CHUNK) {
       if (i > 0) await yieldToUi();
-      const chunk = files.slice(i, i + CHUNK);
+      // 批读也必须逐项检查链接，不能让 readMany 绕过单文件入口的授权闸。
+      const chunk = files.slice(i, i + CHUNK).flatMap(file => {
+        try { return [checkAccess(file)]; }
+        catch (e) { if (["permission_denied", "ENOENT"].includes(e?.code)) return []; throw e; }
+      });
       const results = vfsImpl.readMany(chunk);
       for (let j = 0; j < chunk.length; j++) {
         const item = results[j];
@@ -429,7 +488,15 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
     readBinaryFile,
     readTextFileRange,
     writeTextFile,
+    writeBinaryFile,
+    checkAccess,
     removeFile,
+    // 删除链接只删链接本身；父目录仍须通过同一授权检查。
+    removePath(request) {
+      const path = checkAccess(request.path, { followFinalLink: false });
+      vfsImpl.rmSync(path, { recursive: Boolean(request.recursive), force: Boolean(request.force) });
+      return { path };
+    },
     listDirectory,
     searchFiles,
     searchText,

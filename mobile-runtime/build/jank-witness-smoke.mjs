@@ -28,6 +28,17 @@ const run = (label, fn) => {
     process.exitCode = 1;
   }
 };
+// 异步变体：只有真等一会儿才看得见的检查（补写定时器）走这条。
+const runAsync = async (label, fn) => {
+  try {
+    const detail = await fn();
+    console.log("PASS", label, JSON.stringify(detail));
+  } catch (e) {
+    failures.push(label);
+    console.log("FAIL", label, String(e?.message ?? e));
+    process.exitCode = 1;
+  }
+};
 const expect = (cond, msg) => { if (!cond) throw new Error(msg); };
 
 // ---- WebView 环境替身：先搭台，再引证人（installJankWitness 看 globalThis.document 才肯装）。 ----
@@ -42,7 +53,14 @@ globalThis.performance = { now: () => fakeNow };
 // setInterval 换成手动驱动的 tick 队列：冒烟不 sleep 15s，节拍靠喂。
 const timers = [];
 globalThis.setInterval = (cb) => { timers.push(cb); return timers.length; };
-globalThis.document = { getElementById: () => null };
+const clearedTimers = new Set();
+globalThis.clearInterval = id => clearedTimers.add(id);
+let visibilityListener;
+globalThis.document = {
+  visibilityState: "visible",
+  getElementById: () => null,
+  addEventListener: (name, listener) => { if (name === "visibilitychange") visibilityListener = listener; },
+};
 
 // ---- 假桥（按 Kotlin 形状）。 ----
 // "慢"由假时钟走字表示：桥阻塞主线程时 performance.now() 同样在涨，壳量的就是这个涨。
@@ -65,6 +83,15 @@ globalThis.zcodeSqlite = {
 };
 globalThis.zcodeDevice = { name: () => "zcodeDevice", allFilesGranted: () => true, deviceInfo: () => "{}" };
 globalThis.zcodeExec = { exec: (req) => req }; // 原样回：壳不许改半个字节
+// 原生模型流桥（按 Kotlin ModelHttpBridge 的形状）：模型响应逐块同步 poll，
+// 是 0.8.x 起 UI 线程上最新的同步 JNI 热路径。证人表里没有它就归因不到它。
+let modelPolls = 0;
+globalThis.zcodeModelHttp = {
+  start: (req) => JSON.stringify({ id: "job-1" }),
+  // 慢的一次：跟 fs 假桥同一个写法——桥调用期间假时钟走字，壳量的就是这个涨。
+  poll: (id) => { modelPolls += 1; if (id === "job-slow") fakeNow += 500; return JSON.stringify({ done: false }) },
+  cancel: () => true,
+};
 // JavaObject 形状替身（0.7.7 真机事故回归钉）：方法对 receiver 敏感（this 不是宿主对象就抛），
 // 外加一个**不可枚举**的额外方法（for-in 枚举不到、兜底表也没有）——壳必须 bind 回 orig 并把
 // 漏网方法沿原型链透传。Node 普通对象形状（此前全部假桥）验不到这两条，正是装机事故的盲区。
@@ -93,6 +120,7 @@ const KEY = "zcode-mobile.jank.diag";
 const readDiag = () => JSON.parse(store.get(KEY) ?? "null");
 
 const origFs = globalThis.zcodeFs; // 记住引用：装壳应当替换全局对象本体，而不是把方法名吃掉
+const origModel = globalThis.zcodeModelHttp;
 // 0.7.8 起计时壳默认关（0.7.7 装机数据全空事故的止血）——本冒烟验的是**开壳后**的壳行为，
 // 所以显式打开开关再装；开关本身（缺省不装壳）由 ⑧ 源码级钉住。
 globalThis.localStorage.setItem("zcode-mobile.jank.shell", "1");
@@ -194,5 +222,55 @@ run("⑧ 计时壳默认关（0.7.8 止血）：开关缺省不装壳", () => {
   return { gated: true };
 });
 
-const totalChecks = failures.length ? null : 8;
+run("⑨ 后台暂停心跳，恢复后不把系统节流误记成前台卡死", () => {
+  const totalBefore = readDiag().total;
+  globalThis.document.visibilityState = "hidden";
+  visibilityListener?.();
+  expect(clearedTimers.has(1), "进入后台没有清理心跳定时器");
+  fakeNow += 60_000;
+  globalThis.document.visibilityState = "visible";
+  visibilityListener?.();
+  expect(timers.length === 2, `恢复前台未重建唯一心跳：${timers.length}`);
+  fakeNow += 200;
+  timers[1]();
+  expect(readDiag().total === totalBefore, "后台停留时间被误记为前台冻结");
+  return { timers: timers.length, total: readDiag().total };
+});
+
+run("⑩ 原生模型流桥进证人表：逐块同步 poll 是最新的 UI 线程 JNI 热路径", () => {
+  const wrapped = globalThis.zcodeModelHttp;
+  expect(wrapped !== origModel, "zcodeModelHttp 全局没被壳替换（这一族没进证人表？）");
+  const back = wrapped.poll("job-1");
+  expect(back === JSON.stringify({ done: false }), `模型桥回包被改：${back}`);
+  // 慢一次：既进 slowCalls，也把这一族的计数冲进 diag（flush 只在慢调用时立刻发生）。
+  wrapped.poll("job-slow");
+  const d = readDiag();
+  expect(d.bridges?.model?.poll?.calls >= 2, `model.poll 没进计数：${JSON.stringify(d.bridges?.model)}`);
+  expect((d.slowCalls ?? []).some((c) => c.family === "model"), `model 族没进 slowCalls：${JSON.stringify(d.slowCalls)}`);
+  return { modelOps: Object.keys(d.bridges.model), polls: modelPolls };
+});
+
+run("⑪ phase 标注节流：工具执行热点路径上不再每次标注都同步写盘", () => {
+  fakeNow += 2000; // 越过节流窗
+  const before = store.get(KEY);
+  markJankPhase("tool:Bash");
+  const afterFirst = store.get(KEY);
+  expect(afterFirst !== before, "越过节流窗后 phase 没落盘（自检报告读不到在跑什么）");
+  expect(readDiag().lastPhase === "tool:Bash", `lastPhase 不是当前 phase：${readDiag().lastPhase}`);
+  markJankPhase("tool:Read"); // 同一拍内：节流窗内，不许再写
+  expect(store.get(KEY) === afterFirst, "节流窗内仍在写 localStorage（每次工具执行至少标两次）");
+  return { throttled: true };
+});
+
+await runAsync("⑫ 节流窗开时补写：工具停下来后读数里不留上一段工具名", async () => {
+  await new Promise((resolve) => setTimeout(resolve, 1100)); // 先让 ⑪ 留下的补写落定
+  const before = store.get(KEY);
+  markJankPhase("tool:Grep"); // 窗口内：只记着，不立即写
+  expect(store.get(KEY) === before, "窗口内不该立即写盘");
+  await new Promise((resolve) => setTimeout(resolve, 1100)); // 补写窗口开
+  expect(readDiag().lastPhase === "tool:Grep", `补写没落盘：${readDiag().lastPhase}`);
+  return { lastPhase: readDiag().lastPhase };
+});
+
+const totalChecks = failures.length ? null : 12;
 console.log(failures.length ? `FAILURES: ${failures.join(", ")}` : `ALL ${totalChecks} PASS (realFsUnderlyingCalls=${realFsCalls}, sqliteQueries=${sqliteQueries})`);

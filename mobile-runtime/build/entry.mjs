@@ -4,6 +4,8 @@ import * as core from "../../zcode/apps/zcode-cli/packages/core/dist/index.js";
 import * as vfs from "../compat/vfs.mjs";
 
 export * from "../../zcode/apps/zcode-cli/packages/core/dist/index.js";
+export { buildMemorySection } from "../../zcode/apps/zcode-cli/packages/core/dist/context/sections/memory.js";
+export { formatProjectMemoryIndexContent } from "../../zcode/apps/zcode-cli/packages/core/dist/memory/index-content.js";
 // core 的 index 没有转发 FileSystemPortError，但端口必须抛 contracts 里那个类：
 // isFileSystemPortError() 走的是 instanceof，自造同名类会被当成未知错误。
 export { FileSystemPortError, HttpClientPortError, isFileSystemPortError } from "../../zcode/apps/zcode-cli/packages/contracts/dist/index.js";

@@ -19,6 +19,8 @@ import type { ICredentialService } from "@zcode/services";
 import { createOAuthService } from "@zcode/services/deep/oauth/oauthService.js";
 import { traceOAuthEvent } from "./oauth-trace.js";
 import { rewritePlatformForServer } from "./server-compat.js";
+import { withPendingOAuthPersistence } from "./oauth-pending.js";
+import { createQuotaApiClient } from "./quota-transport.js";
 
 /** 与 shared/src/api.ts:5 的 ApiClient 同形：request(input, init) -> Response。 */
 export interface MobileApiClient {
@@ -36,6 +38,7 @@ export interface MobileApiClient {
 export function createFetchApiClient(): MobileApiClient {
   return {
     request(input, init = {}) {
+      if ((globalThis as {zcodeGitHttp?:unknown}).zcodeGitHttp) return createQuotaApiClient().request(input, init);
       const { timeoutMs, ...rest } = init;
       const signal = timeoutMs
         ? rest.signal
@@ -48,10 +51,11 @@ export function createFetchApiClient(): MobileApiClient {
 }
 
 export function createMobileOAuthService(credentialService: ICredentialService) {
-  return createOAuthService(credentialService, {
+  const service = createOAuthService(credentialService, {
     apiClient: createFetchApiClient() as never,
     env: {},
   });
+  return withPendingOAuthPersistence(service, credentialService);
 }
 
 /**

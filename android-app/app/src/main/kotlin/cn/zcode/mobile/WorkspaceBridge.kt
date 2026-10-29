@@ -1,6 +1,11 @@
 package cn.zcode.mobile
 
+import android.app.AlertDialog
 import android.app.Activity
+import android.os.Build
+import android.os.Environment
+import android.widget.Toast
+import java.io.File
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -37,23 +42,106 @@ class WorkspaceBridge(
     @JavascriptInterface
     fun name(): String = "zcodeWorkspace"
 
-    /** 发起系统目录选择。回包只说明"已发出/发不出"，真正的路径晚一步经 __zcodeWorkspacePicked 回来。 */
+    // 单一选择所有者与请求 ID：超时后的旧结果不能落到下一次选择请求。
+    @Volatile private var activeRequest: String? = null
+    @Volatile private var pendingSafRequest: String? = null
+    private var pickerDialog: AlertDialog? = null
+
     @JavascriptInterface
-    fun pickDirectory(): String {
-        return try {
-            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-                addFlags(
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
-                )
+    @Synchronized
+    fun pickDirectory(requestId: String): String {
+        if (requestId.isBlank() || activeRequest != null || pendingSafRequest != null) {
+            return JSONObject().put("started", false).put("error", "已有目录选择正在进行").toString()
+        }
+        activeRequest = requestId
+        activity.runOnUiThread {
+            if (activeRequest != requestId) return@runOnUiThread
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                // 旧系统没有“所有文件访问”设置入口，直接使用系统文档选择器。
+                startSaf(requestId)
+            } else if (Environment.isExternalStorageManager()) {
+                showLocalDirectory(Environment.getExternalStorageDirectory(), requestId)
+            } else {
+                pickerDialog = AlertDialog.Builder(activity)
+                    .setTitle("选择工作区目录")
+                    .setMessage("本地文件夹可直接读写，无需 SAF 镜像。请先授予所有文件访问权限；也可使用系统文档提供方。")
+                    .setPositiveButton("授权本地文件夹") { _, _ ->
+                        deliver(null)
+                        DeviceProbe(activity).openAllFilesPermission()
+                        Toast.makeText(activity, "授权后请重新选择工作区", Toast.LENGTH_LONG).show()
+                    }
+                    .setNeutralButton("系统文档（SAF）") { _, _ -> startSaf(requestId) }
+                    .setNegativeButton("取消") { _, _ -> deliver(null) }
+                    .setOnCancelListener { deliver(null) }
+                    .show()
             }
-            activity.startActivityForResult(intent, REQUEST_CODE)
-            JSONObject().put("started", true).toString()
-        } catch (e: Exception) {
-            // 没装任何 DocumentsUI（工作资料/极简 ROM 真有这样的）：当场把 JS 挂着的 Promise 结掉。
+        }
+        return JSONObject().put("started", true).toString()
+    }
+
+    @JavascriptInterface
+    fun cancelDirectory(requestId: String) {
+        activity.runOnUiThread {
+            if (activeRequest != requestId) return@runOnUiThread
+            pickerDialog?.dismiss()
+            pickerDialog = null
             deliver(null)
-            JSONObject().put("started", false).put("error", "${e.javaClass.simpleName}: ${e.message}").toString()
+        }
+    }
+
+    private fun showLocalDirectory(directory: File, requestId: String) {
+        // 文件扫描在后台完成，目录很多时不阻塞 WebView 和原生界面。
+        Thread {
+            val base = runCatching { Environment.getExternalStorageDirectory().canonicalFile }.getOrNull()
+            if (base == null) {
+                activity.runOnUiThread { if (activeRequest == requestId) deliver(null) }
+                return@Thread
+            }
+            val current = runCatching { directory.canonicalFile }.getOrNull()
+            val children = if (current != null &&
+                (current == base || current.path.startsWith(base.path + File.separator))) {
+                current.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name.lowercase() }
+            } else null
+            activity.runOnUiThread {
+                if (activeRequest != requestId || activity.isFinishing) return@runOnUiThread
+                if (current == null || children == null) {
+                    Toast.makeText(activity, "无法读取该目录，请检查系统访问权限", Toast.LENGTH_LONG).show()
+                    if (current == base || current == null) deliver(null)
+                    else showLocalDirectory(base, requestId)
+                    return@runOnUiThread
+                }
+                val parent = if (current == base) null else current.parentFile
+                val labels = (if (parent != null) listOf("↑ 上一级") else emptyList()) + children.map { "📁 ${it.name}" }
+                pickerDialog = AlertDialog.Builder(activity)
+                    .setTitle("/sdcard" + current.path.removePrefix(base.path))
+                    .setItems(labels.toTypedArray()) { _, index ->
+                        if (parent != null && index == 0) showLocalDirectory(parent, requestId)
+                        else showLocalDirectory(children[index - if (parent != null) 1 else 0], requestId)
+                    }
+                    .setPositiveButton("使用此文件夹") { _, _ ->
+                        deliver("/sdcard" + current.path.removePrefix(base.path))
+                    }
+                    .setNeutralButton("系统文档（SAF）") { _, _ -> startSaf(requestId) }
+                    .setNegativeButton("取消") { _, _ -> deliver(null) }
+                    .setOnCancelListener { deliver(null) }
+                    .show()
+            }
+        }.start()
+    }
+
+    private fun startSaf(requestId: String) {
+        if (activeRequest != requestId) return
+        try {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            }
+            pendingSafRequest = requestId
+            activity.startActivityForResult(intent, REQUEST_CODE)
+        } catch (e: Exception) {
+            Log.w(TAG, "无法打开系统文档选择器", e)
+            pendingSafRequest = null
+            deliver(null)
         }
     }
 
@@ -63,6 +151,9 @@ class WorkspaceBridge(
      */
     fun handleResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
         if (requestCode != REQUEST_CODE) return false
+        val expectedRequest = pendingSafRequest
+        pendingSafRequest = null
+        if (expectedRequest == null || activeRequest != expectedRequest) return true
         if (resultCode != Activity.RESULT_OK) {
             deliver(null)
             return true
@@ -72,7 +163,7 @@ class WorkspaceBridge(
             deliver(null)
             return true
         }
-        val grantFlags = (data.flags ?: 0) and
+        val grantFlags = data.flags and
             (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
         try {
             activity.contentResolver.takePersistableUriPermission(uri, grantFlags)
@@ -109,6 +200,19 @@ class WorkspaceBridge(
         return out.toString()
     }
 
+    /** 仅升级旧本地主卷SAF授权；保留挂载名和URI供旧项目、会话继续识别。 */
+    @JavascriptInterface
+    fun localTreeAliases(): String {
+        val prefs = activity.getSharedPreferences(TREE_PREFS, Context.MODE_PRIVATE)
+        val aliases = JSONObject()
+        for ((key, value) in prefs.all) {
+            if (key.endsWith("#mode") || value !is String) continue
+            val path = runCatching { treeBridge.realPathOfExternalTree(Uri.parse(value)) }.getOrNull() ?: continue
+            aliases.put("/mnt/$key", path)
+        }
+        return aliases.toString()
+    }
+
     /** 卸载挂载点：不删用户数据，只是应用放弃这棵树的授权。 */
     @JavascriptInterface
     fun forgetTree(name: String): String {
@@ -124,6 +228,9 @@ class WorkspaceBridge(
     }
 
     private fun deliver(vfsPath: String?) {
+        val requestId = activeRequest ?: return
+        activeRequest = null
+        pickerDialog = null
         val literal = if (vfsPath == null) "null" else JSONObject.quote(vfsPath)
         activity.runOnUiThread {
             val web = webViewProvider()
@@ -132,7 +239,7 @@ class WorkspaceBridge(
                 Log.w(TAG, "deliver: WebView 不可用，结果只能等超时兜底: $vfsPath")
                 return@runOnUiThread
             }
-            web.evaluateJavascript("window.__zcodeWorkspacePicked&&window.__zcodeWorkspacePicked($literal)", null)
+            web.evaluateJavascript("window.__zcodeWorkspacePicked&&window.__zcodeWorkspacePicked($literal,${JSONObject.quote(requestId)})", null)
         }
     }
 

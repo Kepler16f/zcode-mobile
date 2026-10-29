@@ -229,6 +229,7 @@ await check("⑦ 非法 action 报错：含收到值的码点形式与支持清�
 // 都真实进入分发分支。网络动作（clone/push/pull/fetch）用假 core（覆盖 self.git）验
 // "进了分支"即可，不真打流量。
 await check("⑧ enum/校验/分发三者同源：每个支持动作都真实分发", async () => {
+  vfs.mkdir("/work/dispatch-probe", { recursive: true });
   const tool = makeGitTool("/work/dispatch-probe", gitFs, undefined);
   // 0.8.0 回归钉：schema 必须住条目**顶层**——上游 ToolRegistry.toContracts() 只认 entry.inputSchema
   // （registry.ts:114），嵌在 metadata 里模型就收到空参数声明（装机"未知 action：未收到"根因）。
@@ -241,7 +242,10 @@ await check("⑧ enum/校验/分发三者同源：每个支持动作都真实分
   globalThis.git = {
     init: async () => { seen.push("init"); },
     clone: async () => { seen.push("clone"); },
-    statusMatrix: async () => { seen.push("statusMatrix"); return []; },
+    getConfig: async () => undefined,
+    TREE: () => ({}), STAGE: () => ({}), WORKDIR: () => ({}),
+    walk: async () => { seen.push("walk"); },
+    readObject: async () => ({}), hashBlob: async () => ({}), isIgnored: async () => false,
     add: async () => { seen.push("add"); },
     commit: async () => { seen.push("commit"); return OID; },
     log: async () => { seen.push("log"); return []; },
@@ -274,7 +278,7 @@ await check("⑧ enum/校验/分发三者同源：每个支持动作都真实分
     const out = await tool.handler({ action: a, ...(probeInputs[a] ?? {}) });
     expect(typeof out === "string", `${a} 的分发结果不是字符串：${typeof out}`);
   }
-  for (const m of ["statusMatrix", "commit", "addRemote", "fetch"]) {
+  for (const m of ["walk", "commit", "addRemote", "fetch"]) {
     expect(seen.includes(m), `分发表没走 ${m} 分支：${seen.join(",")}`);
   }
   return { dispatched: GIT_ACTIONS.length, seen: seen.join(",") };

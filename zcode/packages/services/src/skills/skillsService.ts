@@ -3,6 +3,7 @@ import {
   access,
   appendFile,
   cp,
+  lstat,
   mkdir,
   realpath,
   rm,
@@ -684,6 +685,21 @@ function resolveInside(rootPath: string, rawPath: string): string | null {
   return null;
 }
 
+async function assertSkillCopyDestination(basePath: string, directory: string): Promise<void> {
+  const root = resolve(basePath);
+  const rel = relative(root, resolve(directory));
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) throw new Error("技能复制目标越出授权目录");
+  let current = root;
+  for (const part of rel.split(/[\\/]/).filter(Boolean)) {
+    current = join(current, part);
+    try {
+      if ((await lstat(current)).isSymbolicLink()) throw new Error(`技能复制目标包含符号链接: ${current}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
 async function scanOfficialPluginCacheRoots(pluginStorageRoot: string): Promise<string[]> {
   const cacheRoot = join(pluginStorageRoot, "cache", ZCODE_OFFICIAL_PLUGIN_MARKETPLACE);
   let pluginEntries: Dirent[] = [];
@@ -1138,11 +1154,14 @@ export function createSkillsService(options?: SkillsServiceOptions): ISkillsServ
           ? getWorkspaceZcodeSkillRoot(params.workspacePath)
           : getUserZcodeSkillRoot();
       const targetDir = join(commonRoot, basename(sourceDir));
+      const basePath = skill.scope === "workspace" ? params.workspacePath : resolveUserHomeDir();
+      await assertSkillCopyDestination(basePath, targetDir);
       // 不覆盖已有目录
       if (await exists(targetDir)) {
         throw new Error(`通用目录已存在同名技能: ${basename(sourceDir)}`);
       }
       await mkdir(commonRoot, { recursive: true });
+      await assertSkillCopyDestination(basePath, targetDir);
       await cp(sourceDir, targetDir, { recursive: true });
       return { newPath: join(targetDir, SKILL_FILE_NAME) };
     },
@@ -1160,17 +1179,14 @@ export function createSkillsService(options?: SkillsServiceOptions): ISkillsServ
       if (!skill) {
         throw new Error(`Skill not found: ${params.skillId}`);
       }
-      const normalizedPath = skill.path.replaceAll("\\", "/").toLowerCase();
-      const userCommonRoot = getUserZcodeSkillRoot().replaceAll("\\", "/").toLowerCase();
-      const workspaceCommonRoot = getWorkspaceZcodeSkillRoot(params.workspacePath)
-        .replaceAll("\\", "/")
-        .toLowerCase();
-      const inUserCommon = normalizedPath.includes(`${userCommonRoot}/`);
-      const inWorkspaceCommon = normalizedPath.includes(`${workspaceCommonRoot}/`);
-      if (!inUserCommon && !inWorkspaceCommon) {
+      const commonRoot = skill.scope === "workspace" ? getWorkspaceZcodeSkillRoot(params.workspacePath) : getUserZcodeSkillRoot();
+      const skillDir = dirname(skill.sourcePath ?? skill.path);
+      const relativeDir = relative(resolve(commonRoot), resolve(skillDir));
+      // 子串匹配会把其它目录中偶然包含通用路径的文件误判为可删除。
+      if (skill.scope === "plugin" || !relativeDir || relativeDir.startsWith("..") || isAbsolute(relativeDir)) {
         throw new Error("该技能不在通用目录中");
       }
-      await rm(dirname(skill.path), { recursive: true, force: true });
+      await this.deleteSkill(params);
     },
 
     async deleteSkill(params: {

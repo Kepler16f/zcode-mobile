@@ -35,7 +35,9 @@ export function installSystemThemeMediaShim(): void {
   };
   if (!g.zcodeUi || typeof g.zcodeUi.systemDark !== "function" || typeof g.matchMedia !== "function") return;
 
-  const nativeDark = () => {
+  // 首次读取就抛错时也要有可用的回退值，避免在初始化期间访问自身的暂时性死区。
+  let lastKnown: boolean = false;
+  const nativeDark = (): boolean => {
     try {
       return Boolean(g.zcodeUi?.systemDark?.());
     } catch {
@@ -44,7 +46,7 @@ export function installSystemThemeMediaShim(): void {
     }
   };
 
-  let lastKnown = nativeDark();
+  lastKnown = nativeDark();
   const listeners = new Set<(ev: unknown) => void>();
   const fake: FakeMediaList = {
     media: "(prefers-color-scheme: dark)",

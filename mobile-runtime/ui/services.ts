@@ -38,7 +38,12 @@ import {
   IZCodeTaskService,
   ICodingPlanSubscriptionService,
   IUsageStatsService,
+  IClientConfigService,
+  IClientScenesService,
 } from "@zcode/services";
+import { ZCODE_VERSION, buildRuntimeZCodeEndpointUrls } from "@zcode/shared";
+import { createClientConfigService } from "@zcode/services/deep/client-config/clientConfigService.js";
+import { createClientScenesService } from "@zcode/services/deep/client-scenes/clientScenesService.js";
 import { createQueuePair, ChannelServer } from "@zcode/rpc";
 
 import { createSettingServiceWithMigrations } from "@zcode/services/deep/setting/settingService.js";
@@ -46,15 +51,13 @@ import { createObservableSettingService } from "@zcode/services/deep/setting/obs
 import { createBroadcastService } from "@zcode/services/deep/broadcast/broadcastService.js";
 import { createFileService } from "@zcode/services/deep/file/fileService.js";
 import { createMediaPreviewService } from "@zcode/services/deep/media-preview/mediaPreview.js";
-import { createSkillsService } from "@zcode/services/deep/skills/skillsService.js";
-import { createSubagentsService } from "@zcode/services/deep/subagents/subagentsService.js";
 import { createCommandsService } from "@zcode/services/deep/commands/commandsService.js";
 import { createMemoryService } from "@zcode/services/deep/memory/memoryService.js";
 import { createSettingsSyncService } from "@zcode/services/deep/settings-sync/settingsSyncService.js";
 import { createPluginsService } from "@zcode/services/deep/plugins/pluginsService.js";
 import { createPluginManagementService } from "@zcode/services/deep/plugins/pluginManagementService.js";
-import { createMcpSyncService } from "@zcode/services/deep/mcp-sync/mcpSyncService.js";
 import { createHooksService } from "@zcode/services/deep/hooks/hooksService.js";
+import { createMcpSyncService } from "@zcode/services/deep/mcp-sync/mcpSyncService.js";
 import { createLocalPromptAttachmentTransferService } from "@zcode/services/deep/prompt-attachment-transfer/promptAttachmentTransferService.js";
 import { createOnboardingRecordService } from "@zcode/services/deep/onboarding/onboardingRecordService.js";
 import { TaskIndexRepo } from "@zcode/services/deep/session/taskIndexRepo.js";
@@ -70,15 +73,23 @@ import { setDataBaseDir } from "@zcode/services/deep/paths.js";
 import { createMobileProviderRuntime } from "./providers.js";
 import { createMobileCredentialService, credentialEngine } from "./credentials.js";
 import { createFetchApiClient, createMobileOAuthService, createTracedOAuthService } from "./oauth.js";
+import { createQuotaApiClient } from "./quota-transport.js";
 import { createMobileAccountSource, createMobileAccountRequestAuthService } from "./account.js";
 import { createUsageStatsService } from "@zcode/services/deep/usage-stats/usageStatsService.js";
 import { createMobileAgentService } from "./agent.js";
+import { createMobileGitService } from "./git-service.js";
+import { createMobileHooksService } from "./capability-services.js";
+import { createSkillsService } from "@zcode/services/deep/skills/skillsService.js";
+import { createSubagentsService } from "@zcode/services/deep/subagents/subagentsService.js";
 import { createMobileSessionStore } from "./session-store.js";
 import type { ModelTargetResolver } from "./provider-target.js";
 import { createMobileConnectivityTester } from "./model-connectivity.js";
 import { createMobileSystemService } from "./system.js";
 import { createMobileUsageStatsService } from "./usage-stats.js";
+import { createMobileMemoryContext } from "./memory-context.js";
+import { desktopCompatibilityVersion } from "./server-compat.js";
 import { createToolEngineFactory } from "./tool-engine.js";
+import { createMobileMcpRuntime } from "./mcp-runtime.js";
 import { createMobileWindowControllerService } from "./window-controller.js";
 import { notSupportedDeferred, withUnsupportedFallback, unsupportedCalls } from "./stand-in.js";
 
@@ -199,20 +210,22 @@ export async function createMobileServices(options: {
   // （Android 框架 SQLite 的 FK/WAL/RETURNING 与 sql.js 语义有出入），同步器只会把错误 catch 成一行
   // logger.warn，屏幕上什么都看不到，表现恰是用户报的"侧栏永远空"。这里在启动时就把它逼出来：
   // 成功则留一条 ready 读数进启动屏，失败则进 degraded，让下一次装机报告直接回答"断没断在写库这步"。
-  try {
-    await taskIndexRepo.ensureReady();
-    const readyLine = `task-index 就绪（引擎=${sqliteEngine()}）`;
-    say(readyLine);
-    trace(readyLine);
-  } catch (e) {
-    const error = String((e as Error)?.message ?? e);
-    say(`task-index 初始化失败：${error}`);
-    trace(`task-index 初始化失败：${error}`);
-    degraded.push({
-      name: "taskIndexRepo",
-      error: `侧栏读写的 task-index 建不起来，对话记录进不了列表：${error}`,
-    });
-  }
+  // 这条探测与后面的 provider 运行时互不依赖（一个动 SQLite，一个读配置与凭据），
+  // 串行等就是两段首屏时间白扔。这里改成并行启动、装配结束前再统一等结果。
+  const taskIndexReady = (async () => {
+    try {
+      await taskIndexRepo.ensureReady();
+      const readyLine = `task-index 就绪（引擎=${sqliteEngine()}）`;
+      trace(readyLine);
+    } catch (e) {
+      const error = String((e as Error)?.message ?? e);
+      trace(`task-index 初始化失败：${error}`);
+      degraded.push({
+        name: "taskIndexRepo",
+        error: `侧栏读写的 task-index 建不起来，对话记录进不了列表：${error}`,
+      });
+    }
+  })();
 
   // 顺序是"凭据 → accountSource → ProviderRuntime"：accountSource 要吃 configService 的快照，
   // 而 ProviderRuntime 要把 accountSource 装进 Registry（上游 node.ts:1562 也是这个先后）。
@@ -226,7 +239,7 @@ export async function createMobileServices(options: {
         error: "端侧外壳未提供凭据桥 zcodeCredentials（登录需要的 Keystore 加密存储）",
       },
       { name: "oauthService", error: "凭据桥缺失，登录态无处可存" },
-      { name: "codingPlanSubscriptionService", error: "凭据桥缺失：套餐面按 credentialService 同进同退（工厂要求它，没凭据时不注册）" },
+
     );
   }
   const credentialService = credentialsAvailable ? createMobileCredentialService() : null;
@@ -241,12 +254,13 @@ export async function createMobileServices(options: {
   let usageEntitlementUpstream: ReturnType<typeof createUsageStatsService> | null = null;
   if (credentialService) {
     try {
+      const quotaApiClient = createQuotaApiClient();
       usageEntitlementUpstream = createUsageStatsService({
-        apiClient: apiClient as never,
+        apiClient: quotaApiClient as never,
         accountRequestAuthService: createMobileAccountRequestAuthService({
           credentialService,
           settingService,
-          apiClient,
+          apiClient: quotaApiClient,
         }),
         credentialService,
         // 只为满足形状：getAppUsageSnapshot 由端侧本地聚合实现，上游这一格永远不会被调到；
@@ -327,23 +341,15 @@ export async function createMobileServices(options: {
   // 侧栏历史与"重启后还原对话"这条产品路径就靠它，绝不能静默假装存下了。
   say("session-store");
   const sessionStore = createMobileSessionStore({ onDiagnostic: trace });
+  // 并行那条到这里必须已经落地：后面的同步器要用 task-index 写库。
+  await taskIndexReady;
 
-  // 用量统计探针（Phase 1，与 task-index 那条同一纪律）：真调一次聚合，把读数逼进 agentLog。
-  // 桌面全绿不代表设备上 sessionStore.listAllStates()/聚合没炸——冷启动时这里跑一次，成功留一行
-  // "会话 N / 轮 M / tokens T"，失败进 degraded，让下一次装机报告直接回答"用量屏是真数据还是空面"。
-  try {
-    const usageProbe = await createMobileUsageStatsService({ sessionStore, onDiagnostic: trace }).getAppUsageSnapshot({
-      range: "all",
-    });
-    const line = `用量统计就绪（会话 ${usageProbe.summary.totalSessions} / 轮 ${usageProbe.summary.totalTurns} / tokens ${usageProbe.summary.totalTokens}）`;
-    say(line);
-    trace(line);
-  } catch (e) {
-    const error = String((e as Error)?.message ?? e);
-    say(`用量统计聚合失败：${error}`);
-    trace(`用量统计聚合失败：${error}`);
-    degraded.push({ name: "usageStatsService", error: `用量屏读不出本机统计：${error}` });
-  }
+  // 启动扫描全部历史会阻塞首屏；一次瞬时读取失败还会经 degraded→stubbed
+  // 将已注册的统计服务永久替换为空面，刷新也无法恢复。统计按打开页面时读取，
+  // 数据错误由页面呈现并允许重试，不把读取故障提升为服务装配失败。
+  const usageReady = `用量统计就绪（按需读取；存储=${sessionStore?.engine() ?? "未启用"}）`;
+  say(usageReady);
+  trace(usageReady);
 
   // 端侧 agent 面：v4 对话协议 + 真模型流。providerRuntime 没起来就不建：那时模型落点解析不出来，
   // 注册一个空面只会让 UI 以为运行时在，然后每一轮都失败在离原因更远的地方。
@@ -355,7 +361,28 @@ export async function createMobileServices(options: {
   // 真凶是端侧 Android 桥硬编码的 signal:null（perf 遥测实测 parse 通过），桥侧折叠空值即治本。
   // 是否注册仍由执行桥在不在决定（tool-engine：bashEnabled && execBridge）：纯 WebView（鸿蒙一期、
   // 未接桥的桌面 harness）没有 zcodeExec ⇒ Bash 连声明都不声明，非 exec 档逐字不回归。
-  const toolEngine = createToolEngineFactory({ onDiagnostic: trace });
+  const mcpConfigService = createMcpSyncService();
+  const mcpRuntime = createMobileMcpRuntime({ loadServers: request => mcpConfigService.loadMcpFromUserDirectory(request) });
+  const mcpService: IMcpSyncService = {
+    ...mcpConfigService,
+    listWorkspaceMcpServerStatuses: params => mcpRuntime.listStatuses(params),
+    async saveMcpToUserDirectory(payload) {
+      try { await mcpConfigService.saveMcpToUserDirectory(payload); }
+      finally { mcpRuntime.invalidate(); }
+    },
+    async importMcpServers(params) {
+      try { return await mcpConfigService.importMcpServers(params); }
+      finally { mcpRuntime.invalidate(); }
+    },
+  };
+  const baseToolEngine = createToolEngineFactory({ onDiagnostic: trace });
+  // 设置页和运行时共用实例；端侧 /root 由持久化 VFS 承载用户级数据。
+  const skillsService = createSkillsService({ isDesktopRuntime: true });
+  const subagentsService = createSubagentsService({ isDesktopRuntime: true });
+  const toolEngine: typeof baseToolEngine = async (path, sessionId, signal) => {
+    const base = await baseToolEngine(path, sessionId);
+    return base ? mcpRuntime.wrap(base, path, sessionId, signal) : null;
+  };
   const mobileAgent = providerRuntime
     ? withUnsupportedFallback(
         createMobileAgentService({
@@ -364,6 +391,8 @@ export async function createMobileServices(options: {
           onDiagnostic: trace,
           sessionStore,
           toolEngine,
+          capabilities: { skillsService, subagentsService },
+          memoryContext: createMobileMemoryContext(settingService),
         }),
         "mobile:zcodeAgentService",
       )
@@ -443,15 +472,22 @@ export async function createMobileServices(options: {
             taskIndexRepo,
             taskIndexSyncer,
             onDiagnostic: trace,
+            isSessionRunning: id => mobileAgent?.isSessionRunning(id) === true,
           }),
           "mobile:windowControllerService",
           "端侧接了列表读取口与 tasks-index/workspaces 实时帧，列表组织操作（置顶/归档/删除）没有",
         ),
     },
-    { name: "skillsService", descriptor: ISkillsService, make: () => createSkillsService({ isDesktopRuntime: false }) },
-    { name: "subagentsService", descriptor: ISubagentsService, make: () => createSubagentsService({ isDesktopRuntime: false }) },
+    { name: "skillsService", descriptor: ISkillsService, make: () => skillsService },
+    { name: "subagentsService", descriptor: ISubagentsService, make: () => subagentsService },
     { name: "commandsService", descriptor: ICommandsService, make: () => createCommandsService({ isDesktopRuntime: false }) },
     { name: "memoryService", descriptor: IMemoryService, make: () => createMemoryService() },
+    { name: "clientConfigService", descriptor: IClientConfigService, make: () => createClientConfigService({
+      apiClient: apiClient as never,
+      resolveRequestContext: () => ({endpointOrigin:buildRuntimeZCodeEndpointUrls({}).origin,
+        appVersion:desktopCompatibilityVersion(ZCODE_VERSION), platform:"linux-arm64"}),
+    }) },
+    { name: "clientScenesService", descriptor: IClientScenesService, make: () => createClientScenesService({apiClient:apiClient as never}) },
     { name: "settingsSyncService", descriptor: ISettingsSyncService, make: () => createSettingsSyncService({ settingService }) },
     { name: "pluginsService", descriptor: IPluginsService, make: () => createPluginsService({ isDesktopRuntime: false }) },
     {
@@ -465,22 +501,15 @@ export async function createMobileServices(options: {
     {
       name: "mcpSyncService",
       descriptor: IMcpSyncService,
-      // 这一格的形状由上游的 dependencies 声明（不再手写 `(p: unknown) => Promise<unknown>`）：
-      // 手写那份会把"端侧这一面对不对得上上游要求"从编译期推到运行时，
-      // 而 §1.5.19 那句 Provider「undefined」正是这类形状错。
-      make: () => {
-        // 只把要的那一个键取出来：整个 agent 面当 dependencies 递过去时，替身 Proxy 会把
-        // `logger` 这种没实现的键也返回成一个函数，工厂里 `options.logger ?? 默认` 就误以为真给了 logger。
-        const ports = agent as never as NonNullable<Parameters<typeof createMcpSyncService>[0]>;
-        return createMcpSyncService({ listMcpServerStatuses: ports.listMcpServerStatuses });
-      },
+      make: () => mcpService,
     },
     {
       name: "hooksService",
       descriptor: IHooksService,
       make: () => {
-        const ports = agent as never as NonNullable<Parameters<typeof createHooksService>[0]>;
-        return createHooksService({ grantWorkspaceHookTrust: ports.grantWorkspaceHookTrust });
+        const ports = agentForAdapters as NonNullable<Parameters<typeof createHooksService>[0]>;
+        return createMobileHooksService(createHooksService({ grantWorkspaceHookTrust: ports.grantWorkspaceHookTrust }),
+          () => typeof (globalThis as { zcodeExec?: { exec?: unknown } }).zcodeExec?.exec === "function");
       },
     },
     { name: "promptAttachmentTransferService", descriptor: IPromptAttachmentTransferService, make: () => createLocalPromptAttachmentTransferService() },
@@ -506,16 +535,21 @@ export async function createMobileServices(options: {
       ? [
           { name: "credentialService", descriptor: ICredentialService, make: () => credentialService },
           { name: "oauthService", descriptor: IOAuthService, make: () => createTracedOAuthService(createMobileOAuthService(credentialService)) },
-          // 体验套餐（StartPlanCard/套餐列表）：只读公开的 client/configs，apiClient 用 fetch 版。
-          // 闭包实测 279 模块 / 1.20 MB / 0 缺失垫片（probe-ui-closure）；resolveOffPeakModelSelectionView
-          // 只有 getOffPeakClientConfig 会用，端侧 P0 没有闲时任务面，不给即 undefined——不拖 providerRuntime 进来。
-          {
-            name: "codingPlanSubscriptionService",
-            descriptor: ICodingPlanSubscriptionService,
-            make: () => createCodingPlanSubscriptionService({ apiClient, credentialService }),
-          },
         ]
       : []),
+    // 体验套餐（StartPlanCard/套餐列表）：只读公开的 client/configs，apiClient 用 fetch 版。
+    // 闭包实测 279 模块 / 1.20 MB / 0 缺失垫片（probe-ui-closure）；resolveOffPeakModelSelectionView
+    // 只有 getOffPeakClientConfig 会用，端侧 P0 没有闲时任务面，不给即 undefined——不拖 providerRuntime 进来。
+    // 凭据桥不在时用只读替身：预览能读，购买/余额类接口拿不到 token 就如实报错，不假装有权益。
+    {
+      name: "codingPlanSubscriptionService",
+      descriptor: ICodingPlanSubscriptionService,
+      make: () =>
+        createCodingPlanSubscriptionService({
+          apiClient,
+          credentialService: credentialService ?? { load: async () => null },
+        }),
+    },
     {
       name: "zcodeTaskService",
       descriptor: IZCodeTaskService,
@@ -527,47 +561,11 @@ export async function createMobileServices(options: {
         cuaProductMcpServerResolver: cuaResolver as never,
       }),
     },
-    // A3（0.4.11）：Git 诚实降级——Android 的 toybox 没有 git 二进制（L1 自检的 available
-    // 清单里没有 git），"只读 status/log"没有执行体。注册一个最小面：getRepositorySummary
-    // 返回 isGitAvailable:false / isRepository:false（UI 的 Git 面板对这两个字段有现成分支，
-    // 显示"Git 不可用"而不是报错横幅），其余方法调用时抛具体原因——比"没注册"的
-    // channel-not-found 诚实（那会被 UI 当成内部错误渲染）。
+    // 面板与 Agent 使用同一份 isomorphic-git / VFS；未接入的操作明确返回不可用。
     {
       name: "gitService",
       descriptor: IGitService,
-      make: () => ({
-        getRepositorySummary: async (params: { workspacePath: string }) => ({
-          workspacePath: params.workspacePath,
-          repoRoot: params.workspacePath,
-          workspaceInRepoPath: "",
-          autoRefreshWatchPaths: [],
-          branchName: null,
-          trackingBranchName: null,
-          headRefType: "branch" as const,
-          ahead: 0,
-          behind: 0,
-          isDirty: false,
-          isGitAvailable: false,
-          isRepository: false,
-        }),
-        getWorkspaceRepositoryInfo: async () => ({ isRepository: false }),
-        getLocalBranches: async () => ({ branches: [], currentBranch: null }),
-        getCommitGraph: async () => ({ commits: [], hasMore: false }),
-        getChanges: async () => [],
-        getIgnoredPaths: async () => [],
-        getDiff: async () => ({ hunks: [], truncated: false }),
-        getBranchComparison: async () => ({ ahead: [], behind: [] }),
-        getIdentity: async () => ({ name: null, email: null }),
-        refresh: async () => ({ refreshed: false }),
-        switchBranch: async () => { throw new Error("端侧没有 git 二进制，不支持切换分支"); },
-        createBranchAndSwitch: async () => { throw new Error("端侧没有 git 二进制，不支持创建分支"); },
-        stagePaths: async () => { throw new Error("端侧没有 git 二进制，不支持暂存"); },
-        unstagePaths: async () => { throw new Error("端侧没有 git 二进制，不支持取消暂存"); },
-        discardPaths: async () => { throw new Error("端侧没有 git 二进制，不支持丢弃改动"); },
-        generateCommitMessage: async () => { throw new Error("端侧没有 git 二进制，不支持生成提交信息"); },
-        commit: async () => { throw new Error("端侧没有 git 二进制，不支持提交"); },
-        push: async () => { throw new Error("端侧没有 git 二进制，不支持 push"); },
-      }),
+      make: () => createMobileGitService(),
     },
     {
       name: "zcodeSessionService",
@@ -617,9 +615,7 @@ export async function createMobileServices(options: {
     // usageStatsService 已经不在这份名单里了（Phase 1 启用）：App Usage 读 session-store 的真实
     // 轮次用量做本地聚合；端侧没有的服务端面（Coding Plan monitor/reset）调用时才抛具体原因，
     // 那些屏才触发，不影响用量主面板。
-    // codingPlanSubscriptionService 已经不在这份名单里了：体验套餐查询是**真注册**（凭据在时），
-    // 只读公开 client/configs。凭据不在时它经上面 degraded 那一路重新出现，报的是具体原因。
-    "clientConfigService", "clientScenesService",
+    // 套餐预览在无凭据桥时也已注册；不能列入 degraded，否则 entry 会用不可用占位覆盖它。
     "conversationShareService", "cuaPermissionService",
     // 表里构造失败的也算进去：屏幕与报告仍然报它，只是报的是具体原因而不是"没接"。
     ...degraded.map((d) => d.name),

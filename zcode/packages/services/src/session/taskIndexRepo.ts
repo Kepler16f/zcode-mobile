@@ -1812,6 +1812,10 @@ export class TaskIndexRepo {
       search && search.length > 0 ? `%${search.toLocaleLowerCase()}%` : null;
     const where = ["deleted = 0", `workspace_key IN (${workspaceKeys.map(() => "?").join(", ")})`];
     const args: Array<string | number> = [...workspaceKeys];
+    if (params.excludeTaskIdPrefix) {
+      where.push("substr(task_id, 1, ?) != ?");
+      args.push(params.excludeTaskIdPrefix.length, params.excludeTaskIdPrefix);
+    }
     if (params.provider) {
       appendZCodeAgentIndexedProviderFilter(where, args, params.provider);
     }

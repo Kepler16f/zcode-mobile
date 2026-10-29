@@ -11,9 +11,8 @@
 // 引擎没就绪（isSqliteReady() 为 false）时本层返回 null，agent 面退回纯内存并如实报
 // "没有持久化"，绝不静默假装存下了。
 //
-// 写频是**每轮一次**（startTurn / settleTurn / 配置变更），不是逐 token：两个后端的写都是
-// 同步通道（JNI 往返 / WASM 内存写），逐 token 写会把流式渲染卡住——与帧协议 30 ms 合并
-// 增量（agent.ts 的 FLUSH_WINDOW_MS）是同一个理由。
+// Agent 按秒合并流式检查点，并在工具执行前后和收轮立即保存；不逐 token 同步写入，
+// 避免 JNI / WASM 写盘阻塞渲染。
 //
 // SQL 只用 INSERT OR REPLACE，不用 UPSERT（ON CONFLICT DO UPDATE 要 SQLite 3.24+，
 // 而 minSdk 26 的设备框架库是 3.19）。
@@ -36,6 +35,8 @@ const HYDRATE_LIMIT = 200;
 export interface PersistedTurnUsage {
   inputTokens: number;
   outputTokens: number;
+  modelId?: string;
+  providerId?: string;
 }
 
 /** 会话的完整可还原状态。control 不整体存：它由 phase + lastError 在还原时重新派生。 */
@@ -45,6 +46,9 @@ export interface PersistedSessionState {
   revision: number;
   cumulative: { inputTokens: number; outputTokens: number };
   nextRowId: number;
+  contextWindow?: number;
+  lastPromptTokens?: number;
+  contextUsedTokens?: number;
   /** 每轮的网关用量。readSession 的 snapshot 按轮报 tokens，丢了它还原后全变 0。 */
   turnUsage: Record<string, PersistedTurnUsage>;
   /**
@@ -84,6 +88,16 @@ export interface MobileSessionStore {
   listAllStates(
     limit?: number,
   ): Array<{ sessionId: string; workspacePath: string; state: PersistedSessionState; updatedAt: number }>;
+  /** 用量页只读取小型投影；旧记录分块迁移，避免 Android CursorWindow 装入整段会话。 */
+  listUsageStates?(): Promise<Array<{ sessionId: string; state: PersistedSessionState }>>;
+  /**
+   * 只写用量投影（不碰主表）。
+   * 落盘与投影原本合在一次 save 里，于是每 5 秒的流式检查点都要把整段会话再序列化一遍
+   * 写第二张表：实测双写比单写多 60% 的耗时与一条 SQL，子代理会话各自还有定时器，
+   * 一次滑动就撞上 N 次双写——这正是"滑动偶尔卡一下"的一条实源。
+   * 投影只在收轮时写一次即可；用量页读不到最新投影时会回退到主表并补写。
+   */
+  saveUsageProjection?(entry: Omit<PersistedSession, "updatedAt">): void;
   engine(): string;
 }
 
@@ -114,6 +128,9 @@ function parseState(raw: unknown): PersistedSessionState | null {
         outputTokens: Number(parsed.cumulative?.outputTokens ?? 0),
       },
       nextRowId: Number(parsed.nextRowId ?? parsed.rows.length + 1),
+      ...(typeof parsed.contextWindow === "number" && parsed.contextWindow > 0 ? { contextWindow: parsed.contextWindow } : {}),
+      ...(typeof parsed.lastPromptTokens === "number" && parsed.lastPromptTokens >= 0 ? { lastPromptTokens: parsed.lastPromptTokens } : {}),
+      ...(typeof parsed.contextUsedTokens === "number" && Number.isFinite(parsed.contextUsedTokens) && parsed.contextUsedTokens >= 0 ? { contextUsedTokens: parsed.contextUsedTokens } : {}),
       turnUsage: (parsed.turnUsage ?? {}) as Record<string, PersistedTurnUsage>,
       // 压缩摘要按 optional 透传（0.7.4）：老记录缺这两个键就是"未压缩"，新记录丢了它
       // 还原出来的历史会与被摘要的原文对不上，所以这里必须带。
@@ -140,6 +157,22 @@ function parseSummary(raw: unknown): SessionSummary | null {
   }
 }
 
+function usageProjection(state: PersistedSessionState): PersistedSessionState {
+  return {
+    ...state,
+    contextSummary: undefined,
+    rows: state.rows.map(row => {
+      const r = row as unknown as Record<string, unknown>;
+      return {
+        kind: row.kind, rowId: row.rowId, turnId: row.turnId, createdAt: row.createdAt,
+        endedAt: r.endedAt, state: r.state, status: r.status, model: r.model,
+        // 不在统计库保留正文/工具结果/附件；长度是 legacy 字符统计需要的唯一信息。
+        usageChars: typeof r.text === "string" ? r.text.length : 0,
+      } as unknown as ConversationRow;
+    }),
+  };
+}
+
 export function createMobileSessionStore(
   options: { dbPath?: string; onDiagnostic?: (message: string) => void } = {},
 ): MobileSessionStore | null {
@@ -164,6 +197,7 @@ export function createMobileSessionStore(
     db.exec(
       "CREATE INDEX IF NOT EXISTS idx_mobile_sessions_workspace ON mobile_sessions(workspace_path)",
     );
+    db.exec("CREATE TABLE IF NOT EXISTS mobile_session_usage (session_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at INTEGER NOT NULL)");
   } catch (e) {
     // 建库失败（磁盘满、桥异常）不打死组合根：退回纯内存，屏幕上如实报。
     say(`会话持久化建库失败（${dbPath}）：${String((e as Error)?.message ?? e)}`);
@@ -171,8 +205,26 @@ export function createMobileSessionStore(
   }
   say(`会话持久化就绪：${dbPath}（引擎=${sqliteEngine()}）`);
 
+  // 两个面板（全部/近7日）同时挂载时共用一次读取和迁移。
+  let usageRead: Promise<Array<{ sessionId: string; state: PersistedSessionState }>> | null = null;
+  /** 每条会话最近一次主表落盘的时间戳：投影与主表共用它，读侧才能判断投影是否够新。 */
+  const lastSavedAt = new Map<string, number>();
+  const yieldUi = () => new Promise<void>(resolve => setTimeout(resolve, 0));
+  const readChunks = async (table: "mobile_sessions" | "mobile_session_usage", id: string, length: number, version: number) => {
+    const chunks: string[] = [];
+    const chunkSize = 64 * 1024;
+    for (let start = 1; start <= length; start += chunkSize) {
+      // 每块都绑定同一版本；让出主线程期间收轮保存不能把新旧 JSON 拼在一起。
+      const row = db.prepare(`SELECT substr(state, ?, ?) AS part FROM ${table} WHERE session_id = ? AND updated_at = ?`).get(start, chunkSize, id, version);
+      if (!row) return null;
+      chunks.push(String(row?.part ?? ""));
+      await yieldUi();
+    }
+    return chunks.join("");
+  };
   return {
     save(entry) {
+      const savedAt = Math.max(Date.now(), (lastSavedAt.get(entry.sessionId) ?? 0) + 1);
       db.prepare(
         "INSERT OR REPLACE INTO mobile_sessions (session_id, workspace_path, summary, state, updated_at) VALUES (?, ?, ?, ?, ?)",
       ).run(
@@ -180,8 +232,17 @@ export function createMobileSessionStore(
         entry.workspacePath,
         JSON.stringify(entry.summary),
         JSON.stringify(entry.state),
-        Date.now(),
+        savedAt,
       );
+      // 同一毫秒的两次保存也必须使旧投影失效；失败的写入不能推进版本。
+      lastSavedAt.set(entry.sessionId, savedAt);
+    },
+
+    saveUsageProjection(entry) {
+      db.prepare("INSERT OR REPLACE INTO mobile_session_usage (session_id, state, updated_at) VALUES (?, ?, ?)")
+        // 用主表那一次的时间戳：两张表的 updated_at 不一致时，读侧会以为投影过期而
+        // 每次都回退到主表重读整段会话 —— 那正是用量页 1041 条语句的来源。
+        .run(entry.sessionId, JSON.stringify(usageProjection(entry.state)), lastSavedAt.get(entry.sessionId) ?? Date.now());
     },
 
     load(sessionId) {
@@ -250,6 +311,40 @@ export function createMobileSessionStore(
         });
       }
       return out;
+    },
+
+    listUsageStates() {
+      if (usageRead) return usageRead;
+      usageRead = (async () => {
+        // 不受侧栏200条水合上限影响；只列 id/长度，不读取大字段。
+        const index = db.prepare("SELECT session_id, updated_at FROM mobile_sessions ORDER BY updated_at DESC").all();
+        const out: Array<{ sessionId: string; state: PersistedSessionState }> = [];
+        for (const item of index) {
+          const sessionId = String(item.session_id);
+          // 读取期间允许对话继续流式保存。版本变化时重读，最多三次，避免活跃会话拖住整个页面。
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const current = db.prepare("SELECT updated_at FROM mobile_sessions WHERE session_id = ?").get(sessionId);
+            if (!current) break;
+            const version = Number(current.updated_at);
+            const candidate = db.prepare("SELECT length(state) AS size, updated_at FROM mobile_session_usage WHERE session_id = ?").get(sessionId);
+            const cached = candidate && Number(candidate.updated_at) === version ? candidate : null;
+            const sourceSize = cached?.size ?? db.prepare("SELECT length(state) AS size FROM mobile_sessions WHERE session_id = ?").get(sessionId)?.size;
+            let state = parseState(await readChunks(cached ? "mobile_session_usage" : "mobile_sessions", sessionId, Number(sourceSize), version));
+            if (Number(db.prepare("SELECT updated_at FROM mobile_sessions WHERE session_id = ?").get(sessionId)?.updated_at) !== version) continue;
+            if (!state) continue;
+            if (!cached) {
+              state = usageProjection(state);
+              db.prepare("INSERT OR REPLACE INTO mobile_session_usage (session_id, state, updated_at) VALUES (?, ?, ?)")
+                .run(sessionId, JSON.stringify(state), version);
+            }
+            out.push({ sessionId, state });
+            await yieldUi();
+            break;
+          }
+        }
+        return out;
+      })().finally(() => { usageRead = null; });
+      return usageRead;
     },
 
     engine() {

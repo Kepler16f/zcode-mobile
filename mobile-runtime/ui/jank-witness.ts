@@ -16,7 +16,8 @@
 //
 // 桥族计时壳（本轮，"偶发卡死"残留源头的证人增强）：gap 只说"堵了多久"，不说"堵在哪个桥的哪一下"。
 // 给主要同步桥族（zcodeFs/zcodeTree → fs/tree，zcodeSqlite → sqlite，zcodeExec → exec，
-// zcodeBrowser → browser，zcodeDevice → device，zcodeGitHttp → githttp）的每个方法套一层计时壳：
+// zcodeBrowser → browser，zcodeDevice → device，zcodeGitHttp → githttp，
+// zcodeModelHttp → model）的每个方法套一层计时壳：
 // 族×操作两级计数（次数 / 总耗时 / 最慢一次及其时刻），单次 ≥ BRIDGE_SLOW_CALL_MS 的调用记进
 // slowCalls 环（最坏 12 条）并**立刻落盘**——即便整段没到 ≥800ms 心跳线，"readMany 一次 2.6s"
 // "exec 一条 60s 超时" "githttp 一次 9s 网络" 这些最慢单次也能被自检直接点名归因。
@@ -70,6 +71,10 @@ const BRIDGE_FAMILIES: Array<{ global: string; family: string; methods: string[]
   { global: "zcodeBrowser", family: "browser", methods: ["open", "navigate", "back", "read", "close"] },
   { global: "zcodeDevice", family: "device", methods: ["openExternal", "execL1", "execL2", "allFilesGranted", "deviceInfo", "openAllFilesPermission", "externalStorageRoot"] },
   { global: "zcodeGitHttp", family: "githttp", methods: ["call"] },
+  // 原生模型流桥（0.8.x 的模型原生传输）：模型响应每块都要在 UI 线程上同步 poll 一次原生桥
+  // （model-transport.ts 的 mobileModelFetch）。它是最新的同步 JNI 热路径，证人表里没有它
+  // 就等于"卡死归因"看不见它 —— 这一族不在表里时，slowCalls 永远不会点名模型流。
+  { global: "zcodeModelHttp", family: "model", methods: ["start", "poll", "cancel"] },
 ];
 
 function blank(): JankDiag {
@@ -99,11 +104,51 @@ function write(d: JankDiag): void {
 
 /** 供其它模块标注"现在在跑什么"（如 tool-engine 在 Grep 前置 "grep:/mnt/tree"），冻结采样会带上。 */
 let phase: string | null = null;
+/** 已落盘的 phase 与落盘时刻（performance.now 基准，单调不受系统改钟影响）。 */
+let phasePersisted: string | null = null;
+let phasePersistedAt = Number.NEGATIVE_INFINITY;
+/** phase 落盘的最小间隔：工具执行每次至少标两次（进/出），不节流就是每次标注一次同步写盘。 */
+const PHASE_FLUSH_MS = 1000;
+/** 节流窗外的补写定时器：工具停下来之后把"最后一次在跑什么"补进 diag，别让它停在上一段工具名上。 */
+let phaseFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 把当前 phase 写进 diag（自检报告里"最近一次在跑什么"那一格）。 */
+function persistPhase(now: number): void {
+  const d = read();
+  d.lastPhase = phase;
+  write(d);
+  phasePersisted = phase;
+  phasePersistedAt = now;
+}
+
 export function markJankPhase(p: string | null): void {
   phase = p;
-  const d = read();
-  d.lastPhase = p;
-  write(d);
+  // 每次标注都读写一遍 localStorage ＝ 每次标注一次同步写盘。agent 在每次工具执行前后
+  // 各标一次（agent.ts 的 markJankPhase 调用点），一轮几十个工具就是上百次同步写盘，
+  // 落在 UI 线程上——证人自己成了卡顿的一部分。冻结归因并不依赖这里的落盘：
+  // sample() 记冻结样本时带的是内存里的 phase（那边永远准）。这里的落盘只为自检报告里
+  // "最近一次在跑什么"服务，按时间节流即可（落后一秒钟不影响读数）。
+  const now = Number(performance.now());
+  if (now - phasePersistedAt >= PHASE_FLUSH_MS) {
+    if (p !== phasePersisted) persistPhase(now);
+    return;
+  }
+  // 窗口内：这次不写，但记着——窗开时补写一次（工具停下来也不会把上一段工具名留在读数里）。
+  if (p !== phasePersisted) schedulePhaseFlush();
+}
+
+/** 补写定时器：同一个时刻只留一个，Node 侧（冒烟）不因此吊住进程。 */
+function schedulePhaseFlush(): void {
+  if (phaseFlushTimer !== null) return;
+  const delay = Math.max(0, PHASE_FLUSH_MS - (Number(performance.now()) - phasePersistedAt));
+  const timer = globalThis.setTimeout(() => {
+    phaseFlushTimer = null;
+    if (phase === phasePersisted) return;
+    persistPhase(Number(performance.now()));
+  }, delay);
+  phaseFlushTimer = timer;
+  const unref = (timer as unknown as { unref?: () => void })?.unref;
+  if (typeof unref === "function") unref.call(timer);
 }
 
 // ---- 桥族计时壳 ----
@@ -164,9 +209,13 @@ function flushBridgeStats(): void {
   const d = read();
   d.bridges = snapshotBridges();
   d.slowCalls = slowRing;
+  // 顺带把当前 phase 刷进 diag：这是节流窗外的免费刷新点，省得 phase 落后一整轮工具。
+  d.lastPhase = phase;
   d.updatedAt = Date.now();
   write(d);
   callsSinceFlush = 0;
+  phasePersisted = phase;
+  phasePersistedAt = Number(performance.now());
 }
 
 /**
@@ -196,13 +245,15 @@ function instrumentOne(
  * 无副作用的活体探针：包完一族后用"必回错串"的调用摸一次通道——返回了（哪怕是错误 JSON）
  * 说明 receiver 绑定正确、桥没被包死；**抛出异常**说明这个壳会把全家点掉，立刻回退成原对象。
  * 只有能安全探针的族参与：fs/tree/githttp 拿非法请求打 call（原生回错误字符串，不落盘不开网），
- * device 拿 deviceInfo（纯读）。sqlite/exec/browser 没有无副作用入口，靠 bind-orig 修复本身。
+ * device 拿 deviceInfo（纯读），model 拿一个不存在的任务 id 打 poll（原生回错误字符串，
+ * 不建任务不开网）。sqlite/exec/browser 没有无副作用入口，靠 bind-orig 修复本身。
  */
 const PROBE: Record<string, { method: string; arg: unknown }> = {
   fs: { method: "call", arg: '{"op":"__probe__"}' },
   tree: { method: "call", arg: '{"op":"__probe__"}' },
   githttp: { method: "call", arg: '{"op":"__probe__"}' },
   device: { method: "deviceInfo", arg: undefined },
+  model: { method: "poll", arg: "__probe__" },
 };
 
 /**
@@ -300,8 +351,9 @@ export function installJankWitness(): void {
   if (shellOn) instrumentBridges();
   let last = Number(performance.now());
   let ticks = 0;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
   // setInterval 而非 rAF：主线程堵死时 rAF 根本不排帧，量不出 gap；setTimeout 的迟到本身就是证据。
-  globalThis.setInterval(() => {
+  const sample = () => {
     const now = Number(performance.now());
     const gap = now - last;
     last = now;
@@ -328,5 +380,23 @@ export function installJankWitness(): void {
     d.slowCalls = slowRing;
     write(d);
     callsSinceFlush = 0;
-  }, HEARTBEAT_MS);
+  };
+  const startHeartbeat = () => {
+    if (heartbeat !== null) return;
+    // 切回前台时从当前时刻起算，后台被系统节流/冻结的时间不应被记成 UI 卡死。
+    last = Number(performance.now());
+    ticks = 0;
+    heartbeat = globalThis.setInterval(sample, HEARTBEAT_MS);
+  };
+  const stopHeartbeat = () => {
+    if (heartbeat === null) return;
+    globalThis.clearInterval(heartbeat);
+    heartbeat = null;
+  };
+  const visibilityChanged = () => {
+    if (globalThis.document?.visibilityState === "hidden") stopHeartbeat();
+    else startHeartbeat();
+  };
+  globalThis.document.addEventListener?.("visibilitychange", visibilityChanged);
+  visibilityChanged();
 }

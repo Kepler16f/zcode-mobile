@@ -28,6 +28,7 @@ import { Input } from "@/components/ui/input.js";
 import { Button } from "@/components/ui/button.js";
 import { SettingsBadge, SettingsGroupCard, SettingsRow } from "@/settings/SettingsPageParts.js";
 import { DataBaseDirControl } from "@/settings/DataBaseDirControl.js";
+import { MobileCompatibilitySettings } from "@/settings/MobileCompatibilitySettings.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { useOptionalServices } from "@/hooks/useServices.js";
 import { ProactiveSuggestionsSetting } from "@/settings/ProactiveSuggestionsSetting.js";
@@ -278,6 +279,7 @@ export function GeneralSectionContent({
 
   return (
     <div className="space-y-4">
+      <MobileCompatibilitySettings />
       <SettingsGroupCard>
         <SettingsRow
           label={intl.formatMessage({ id: "settings.locale" })}

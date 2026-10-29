@@ -23,8 +23,7 @@
 //   - MCP / 子代理 / goal / 工作流：命令一律 ack rejected + 原因码，
 //     对应入口在 availability 里就是关的，不会出现"按钮能点、点了没反应"。
 //   - 上下文压缩（0.7.4 起已接）：compact 命令 + "/compact" 输入前缀 + 轮首自动压缩；
-//     长上下文由摘要接管，HISTORY_MESSAGES_MAX 退为压缩失败时的兜底截断（如实注入
-//     "早期历史已省略 N 条"标记，不再无声掐断）。见 COMPACT 段。
+//     长上下文按模型窗口摘要压缩；摘要失败且完整历史超窗时明确拒绝请求，时间线始终完整。
 //   - 会话持久化：会话只活在这个进程里。重启后 UI 拿旧 sessionId 来回看，这里如实回
 //     "这台设备上看不到之前那次对话的内容"，绝不拿空时间线冒充历史。
 //   - 排队（0.7.1 起已接）：一轮进行中入队（inputRouting=enqueue），队列项可删/改/重排/
@@ -48,6 +47,7 @@ import {
   workspaceConfigTopic,
   workspaceConfigTopicFrameSchema,
   type CommandAck,
+  type AttachmentRef,
   type CommandEnvelope,
   type CommandResult,
   type CommandStateSummary,
@@ -82,7 +82,7 @@ import type {
   ZCodeWorkspacePresentation,
 } from "@zcode/shared";
 import { ZCODE_PROTOCOL_NAME, ZCODE_PROTOCOL_VERSION } from "@zcode/shared";
-import type { ZCodeAgentRuntimeLifecycleEvent } from "@zcode/services";
+import type { ZCodeAgentRuntimeLifecycleEvent, ISkillsService, ISubagentsService } from "@zcode/services";
 
 import {
   ProviderTargetError,
@@ -98,13 +98,26 @@ import {
   type ModelStreamResult,
   type ModelTurnMessage,
   type ModelTarget,
+  type ModelToolCall,
 } from "./model-stream.js";
-import type { ToolEngine, ToolEngineFactory } from "./tool-engine.js";
+import type { ToolEngine, ToolEngineFactory, ToolRunResult } from "./tool-engine.js";
 import { capToolContent } from "./tool-engine.js";
+import { AGENT_TOOL, SKILL_TOOL, discoverMobileCapabilities, executeMobileSkill, runMobileSubagent, type ExecuteSubagentTool } from "./skills-subagents.js";
+import * as vfs from "../compat/vfs.mjs";
 import { parseDsmlCalls } from "./dsml.js";
 import { markJankPhase } from "./jank-witness.js";
-import type { MobileSessionStore, PersistedTurnUsage } from "./session-store.js";
+import type { MobileSessionStore, PersistedSession, PersistedTurnUsage } from "./session-store.js";
+import { localWorkspacePath } from "../compat/workspace-aliases.mjs";
 import { createMobilePluginFace } from "./plugins-mobile.js";
+import { createMobileAttachments } from "./attachments.js";
+import {
+  COMPACT_SUMMARY_SYSTEM_PROMPT,
+  COMPACT_SUMMARY_USER_INSTRUCTION,
+  compactSummaryPrefix,
+  isCompactTooLargeError,
+  MAX_COMPACT_PASSES,
+  planCompactPass,
+} from "./compact.js";
 import {
   createMobileHookRuntime,
   grantWorkspaceHookTrust,
@@ -115,27 +128,14 @@ import {
 /** 与上游 continuous profile 同一个值（core.ts:38）：30 ms 内的增量并成一帧。 */
 const FLUSH_WINDOW_MS = 30;
 const SNAPSHOT_WINDOW_ROWS = PROTOCOL_V4_LIMITS.snapshotTailWindowRows;
+/** 自动压缩阈值由模型窗口扣除输出、提示词和安全余量得到，不使用消息条数上限。 */
 /**
- * 历史消息条数的兜底上限（0.7.4 降级）：上下文压缩（compact）已接管长会话，正常路径下
- * 送给模型的历史 = 摘要 + 压缩点之后的全部对话行，不受这一格约束。只有**压缩失败/被中断**
- * 时它才生效——截到最近 N 条，并在最前面注入一条"早期历史已省略 N 条"的如实标记，
- * 不再像 P0 那样无声掐断。
+ * 自动压缩连续失败多少次就停掉自动压缩（0.8.4）。
+ * 桌面端 compact/policy.ts 有同一条闸（MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3）：
+ * 摘要请求要么成功要么失败得很稳定，连着重试只是每轮多烧一次全文请求，
+ * 还会把真正的失败原因刷屏。停下来把选择权交回用户（手动 /compact 或缩短历史）。
  */
-const HISTORY_MESSAGES_MAX = 40;
-/**
- * 自动压缩的触发线（0.7.4，COMPACT 段）：估算占用 ≥ COMPACT_TRIGGER_TOKENS 就压。
- * 估算口径 = 网关上一轮报回的 input_tokens + 本轮新增文本的字符启发（≈ chars/2.5 个 token，
- * 中英混排取保守值）；usage 从没报过（新会话/网关不回用量）时纯按字符启发。
- * 60k 的依据：端侧出货模型上下文多为 128k~200k，触发点留足一轮长回答 + 工具往返的余量，
- * 又不至于撞 provider 的窗口报错（那会让整轮直接失败，比压缩贵得多）。
- */
-const COMPACT_TRIGGER_TOKENS = 60_000;
-/** 压缩时保留的最近对话行数（尾部原文）：摘要覆盖前部，这几行逐字保留，模型看得到最新的来回。 */
-const COMPACT_KEEP_RECENT_ROWS = 14;
-/** 送给模型的单条历史正文与压缩输入的封顶字符数：防 transcript 里某条超长正文把压缩请求本身撑爆。 */
-const COMPACT_MAX_MESSAGE_CHARS = 8_000;
-/** 压缩产出的摘要封顶字符数（进 transcript 与持久化，太长等于没压）。 */
-const COMPACT_SUMMARY_MAX_CHARS = 4_000;
+const MAX_CONSECUTIVE_COMPACT_FAILURES = 3;
 /** P0 的单轮输出上限。真实值应由模型能力配置给出，这里先给一个不会把回答截断得太狠的数。 */
 /** 单轮输出预算的默认上限。0.5.1：4096 → 16384——P0 的临时值把长回答拦腰截在
  *  finish_reason=length 上（用户看到的"说到一半就断了"），且思考档位开启后推理 token
@@ -174,8 +174,8 @@ const MOBILE_AGENT_NAME = "zcode";
 // ── 执行模式（0.7.2，用户点名"访问调节（完全访问/自主模式/变更前确认）功能无效"）──
 // 值域 = 协议的 submissionModeSchema（build/edit/plan/yolo），"计划"在前端是独立勾选项
 // （planEnabled），resolveExecutionState 把两者合成一个执行态。端侧按自己的真实能力落语义：
-//   build（变更前确认）：跑命令（Bash）与删文件（Delete）都先问；
-//   edit（自动编辑）：文件改动自动（删除也不再问），跑命令仍问——命令是另一档风险；
+//   build（变更前确认）：写文件（Write/Edit/Delete）与跑命令（Bash）都先问；
+//   edit（自动编辑）：文件改动自动，跑命令仍问——命令是另一档风险；
 //   yolo（完全访问）：一律不问（含越界路径授权，按"始终允许"放行）；
 //   plan（计划模式）：改文件（Write/Edit/Delete）一律不执行，让模型先出计划；
 //     命令（Bash）仍走审批闸——计划模式要能查（ls/git status），但不能静默改状态。
@@ -184,11 +184,47 @@ type MobileExecutionMode = "build" | "edit" | "plan" | "yolo";
 /** 计划模式下不执行的工具：**改文件**那几个。Bash 只读探查照走审批闸，不在拦截集里。 */
 const PLAN_MODE_BLOCKED_TOOLS = new Set(["Write", "Edit", "Delete"]);
 
+/** 计划模式以最终执行参数为准：Fetch 和 Git 是读写混合工具，不能只按工具名放行。 */
+function isPlanModeBlocked(call: { name: string; arguments: string }): boolean {
+  if (PLAN_MODE_BLOCKED_TOOLS.has(call.name)) return true;
+  // MCP 工具的副作用由外部服务器定义，计划模式不能假定其只读。
+  if (call.name.startsWith("mcp__")) return true;
+  if (call.name !== "Fetch" && call.name !== "Git") return false;
+  let input: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(call.arguments);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return true;
+    input = parsed as Record<string, unknown>;
+  } catch {
+    return true;
+  }
+  if (call.name === "Fetch") return input.action !== "fetch";
+  if (input.action === "status" || input.action === "log") return false;
+  if (input.action === "branch") return typeof input.ref === "string" && input.ref.trim().length > 0;
+  if (input.action === "remote") return typeof input.url === "string" && input.url.trim().length > 0;
+  return true;
+}
+
 function normalizeExecutionMode(raw: unknown): MobileExecutionMode {
   return raw === "yolo" || raw === "edit" || raw === "plan" ? raw : "build";
 }
 
+/** 端上模式语义：变更前确认拦写文件/删除/命令，自动编辑放行文件变更但仍审批命令。 */
+function mobileNeedsToolApproval(
+  mode: MobileExecutionMode,
+  toolName: string,
+  engineRequiresApproval: boolean,
+): boolean {
+  if (mode === "plan" && toolName === "Bash") return true;
+  if (mode === "yolo") return false;
+  const mutatesFiles = toolName === "Write" || toolName === "Edit" || toolName === "Delete";
+  if (mode === "edit" && mutatesFiles) return false;
+  return engineRequiresApproval || mutatesFiles;
+}
+
 export interface MobileAgentServiceOptions {
+  capabilities?: { skillsService: ISkillsService; subagentsService: ISubagentsService };
+  memoryContext?: (workspacePath: string) => Promise<{root:string;content:string}|null>;
   /** 模型落点的来源。没有 ProviderRuntime（组合根那步构造失败）时整个面按"取不到模型"报出去。 */
   modelTargets?: ModelTargetResolver;
   /** 写进 anthropic 的 `metadata.user_id`，与桌面的设备标识同源。 */
@@ -225,14 +261,19 @@ export interface MobileAgentServiceOptions {
   compactEnabled?: boolean;
   /**
    * 自动压缩触发阈值（token 估算）。自检注入一个极小值即可确定性地逼出自动压缩，
-   * 不必真攒够 60k 上下文。缺省用 COMPACT_TRIGGER_TOKENS。
+   * 不必真攒够 60k 上下文。缺省按当前模型窗口计算。
    */
   compactTriggerTokens?: number;
   /**
-   * 压缩时逐字保留的最近对话行数。自检注入小值（如 1）即可在两三句里逼出压缩边界；
-   * 缺省用 COMPACT_KEEP_RECENT_ROWS。
+   * 仅供确定性测试注入的逐字保留行数；正常运行按模型 contextWindow 和完整轮次预算选择。
    */
   compactKeepRecentRows?: number;
+  /**
+   * 仅供确定性测试注入的"单段摘要请求能装多少早期历史"（token 估算）。
+   * 缺省按模型 contextWindow 算（窗口 - 输出预算 - 指令余量）。注入一个小值即可确定性地
+   * 逼出"分段摘要"这条路径（早期段装不下 → 分几段摘要，前一段的摘要带进后一段）。
+   */
+  compactPassInputTokens?: number;
 }
 
 interface MobileSession {
@@ -270,10 +311,15 @@ interface MobileSession {
   contextSummary?: string;
   /** 摘要覆盖到的最后一行的 rowId（含）。压缩点之后的行逐字进历史。 */
   contextSummaryCoveredThroughRowId?: number;
-  /** 压缩点之后被省略、由兜底截断丢弃的行数（压缩失败时才出现）：标记段按它写"早期历史已省略 N 条"。 */
-  omittedEarlyRows?: number;
   /** 最近一次网关报回的 input_tokens（自动压缩触发估算的基线）。 */
   lastPromptTokens?: number;
+  contextUsedTokens?: number;
+  /** 自动压缩连续失败次数（桌面端 compact/policy.ts 的 MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES 同口径）：
+   *  连着失败这么多次，再自动压一次还是同样的失败——白白烧一次全文请求。 */
+  consecutiveCompactFailures?: number;
+  /** "自动压缩已暂停"这件事已经跟用户说过一次（只说一次，不刷屏）。 */
+  autoCompactPausedNotified?: boolean;
+  contextWindow?: number;
   /** 正在跑的 compact 轮句柄：stop/中断的收口走 settleCompact（不是对话轮的 settleTurn）。 */
   compactRun?: {
     turnId: string;
@@ -293,7 +339,7 @@ interface MobileQueueItem {
   clientId: string;
   kind: "sendText";
   text: string;
-  attachments: unknown[];
+  attachments: AttachmentRef[];
   delivery: {
     requested: "auto" | "startNow" | "queue" | "guide";
     admitted: "queue";
@@ -444,6 +490,7 @@ function firstUserText(rows: ConversationRow[]): string | null {
 export function createMobileAgentService(options: MobileAgentServiceOptions = {}) {
   const sessions = new Map<string, MobileSession>();
   const store = options.sessionStore ?? null;
+  const attachments = createMobileAttachments();
   const subscriptions = new Map<string, MobileSubscription>();
   /**
    * turnId -> 这一轮网关报回的用量。为什么要单独记一份：ConversationRow 的形状是协议定的
@@ -451,7 +498,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
    * 报 tokens —— 拿会话累计值填到每条消息上，就是把第一轮用量重复计了 N 遍。
    * 网关这一轮没报用量就记 0：0 的含义是"没报"，不是"没用"。
    */
-  const turnUsage = new Map<string, { inputTokens: number; outputTokens: number }>();
+  const turnUsage = new Map<string, PersistedTurnUsage>();
   // Bash 审批的挂起表：interactionId → resolve。runTurn 里 await 它，UI 的 resolveInteraction
   // 命令到达时兑现。先到先得（协议里写明）：第二次 resolve 找不到表项，如实回 noop。
   const pendingInteractionResolvers = new Map<string, (optionId: string | undefined) => void>();
@@ -460,6 +507,14 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   let boundClientId: string | null = null;
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   const pendingDeltas = new Map<string, ConversationDelta[]>();
+  const checkpointTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // 切后台时 timer 可能被冻结；尽力先保存当前内存事实，再交给系统回收。
+  const checkpointOnBackground = () => {
+    if (typeof document === "undefined" || document.visibilityState !== "hidden") return;
+    for (const session of sessions.values()) if (session.run || session.compactRun ||
+      (session.sessionId.startsWith("mobile-subagent-") && session.control.phase === "running")) persistSession(session);
+  };
+  if (typeof document !== "undefined") document.addEventListener("visibilitychange", checkpointOnBackground);
 
   const frameEmitter = new Emitter<ConversationTopicWireCandidate>();
   const restartEmitter = new Emitter<{ workspaceKey: string }>();
@@ -624,6 +679,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   function summaryOf(session: MobileSession, workspaceId: string): SessionSummary {
     const rows = session.rows;
+    const pending = session.pendingInteractions.find(item => item.kind === "permission" || item.kind === "userInput");
     const firstText = firstUserText(rows) ?? "";
     let lastAssistantText = "";
     let lastActivityAt = 0;
@@ -645,6 +701,15 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       sessionEnded: session.control.sessionEnded,
       // 端侧没有后台任务（backgroundWorks 恒空），所以这一格是真的 false，不是"先报没有"。
       hasBackgroundWork: false,
+      // 侧栏与对话弹窗共享同一份挂起交互；只投影种类/数量，不泄露命令和问题内容。
+      ...(pending ? { pendingInteraction: {
+        interactionId: pending.interactionId,
+        kind: pending.kind === "userInput" ? "userInput" as const : "permission" as const,
+      } } : {}),
+      pendingInteractionSummary: {
+        permissionCount: session.pendingInteractions.filter(item => item.kind === "permission").length,
+        userInputCount: session.pendingInteractions.filter(item => item.kind === "userInput").length,
+      },
       lastActivityAt: lastActivityAt || now(),
       ...(lastAssistantText ? { lastAssistantPreview: lastAssistantText.slice(0, 120) } : {}),
       createdAt: rows[0]?.createdAt ?? now(),
@@ -659,7 +724,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
    *     逐 token 广播会让侧栏在每一轮流式输出里重拉一次。
    */
   function publishSessionIndex(session: MobileSession): void {
-    if (session.missing || session.rows.length === 0) return;
+    // 子会话只能从父任务入口浏览，不能进入普通任务索引并触发全局列表回源。
+    if (session.missing || session.rows.length === 0 || session.sessionId.startsWith("mobile-subagent-")) return;
     const state = stateForSessionPath(session.workspacePath);
     const summary = summaryOf(session, state.workspaceKey);
     const previous = state.summaries.get(session.sessionId);
@@ -841,6 +907,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     const list = pendingDeltas.get(session.sessionId) ?? [];
     list.push(delta);
     pendingDeltas.set(session.sessionId, list);
+    scheduleCheckpoint(session);
     if (flushTimer) return;
     flushTimer = setTimeout(() => {
       flushTimer = null;
@@ -866,6 +933,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   function appendRow(session: MobileSession, row: ConversationRow): void {
     session.rows.push(row);
+    scheduleCheckpoint(session);
     flushPending(session);
     emitFrame(session, { kind: "deltas", deltas: [{ op: "row.appended", row }] }, "online");
   }
@@ -880,6 +948,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     const isNew = index < 0;
     if (isNew) session.rows.push(row);
     else session.rows[index] = row;
+    scheduleCheckpoint(session);
     flushPending(session);
     emitFrame(
       session,
@@ -937,6 +1006,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       },
       "online",
     );
+    if (patch.pendingInteractions || patch.control) publishSessionIndex(session);
   }
 
   function emptyConfig(): SessionConfigState {
@@ -991,6 +1061,18 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     });
     persistSession(session);
     say(`执行模式：${nextMode}${nextPlan === true ? "（计划）" : ""}`);
+    // 切换到无需审批的模式时兑现已经挂起的权限请求，保留问答和 Hook 审核交互。
+    const effectiveMode = executionModeOf(session);
+    for (const pending of session.pendingInteractions) {
+      if (pending.payload.kind !== "permission") continue;
+      const payload = pending.payload as { toolName?: string; detail?: unknown };
+      const pathRequest = !!payload.detail && typeof payload.detail === "object" && "scope" in payload.detail;
+      if (effectiveMode === "yolo" || (effectiveMode === "edit" && !pathRequest &&
+          ["Write", "Edit", "Delete"].includes(payload.toolName ?? ""))) {
+        // 模式放行不应写入“始终允许”记忆，否则切回确认模式仍会沿用自动授予的永久许可。
+        pendingInteractionResolvers.get(pending.interactionId)?.("allow_once");
+      }
+    }
   }
 
   /** 思考档位清单（0.5.1）：从 view 的 model.config.optionSpecs.reasoningLevel.values 读，
@@ -1098,11 +1180,14 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   }
 
   /**
-   * 把这条会话的当前事实写进 SQLite。写频是每轮一次（startTurn / settleTurn / 改配置），
-   * 不是逐 token：两个后端的写都是同步通道，逐 token 写会先把流式渲染卡死。
+   * 把这条会话的当前事实写进 SQLite。正文按秒合并，工具执行前后和收轮立即保存；
+   * 原生桥是同步通道，因此不能逐 token 写入。
    * 失败只报诊断、不抛——落盘失败不该打死正在进行的对话。
    */
   function persistSession(session: MobileSession): void {
+    const timer = checkpointTimers.get(session.sessionId);
+    if (timer) clearTimeout(timer);
+    checkpointTimers.delete(session.sessionId);
     if (!store || session.missing) return;
     try {
       const summary = summaryOf(session, stateForSessionPath(session.workspacePath).workspaceKey);
@@ -1116,6 +1201,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           revision: session.revision,
           cumulative: { ...session.cumulative },
           nextRowId: session.nextRowId,
+          ...(session.contextWindow ? { contextWindow: session.contextWindow } : {}),
+          ...(session.lastPromptTokens !== undefined ? { lastPromptTokens: session.lastPromptTokens } : {}),
+          ...(session.contextUsedTokens !== undefined ? { contextUsedTokens: session.contextUsedTokens } : {}),
           turnUsage: turnUsageOf(session),
           // 压缩状态随行一起落盘（0.7.4）：缺了它重启后"已压缩"的会话历史与摘要对不上。
           ...(session.contextSummary ? { contextSummary: session.contextSummary } : {}),
@@ -1129,6 +1217,46 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     } catch (e) {
       say(`会话 ${session.sessionId} 落盘失败（重启后将看不到这一轮）：${String((e as Error)?.message ?? e)}`);
     }
+  }
+
+  /**
+   * 收轮时补一次用量投影（只写投影表）。
+   * 投影不再是每次检查点的双写副产物——那会把每 5 秒的落盘变成写放大器，
+   * 父轮带 N 个子代理时就是 N+1 条定时器，滑动中撞上就是一次可见的卡顿。
+   */
+  function persistUsageProjection(session: MobileSession): void {
+    if (!store?.saveUsageProjection) return;
+    try {
+      store.saveUsageProjection({
+        sessionId: session.sessionId,
+        workspacePath: session.workspacePath,
+        summary: summaryOf(session, stateForSessionPath(session.workspacePath).workspaceKey),
+        state: {
+          rows: session.rows,
+          config: session.config,
+          revision: session.revision,
+          cumulative: { ...session.cumulative },
+          nextRowId: session.nextRowId,
+          turnUsage: turnUsageOf(session),
+          phase: session.control.phase,
+          lastError: session.control.lastError,
+        },
+      });
+    } catch (e) {
+      say(`会话 ${session.sessionId} 用量投影写入失败：${String((e as Error)?.message ?? e)}`);
+    }
+  }
+
+  /** 流式内容最多每五秒落盘一次；先定时再忽略增量，避免连续输出时一直推迟保存。 */
+  function scheduleCheckpoint(session: MobileSession): void {
+    // 子会话由父轮驱动，没有自己的run句柄，但流中内容同样必须形成重启检查点。
+    const running = session.run || session.compactRun ||
+      (session.sessionId.startsWith("mobile-subagent-") && session.control.phase === "running");
+    if (!store || !running || checkpointTimers.has(session.sessionId)) return;
+    checkpointTimers.set(session.sessionId, setTimeout(() => {
+      checkpointTimers.delete(session.sessionId);
+      if (sessions.get(session.sessionId) === session) persistSession(session);
+    }, 5000));
   }
 
   /**
@@ -1150,9 +1278,16 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       if (row.kind === "assistantText" && row.state === "streaming") {
         return { ...row, state: "interrupted" as const };
       }
+      // 子代理与父轮同在本进程执行；进程结束后旧的运行标记也必须收口。
+      if (row.kind === "subagent" && row.status === "running") {
+        return { ...row, status: "cancelled" as const, endedAt: ended };
+      }
       // 思考行同理（0.7.3）：重启前开着流式思考，还原后不能停在 streaming（光标永远闪）。
       if (row.kind === "reasoning" && row.state === "streaming") {
         return { ...row, state: "interrupted" as const };
+      }
+      if (row.kind === "toolCall" && (row.status === "running" || row.status === "pendingApproval" || row.status === "inputStreaming")) {
+        return { ...row, status: "error" as const, error: { code: "mobile.toolResultUnknown", message: "执行被中断，工具可能已产生副作用；请先检查工作区，不要直接重复执行。" } };
       }
       return row;
     });
@@ -1173,7 +1308,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
    */
   function restoreSession(sessionId: string, workspacePath: string): MobileSession | null {
     if (!store) return null;
-    let persisted;
+    let persisted: PersistedSession | null;
     try {
       persisted = store.load(sessionId);
     } catch (e) {
@@ -1181,16 +1316,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       return null;
     }
     if (!persisted) return null;
-    // 0.8.0（工作区指定"没生效"的可见化，来自工作区线交付）：还原会话的归属以**持久化路径**
-    // 为准——会话跟着建它的工作区走，重选文件夹不搬旧会话（协议语义如此）。但用户的感知是
-    // "选了目录，会话还在别处跑"，所以两条路径不一致时必须能在 agentLog 里看见，
-    // 而不是静默按旧路径继续。
-    if (workspacePath && persisted.workspacePath && persisted.workspacePath !== workspacePath) {
-      say(
-        `会话 ${sessionId} 属于工作区 ${persisted.workspacePath}，但命令从 ${workspacePath} 发来：` +
-          `仍按原工作区执行（这是设计，不是丢句）；要在新目录干活请新建会话。`,
-      );
-    }
+    // 持久化会话属于创建时的工作区；不能将旧历史和新目录的工具执行拼在一起。
+    assertSessionWorkspace(sessionId, persisted.workspacePath, workspacePath);
     const diedMidTurn =
       persisted.state.phase === "running" || persisted.state.phase === "prewarming";
     const phase = diedMidTurn ? "completedInterrupted" : persisted.state.phase;
@@ -1213,6 +1340,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       seq: 0,
       rows: diedMidTurn ? settleDanglingRows(persisted.state.rows) : persisted.state.rows,
       nextRowId: persisted.state.nextRowId,
+      ...(persisted.state.contextWindow ? { contextWindow: persisted.state.contextWindow } : {}),
+      ...(persisted.state.lastPromptTokens !== undefined ? { lastPromptTokens: persisted.state.lastPromptTokens } : {}),
+      ...(persisted.state.contextUsedTokens !== undefined ? { contextUsedTokens: persisted.state.contextUsedTokens } : {}),
       control: settledControl(phase, lastError),
       config: persisted.state.config,
       cumulative: { ...persisted.state.cumulative },
@@ -1240,7 +1370,25 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   /** 内存 → 持久化 → 占位，三级兜底。所有"按 sessionId 找会话"的入口都走这一条。 */
   function sessionOrRestore(sessionId: string, workspacePath: string): MobileSession {
-    return sessions.get(sessionId) ?? restoreSession(sessionId, workspacePath) ?? missingSession(sessionId, workspacePath);
+    const session = sessions.get(sessionId) ?? restoreSession(sessionId, workspacePath) ?? missingSession(sessionId, workspacePath);
+    // 缓存命中同样检查归属，禁止旧会话的历史与新目录的工具根混在一起。
+    assertSessionWorkspace(sessionId, session.workspacePath, workspacePath);
+    return session;
+  }
+
+  function assertSessionWorkspace(sessionId: string, actual: string, requested: string): void {
+    // 无路径的查询协议按全局唯一 sessionId 查找；带路径的入口必须严格绑定原工作区。
+    const canonical = (value: string) => {
+      const parts: string[] = [];
+      for (const part of value.replace(/\\/g, "/").split("/")) {
+        if (!part || part === ".") continue;
+        if (part === "..") parts.pop(); else parts.push(part);
+      }
+      return ("/" + parts.join("/")).replace(/^\/(?:storage\/emulated\/0|storage\/self\/primary|ext)(?=\/|$)/, "/sdcard");
+    };
+    if (requested && actual && canonical(actual) !== canonical(requested)) {
+      throw new Error(`fault.session.workspaceMismatch: 会话 ${sessionId} 属于 ${actual}，不能从 ${requested} 访问`);
+    }
   }
 
   /**
@@ -1265,9 +1413,14 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     }
     if (entries.length === 0) return;
     for (const { sessionId, summary } of entries) {
+      if (sessionId.startsWith("mobile-subagent-")) continue;
       // workspaceId 要换成当前这把 key：库里存的是当时的值，而帧是按 workspaceKey 过滤的，
       // 对不上就会被静默丢掉（emitWorkspaceTopicFrame 的那道 topic 校验）。
-      state.summaries.set(sessionId, { ...summary, workspaceId: state.workspaceKey });
+      const wasRunning = summary.phase === "running" || summary.phase === "prewarming";
+      state.summaries.set(sessionId, { ...summary, workspaceId: state.workspaceKey,
+        ...(wasRunning ? { phase: "completedInterrupted", pendingInteraction: undefined,
+          pendingInteractionSummary: {permissionCount:0,userInputCount:0}, hasBackgroundWork:false } : {}),
+      });
     }
     say(`从持久化水合 ${entries.length} 条历史会话进 workspace=${state.workspaceKey} 的索引`);
   }
@@ -1282,64 +1435,123 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   // ── 一轮执行 ──
   /**
-   * 工具循环里**本轮私有**的模型历史：持久化的 session.rows 只有文本行（跨轮的 tool 消息
-   * 不重建 —— 下一轮的历史只需要对话文本，OpenAI 也不要求带着上一轮的工具往返）。
-   * 但**当前这一轮内**的 assistant(tool_calls) → tool(结果) 必须原样带回去，否则第二步起
-   * 模型看不到自己调了什么、拿到什么结果，循环直接死在"重复调用同一个工具"上。
-   * 所以循环用的是局部 transcript，不是 historyMessages(session)。
+   * 按持久化时间线重建用户、助手和工具往返；每组 assistant 调用必须先于它的全部结果。
+   * 本轮仍用局部 transcript 累加，因为它还包含刚产生、尚未收口的模型事件。
    *
-   * 0.7.4 上下文压缩接线：长对话由摘要接管（contextSummary 顶在最前，压缩点之后的行逐字
-   * 保留），HISTORY_MESSAGES_MAX 退为**压缩失败/未生效**时的兜底截断 —— 且截断不再无声：
-   * 顶部注入一条如实的"早期历史已省略 N 条"标记。
+   * 长对话由摘要接管（contextSummary 顶在最前，压缩点之后的行逐字保留）。此处始终
+   * 重建完整历史；请求预算超限时拒绝模型调用，不截短此处的历史，也不影响时间线展示。
    */
-  function historyMessages(session: MobileSession): ModelTurnMessage[] {
+  function historyMessages(session: MobileSession, includeAttachments = true, throughRowId = Number.POSITIVE_INFINITY): ModelTurnMessage[] {
     const out: ModelTurnMessage[] = [];
     if (session.contextSummary) {
       // 摘要进历史的方式：一条说明来源的 user 消息。模型据此知道更早的原文已被压缩，
       // 需要细节时应如实向用户承认，而不是编造。
-      out.push({
-        role: "user",
-        content:
-          "[上下文压缩摘要] 此前的对话已按下述摘要压缩（早期原文不再逐字提供）。" +
-          "把摘要当作既定事实的背景，不要向用户复述这条说明本身：\n" +
-          session.contextSummary,
-      });
+      out.push({ role: "user", content: compactSummaryPrefix(session.contextSummary) });
     }
     const coveredThrough = session.contextSummaryCoveredThroughRowId ?? 0;
-    for (const row of session.rows) {
-      if (row.rowId <= coveredThrough) continue;
-      if (row.kind === "userInput" && row.origin === "realUser") {
-        out.push({ role: "user", content: row.text });
-      } else if (row.kind === "assistantText" && row.text) {
-        out.push({ role: "assistant", content: row.text });
-      }
-    }
-    // 兜底截断只在"没有摘要且超限"时生效：有摘要 = 压缩在管长上下文，不再掐（症状③）。
-    if (!session.contextSummary && out.length > HISTORY_MESSAGES_MAX) {
-      const dropped = out.length - HISTORY_MESSAGES_MAX;
-      session.omittedEarlyRows = dropped;
-      return [
-        {
-          role: "user",
-          content:
-            `[早期历史已省略 ${dropped} 条] 上下文压缩未能生效，为守住窗口只保留了最近 ${HISTORY_MESSAGES_MAX} 条对话。` +
-            "如果用户问起更早的内容，如实说明这段历史已被省略。",
-        },
-        ...out.slice(-HISTORY_MESSAGES_MAX),
-      ];
-    }
-    session.omittedEarlyRows = undefined;
+    const body = session.rows.filter((row) => row.rowId <= throughRowId && row.rowId > coveredThrough);
+    out.push(...rowsToModelMessages(body, session.sessionId, includeAttachments, "full"));
     return out;
   }
 
+  /**
+   * 行 → 模型消息（0.8.4 抽出）：上下文装配与"分段摘要"共用这一份转换。
+   * 分段摘要要把早期若干**完整轮次**单独转成消息，不能靠 throughRowId 截整段历史。
+   * attachmentMode="placeholder"：不解析附件、不带 base64，只留文件名占位——
+   * 摘要请求因附件体积装不下时的重试路径用它（对齐桌面 compact 的媒体占位投影）。
+   */
+  function rowsToModelMessages(
+    rows: ConversationRow[],
+    sessionId: string,
+    includeAttachments: boolean,
+    attachmentMode: "full" | "placeholder",
+  ): ModelTurnMessage[] {
+    const out: ModelTurnMessage[] = [];
+    for (let index = 0; index < rows.length; index++) {
+      const row = rows[index]!;
+      if (row.kind === "userInput" && row.origin === "realUser") {
+        const refs = row.attachments ?? [];
+        if (includeAttachments && refs.length && attachmentMode === "full") {
+          out.push({
+            role: "user",
+            content: row.text,
+            attachments: refs.map((ref) => attachments.resolve(sessionId, ref)),
+          });
+        } else if (refs.length && attachmentMode === "placeholder") {
+          out.push({
+            role: "user",
+            content: `${row.text}\n[附件：${refs.map((ref) => ref.fileName).join("、")}（本次摘要未附带原文件内容）]`,
+          });
+        } else {
+          out.push({
+            role: "user",
+            content: row.text,
+          });
+        }
+      } else if (row.kind === "assistantText" && row.text) {
+        out.push({ role: "assistant", content: row.text });
+      } else if (row.kind === "toolCall") {
+        // 同一次模型回复可能并行发出多个调用：先重建完整 assistant 调用，再逐条回结果。
+        const calls: ToolCallRow[] = [row];
+        while (index + 1 < rows.length) {
+          const next = rows[index + 1]!;
+          if (next.kind !== "toolCall" || next.turnId !== row.turnId) break;
+          calls.push(next);
+          index++;
+        }
+        out.push({
+          role: "assistant",
+          content: "",
+          toolCalls: calls.map((call) => ({ id: call.toolCallId, name: call.toolName, arguments: call.inputText })),
+        });
+        for (const call of calls) {
+          const content = call.output?.text ?? call.error?.message ??
+            (call.status === "cancelled" ? "工具调用已取消。" : "工具结果未知，执行可能已产生副作用。");
+          out.push({ role: "tool", toolCallId: call.toolCallId, content: capToolContent(content) });
+        }
+      }
+    }
+    return out;
+  }
 
-  /** 当前要送给模型的历史（不含 system 提示词）的粗估 token 占用：网关用量优先，字符启发兜底。 */
+  /** 非 tokenizer 的保守启发：ASCII 约 3.5 字符/token，CJK 至少 1.5，符号/emoji 更高。 */
+  function estimateTextTokens(text: string): number {
+    let tokens = 0;
+    for (const char of text) {
+      const cp = char.codePointAt(0) ?? 0;
+      if (cp <= 0x7f) tokens += 1 / 3.5;
+      else if ((cp >= 0x2e80 && cp <= 0x9fff) || (cp >= 0xf900 && cp <= 0xfaff) ||
+               (cp >= 0x3040 && cp <= 0x30ff) || (cp >= 0xac00 && cp <= 0xd7af) || cp >= 0x20000) tokens += 1.5;
+      else if (cp >= 0x1f000) tokens += 2.5;
+      else tokens += 1;
+    }
+    return Math.ceil(tokens);
+  }
+
+  function estimateMessageTokens(message: ModelTurnMessage): number {
+    let tokens = estimateTextTokens(message.content);
+    for (const call of message.toolCalls ?? []) tokens += estimateTextTokens(call.name) + estimateTextTokens(call.arguments);
+    // 图片/PDF tokenization 取决于 provider；对 base64 的估算仅为启发值，视觉 token 可能不同。
+    for (const attachment of message.attachments ?? []) tokens += estimateTextTokens(attachment.dataBase64) + estimateTextTokens(attachment.fileName);
+    return tokens + 8;
+  }
+
+  /** 不截短历史：先自动摘要；完整上下文仍超窗口时明确拒绝，避免执行缺失上下文的请求。 */
+  function assertHistoryFitsBudget(messages: ModelTurnMessage[], budget: number): void {
+    const estimated = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+    if (estimated > budget) {
+      throw new Error(`完整历史估算 ${estimated} token，超过可用上下文预算 ${budget} token。未省略或截短历史；请运行 /compact，或缩短当前输入/工具结果后重试。`);
+    }
+  }
+
+  /** 当前历史（不含 system 提示词）的粗估 token 占用。 */
   function estimateHistoryTokens(session: MobileSession): number {
-    let chars = 0;
-    for (const m of historyMessages(session)) chars += m.content.length;
-    const byChars = Math.ceil(chars / 2.5);
-    // 网关上一轮报回的 input_tokens 是**当时**窗口的真实水位；此后每轮对话只增不减
-    // （除了刚压过），两者取大是保守且不骗人的估计。
+    const byChars = historyMessages(session, false).reduce((sum, message) => sum + estimateMessageTokens(message), 0) +
+      session.rows.reduce((sum, row) => sum + (row.kind === "userInput" && row.rowId > (session.contextSummaryCoveredThroughRowId ?? 0)
+        ? (row.attachments ?? []).reduce((n, ref) => n + Math.ceil(ref.bytes / 1.8), 0)
+        : 0), 0);
+    // 完整 transcript 估算已包含新增用户输入与工具回包；provider usage 作为水位下界。
+    // 不累加旧 prompt，避免把已经包含在完整 transcript 中的历史重复计算。
     return Math.max(session.lastPromptTokens ?? 0, byChars);
   }
 
@@ -1383,13 +1595,13 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   /**
    * 上下文压缩（0.7.4）：把压缩点之前的早期对话交给**当前模型**压成摘要，替换 transcript
    * 的前部；时间线行**不删**（展示层全量回放），只让历史取用摘要。三条入口共用这一个函数：
-   *   - 自动：runTurn 装配 transcript 前，估算占用 ≥ COMPACT_TRIGGER_TOKENS；
+   *   - 自动：runTurn 装配 transcript 前，估算占用达到模型窗口的输入预算；
    *   - 命令：v4 `compact` 维护命令（UI 的 context usage 面板入口）；
    *   - 输入前缀：sendText 的 "/compact"（与桌面 slashCommands 的识别口径一致）。
    * 时间线上落一条 timelineMarker(compact) 行 —— 协议里这就是"已压缩上下文"的系统行
    * （ConversationRowView 按 marker.status 渲染 started/completed/failed/skipped）。
-   * 失败/中断：marker 如实收 failed/cancelled，transcript 不动，下一轮自然退回
-   * historyMessages 的兜底截断（带省略标记），绝不静默吞对话。
+   * 失败/中断：marker 如实收 failed/cancelled，摘要水位不动；完整历史超窗时拒绝模型请求，
+   * 完整原文仍留在时间线，可重试压缩。
    */
   async function runCompact(
     session: MobileSession,
@@ -1398,23 +1610,68 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       selection: ModelSelectionValue | null;
       sourceCommandId?: string;
       clientId?: string;
-      /** 逐字保留的最近对话行数（自检注入小值逼出压缩边界；缺省 COMPACT_KEEP_RECENT_ROWS）。 */
+      /** 测试专用：显式注入时按行数保留；正常运行按模型窗口预算保留完整轮次。 */
       keepRecentRows?: number;
+      parentSignal?: AbortSignal;
     },
   ): Promise<"success" | "failed" | "cancelled" | "noop"> {
     if (session.compactRun) return "noop"; // 单飞：同一会话同一时刻只跑一次压缩
     const targets = options.modelTargets;
     if (!targets) return "noop";
-    const keepRows =
-      params.keepRecentRows ?? options.compactKeepRecentRows ?? COMPACT_KEEP_RECENT_ROWS;
     const coveredThrough = session.contextSummaryCoveredThroughRowId ?? 0;
     // 可压的对话行 = 历史里会被逐字送进模型的那些（与 historyMessages 同判据）。
     const candidates = session.rows.filter(
       (row) =>
         row.rowId > coveredThrough &&
         ((row.kind === "userInput" && row.origin === "realUser") ||
-          (row.kind === "assistantText" && row.text)),
+          (row.kind === "assistantText" && row.text) || row.kind === "toolCall"),
     );
+    const injectedKeepRows = params.keepRecentRows ?? options.compactKeepRecentRows;
+    const contextWindow = session.contextWindow ?? 64_000;
+    const recentBudget = Math.max(1_024, Math.min(16_000, Math.floor(contextWindow * 0.2)));
+    // 按轮次归拢：摘要边界永远落在完整轮次之间（桌面端 compact-selection.ts 同口径）。
+    // 边界落在轮次中间会切出"助手调用工具留在保留区、工具回包进了摘要"这种半截轮次——
+    // 送模型时就是一条没有回包的 tool_calls，请求会被网关拒。
+    const byTurn = new Map<string, { turnId: string; firstRowId: number; cost: number; rows: ConversationRow[] }>();
+    for (const row of candidates) {
+      const current = byTurn.get(row.turnId) ?? { turnId: row.turnId, firstRowId: row.rowId, cost: 0, rows: [] };
+      current.firstRowId = Math.min(current.firstRowId, row.rowId);
+      current.rows.push(row);
+      if (row.kind === "userInput") current.cost += estimateMessageTokens({ role: "user", content: row.text }) +
+        (row.attachments ?? []).reduce((sum, ref) => sum + Math.ceil(ref.bytes / 1.8), 0);
+      else if (row.kind === "assistantText") current.cost += estimateMessageTokens({ role: "assistant", content: row.text });
+      else if (row.kind === "toolCall") current.cost += estimateMessageTokens({
+        role: "assistant", content: "", toolCalls: [{ id: row.toolCallId, name: row.toolName, arguments: row.inputText }],
+      }) + estimateMessageTokens({ role: "tool", content: row.output?.text ?? row.error?.message ?? "" });
+      byTurn.set(row.turnId, current);
+    }
+    const turns = [...byTurn.values()].sort((a, b) => a.firstRowId - b.firstRowId);
+    let keepFromRowId: number | undefined;
+    let firstKeptTurn = turns.length;
+    if (injectedKeepRows !== undefined) {
+      keepFromRowId = candidates[Math.max(0, candidates.length - Math.max(0, injectedKeepRows))]?.rowId;
+    } else {
+      let used = 0;
+      for (let i = turns.length - 1; i >= 0; i--) {
+        const turn = turns[i]!;
+        if (used > 0 && used + turn.cost > recentBudget) break;
+        firstKeptTurn = i;
+        used += turn.cost;
+        if (used >= recentBudget) break;
+      }
+      keepFromRowId = firstKeptTurn < turns.length ? turns[firstKeptTurn]!.firstRowId : undefined;
+    }
+    if (keepFromRowId !== undefined) {
+      // 注入行数时边界可能落在轮次中间：回退到该行所在轮次的第一行。
+      const anchorTurn = turns.find((turn) => turn.rows.some((row) => row.rowId === keepFromRowId));
+      if (anchorTurn) {
+        keepFromRowId = anchorTurn.firstRowId;
+        firstKeptTurn = turns.indexOf(anchorTurn);
+      }
+    }
+    // 要压掉的早期段 = 保留区之前的那些完整轮次（分段摘要按它切块）。
+    const summarizeTurns = turns.slice(0, firstKeptTurn);
+    const keepRows = candidates.filter((row) => keepFromRowId !== undefined && row.rowId >= keepFromRowId).length;
     const markerRowId = takeRowId(session);
     const markerTurnId = newId("compact");
     /** running 期间把命令投进 pendingCommands —— 协议上这是"权威侧已接管"的凭据，
@@ -1454,12 +1711,22 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         marker,
       } as ConversationRow);
     };
-    // 尾部行数不足（全是值得逐字保留的近话）：没有可压的前段就如实 noop，不制造空摘要。
+    // 没有完整的早期轮次可压时如实 noop，不制造空摘要。
     if (candidates.length <= keepRows + 1) {
       if (params.origin === "manual") {
         appendMarker({ type: "compact", origin: "manual", status: "noop" });
         publishPendingCommand(false);
         say("压缩请求被跳过：当前上下文还太短，没有可压缩的早期段落");
+      }
+      return "noop";
+    }
+    // 保留区吃掉了全部历史（没有早期段可压）：同样如实 noop——不能走到摘要请求里
+    // 再报"模型没有产出摘要"，那是把"没东西可压"说成"模型失灵"。
+    if (summarizeTurns.length === 0) {
+      if (params.origin === "manual") {
+        appendMarker({ type: "compact", origin: "manual", status: "noop" });
+        publishPendingCommand(false);
+        say("压缩请求被跳过：没有可压缩的早期段落");
       }
       return "noop";
     }
@@ -1470,6 +1737,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       return "failed";
     }
     const abort = new AbortController();
+    const abortFromParent = () => abort.abort();
+    params.parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+    if (params.parentSignal?.aborted) abort.abort();
     session.compactRun = { turnId: markerTurnId, markerRowId, abort, selection };
     publishPendingCommand(true);
     appendMarker({
@@ -1482,60 +1752,133 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     try {
       const target = await resolveModelTarget(targets, selection);
       if (options.deviceId) target.metadataUserId = options.deviceId;
-      // 压缩输入 = 将要送出的同一份历史（摘要 + 全部未压行），外加一条指令；
-      // 正文不进时间线（这条流的 onDelta 只收字），压缩产物本身替换历史前部。
-      // 单条正文封顶（COMPACT_MAX_MESSAGE_CHARS）：某条超长历史行不该把压缩请求自己撑爆。
-      const cappedInput: ModelTurnMessage[] = [
-        {
-          role: "system",
-          content:
-            "You are a context-compaction engine. Summarize the conversation so far so another " +
-            "AI assistant can continue the work with full fidelity. Preserve: the user's goals " +
-            "and constraints, decisions made, file paths/symbols/commands touched, important " +
-            "tool results, task progress (what is done vs. in flight), and anything promised. " +
-            "Write dense bullet notes. Never invent facts. Stay under 4000 characters.",
-        },
-        ...historyMessages(session).map((m) =>
-          m.content.length > COMPACT_MAX_MESSAGE_CHARS
-            ? { ...m, content: `${m.content.slice(0, COMPACT_MAX_MESSAGE_CHARS)}…（超长正文截尾）` }
-            : m,
-        ),
-        { role: "user", content: "Compress everything above into the summary notes now." },
-      ];
-      let summary = "";
-      const result = await streamModelCompletionWithRetry({
-        target,
-        messages: cappedInput,
-        // 摘要是"压缩产物"，不是对话回答：给小预算（默认档的四分之一），
-        // 防模型把压缩请求当续写任务写成长文。
-        maxOutputTokens: Math.min(MAX_OUTPUT_TOKENS, 4_096),
-        signal: abort.signal,
-        onDelta: (piece) => {
-          summary += piece;
-        },
-        onRetry: (attempt, waitMs, reason) =>
-          say(`压缩请求重连：第 ${attempt} 次尝试（上次 ${reason}，已等 ${Math.round(waitMs / 1000)} 秒）`),
-      });
-      // 注意：**不**把这次请求的 input_tokens 记成新基线 —— 它是压缩**前**的全文水位，
-      // 记下来会让下一轮的估算立刻再次越过阈值（连环自压）。压缩后的真实水位由
-      // 下一段字符启发 + 下一次对话轮的网关用量自然接管。
-      void result.usage;
-      summary = summary.trim();
-      if (abort.signal.aborted) throw Object.assign(new Error("aborted"), { aborted: true });
+      const compactWindow = target.contextWindow ?? 64_000;
+      const modelOutputCap = Math.min(20_000, target.maxOutputTokensCap ?? 20_000,
+        target.contextWindow ? Math.max(1, Math.floor(target.contextWindow / 4)) : 20_000);
+      const compactInstructionReserve = estimateTextTokens(COMPACT_SUMMARY_SYSTEM_PROMPT) +
+        estimateTextTokens(COMPACT_SUMMARY_USER_INSTRUCTION) + 512;
+      // 一段摘要请求能装多少早期历史：窗口 - 输出预算 - 指令余量。
+      const passInputBudget = Math.max(
+        256,
+        options.compactPassInputTokens ?? compactWindow - modelOutputCap - compactInstructionReserve,
+      );
+      // 早期段按整轮切成若干段，一段一段摘要：前一段的摘要带进后一段，最后一段的
+      // 摘要就是最终摘要。桌面端在摘要请求装不下时是把更早的轮次**丢掉**再重试
+      // （compact-selection.ts 的 selectCompactEntriesAfterPromptTooLong）——那等于悄悄
+      // 丢历史。端侧改成分段摘要：装不下就分几次，历史一条不丢。
+      const systemMessage: ModelTurnMessage = { role: "system", content: COMPACT_SUMMARY_SYSTEM_PROMPT };
+      const instructionMessage: ModelTurnMessage = { role: "user", content: COMPACT_SUMMARY_USER_INSTRUCTION };
+      /** 发一段摘要请求；装不下（上下文/附件过大）时改用附件占位再试一次。 */
+      const summarizePass = async (passRows: ConversationRow[], prefix: string | null, passIndex: number): Promise<string> => {
+        const prefixMessages: ModelTurnMessage[] = prefix
+          ? [{ role: "user" as const, content: compactSummaryPrefix(prefix) }]
+          : [];
+        const buildMessages = (attachmentMode: "full" | "placeholder"): ModelTurnMessage[] => [
+          systemMessage,
+          ...prefixMessages,
+          ...rowsToModelMessages(passRows, session.sessionId, true, attachmentMode),
+          instructionMessage,
+        ];
+        let messages = buildMessages("full");
+        let inputTokens = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+        if (inputTokens > passInputBudget) {
+          messages = buildMessages("placeholder");
+          inputTokens = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+          say(`压缩第 ${passIndex + 1} 段使用附件占位；正文仍完整提供`);
+        }
+        if (inputTokens > passInputBudget) {
+          throw new Error(`单个完整历史轮次连同摘要前缀仍超过摘要输入预算 ${passInputBudget} token；未截短正文，旧摘要和覆盖水位保持不变`);
+        }
+        const maxOutputTokens = Math.min(modelOutputCap, compactWindow - inputTokens - compactInstructionReserve);
+        if (maxOutputTokens < 64) {
+          throw new Error(`摘要输入估算 ${inputTokens + compactInstructionReserve} token，已耗尽窗口 ${compactWindow} token 的输出空间；摘要未生成，旧摘要与覆盖水位保持不变`);
+        }
+        const request = async (): Promise<string> => {
+          let text = "";
+          const result = await streamModelCompletionWithRetry({
+            target,
+            messages,
+            // 摘要是"压缩产物"，不是对话回答：给小预算（默认档的四分之一），
+            // 防模型把压缩请求当续写任务写成长文。
+            maxOutputTokens,
+            signal: abort.signal,
+            onDelta: (piece) => {
+              text += piece;
+            },
+            onRetry: (attempt, waitMs, reason) =>
+              say(`压缩请求重连：第 ${attempt} 次尝试（上次 ${reason}，已等 ${Math.round(waitMs / 1000)} 秒）`),
+          });
+          if (result.truncated || result.finishReason === "length" || result.finishReason === "max_tokens" ||
+              (result.usage?.outputTokens ?? 0) > maxOutputTokens || result.toolCalls?.length) {
+            throw new Error(`摘要响应不完整（finishReason=${result.finishReason ?? "未知"}，truncated=${Boolean(result.truncated)}，输出预算=${maxOutputTokens}）；未应用摘要，旧覆盖水位保持不变`);
+          }
+          // 注意：**不**把这次请求的 input_tokens 记成新基线 —— 它是压缩**前**的全文水位，
+          // 记下来会让下一轮的估算立刻再次越过阈值（连环自压）。压缩后的真实水位由
+          // 下一段字符启发 + 下一次对话轮的网关用量自然接管。
+          void result.usage;
+          const trimmed = text.trim();
+          if (!trimmed) throw new Error("摘要响应为空（模型没有产出摘要）");
+          return trimmed;
+        };
+        try {
+          return await request();
+        } catch (e) {
+          // 装不下（上下文超限 / 附件太大）：附件只留文件名再试一次（对齐桌面 compact
+          // 的媒体占位投影）。还是不行就把错误如实抛出去，不假装压过了。
+          if (!isCompactTooLargeError(e)) throw e;
+          say("压缩请求装不下（上下文或附件过大），改用附件占位重试");
+          messages = buildMessages("placeholder");
+          inputTokens = messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+          if (inputTokens > passInputBudget) throw new Error("完整摘要输入仍超限；未截短正文或推进覆盖水位");
+          return await request();
+        }
+      };
+      // 一段一段压：每一段按"当前前缀摘要的实际体积"算出还能装多少整轮。
+      // 前缀会变长，所以这段的预算不能一次算死。
+      let summary: string | null = null;
+      let remaining = summarizeTurns.slice();
+      let passCount = 0;
+      while (remaining.length > 0) {
+        if (passCount >= MAX_COMPACT_PASSES) {
+          throw new Error(`早期段超过 ${MAX_COMPACT_PASSES} 段摘要上限；未生成摘要，也未标记任何历史为已覆盖`);
+        }
+        const prefix = summary ?? session.contextSummary ?? null;
+        const prefixTokens = prefix
+          ? estimateMessageTokens({ role: "user", content: compactSummaryPrefix(prefix) })
+          : 0;
+        const rowBudget = Math.max(64, passInputBudget - compactInstructionReserve - prefixTokens);
+        const count = Math.max(1, planCompactPass(remaining.map((turn) => turn.cost), rowBudget));
+        const passRows = remaining.slice(0, count).flatMap((turn) => turn.rows);
+        remaining = remaining.slice(count);
+        passCount += 1;
+        summary = await summarizePass(passRows, prefix, passCount - 1);
+        if (abort.signal.aborted) throw Object.assign(new Error("aborted"), { aborted: true });
+      }
       if (!summary) {
         appendMarker({ type: "compact", origin: params.origin, status: "failed", tokensBefore });
         say("上下文压缩失败：模型没有产出摘要");
+        session.consecutiveCompactFailures = (session.consecutiveCompactFailures ?? 0) + 1;
         return "failed";
       }
-      if (summary.length > COMPACT_SUMMARY_MAX_CHARS) {
-        summary = `${summary.slice(0, COMPACT_SUMMARY_MAX_CHARS)}…（摘要超长，已截尾）`;
-      }
-      // 压缩边界 = 除最近 keepRows 条对话行之外的全部：这几行逐字保留，
-      // 模型看得见最新来回的原话；其余由摘要接管。
-      const keptFrom = candidates[candidates.length - keepRows];
+      // 压缩边界取保留区首条消息之前；默认保留最近完整轮次直到 token 预算，
+      // 测试可注入行数。覆盖水位与实际送进摘要的完整历史保持一致。
       session.contextSummary = summary;
-      session.contextSummaryCoveredThroughRowId = keptFrom ? keptFrom.rowId - 1 : coveredThrough;
-      session.omittedEarlyRows = undefined;
+      // 保留区为空（全部历史都被摘要覆盖）时，水位要落到"最后一段被压掉的行"，
+      // 不能停在旧水位——否则摘要顶在头上、原文却还在历史里，白压一场。
+      const lastSummarizedTurn = summarizeTurns[summarizeTurns.length - 1];
+      const summarizedThroughRowId = lastSummarizedTurn
+        ? lastSummarizedTurn.rows[lastSummarizedTurn.rows.length - 1]?.rowId ?? coveredThrough
+        : coveredThrough;
+      session.contextSummaryCoveredThroughRowId = keepFromRowId
+        ? keepFromRowId - 1
+        : summarizedThroughRowId;
+      // 压成功了：失败计数清零，"自动压缩已暂停"的告知也复位（下次又能自动压）。
+      session.consecutiveCompactFailures = 0;
+      session.autoCompactPausedNotified = false;
+      // 网关用量反映的是压缩前的 prompt。丢弃旧基线，让后续阈值按摘要后的历史估算，
+      // 避免每轮都因压缩前的大窗口水位重复触发 compact。
+      session.lastPromptTokens = undefined;
+      session.contextUsedTokens = estimateHistoryTokens(session);
       appendMarker({
         type: "compact",
         origin: params.origin,
@@ -1546,12 +1889,15 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       say(
         `上下文已压缩（${params.origin === "auto" ? "自动" : "手动"}）：摘要替换早期 ${
           candidates.length - keepRows
-        } 条对话行的历史占用（估算 ${tokensBefore} → ${estimateHistoryTokens(session)} token）`,
+        } 条对话行的历史占用（估算 ${tokensBefore} → ${estimateHistoryTokens(session)} token${
+          passCount > 1 ? `；早期段分成 ${passCount} 段摘要，历史一条没丢` : ""
+        }）`,
       );
       persistSession(session);
       return "success";
     } catch (e) {
       const cancelled = abort.signal.aborted || (e as Error)?.message === "aborted";
+      session.consecutiveCompactFailures = (session.consecutiveCompactFailures ?? 0) + 1;
       appendMarker({
         type: "compact",
         origin: params.origin,
@@ -1560,11 +1906,12 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       });
       say(
         `上下文压缩${cancelled ? "被中断" : "失败"}（${String((e as Error)?.message ?? e)}）：` +
-          "本轮退回兜底截断，历史不静默丢弃",
+          "没有应用摘要；若完整历史超过模型预算，本轮模型请求会明确失败，完整时间线仍保留",
       );
       persistSession(session);
       return cancelled ? "cancelled" : "failed";
     } finally {
+      params.parentSignal?.removeEventListener("abort", abortFromParent);
       if (session.compactRun?.turnId === markerTurnId) session.compactRun = undefined;
       // 任何终态都要撤回 pendingCommands（成功/失败/中断/空转都算）。manual 路径下
       // publishPendingCommand(false) 自带一帧 control（把 availability/inputRouting 扳回空闲）；
@@ -1583,6 +1930,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
    * engine 参数是本轮解析出的引擎（可能为 null：core 加载失败、或组合根没接）。
    */
   function systemPrompt(workspacePath: string, engine: ToolEngine | null, mode: MobileExecutionMode = "build"): string {
+    workspacePath = localWorkspacePath(workspacePath);
     const lines = [
       "You are ZCode running on a phone.",
       "Reply in the language the user writes in.",
@@ -1622,7 +1970,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     // Node harness 没有 zcodeDevice 桥 → 这一句不出现，systemPrompt 逐字不变（回归不受影响）。
     if (hasAllFilesAccess()) {
       lines.push(
-        "All-files access is granted: you can read and write the phone's real files directly via absolute paths. Shared storage is under /sdcard — the Downloads folder is /sdcard/Download, Documents is /sdcard/Documents. Prefer these real paths when the user names a folder rather than staying inside the private workspace.",
+        "Android all-files access is available. Real shared storage is under /sdcard (Downloads: /sdcard/Download). File tools remain limited to this session's selected workspace and paths explicitly approved by the user. Request approval before accessing another directory. Bash runs with the app's OS permissions and has no per-workspace OS filesystem sandbox; normal command approval still applies.",
       );
     }
     return lines.join("\n");
@@ -1630,7 +1978,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   function startTurn(
     session: MobileSession,
-    params: { workspacePath: string; text: string; sourceCommandId?: string; config?: Partial<SessionConfigState> },
+    params: { workspacePath: string; text: string; attachments?: AttachmentRef[]; sourceCommandId?: string; config?: Partial<SessionConfigState> },
   ): TurnHandles {
     const turnId = newId("turn");
     const startedAt = now();
@@ -1664,6 +2012,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       createdAtSeq: session.seq,
       kind: "userInput",
       text: params.text,
+      ...(params.attachments?.length ? { attachments: params.attachments } : {}),
       // realUser 是这条协议里"真的是人打出来的"唯一取值；其余（synthetic/mailbox/…）会被 UI 折进别处。
       origin: "realUser",
       ...(params.sourceCommandId ? { sourceCommandId: params.sourceCommandId } : {}),
@@ -1774,6 +2123,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     publishSessionIndex(session);
     // 收口这一拍是权威的落盘点：终态 control、完整 assistant 正文、这一轮的真实用量都在此刻齐了。
     persistSession(session);
+    // 用量投影只在这一拍补一次：它是给用量页读的轻量视图，不该跟着每 5 秒的检查点双写。
+    persistUsageProjection(session);
   }
 
   // ── 等待队列（0.7.1）──
@@ -1788,6 +2139,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     envelope: CommandEnvelope,
     input: {
       text: string;
+      attachments?: AttachmentRef[];
       modelSelection?: ModelSelectionValue;
       mode?: unknown;
       planEnabled?: unknown;
@@ -1808,8 +2160,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       clientId: boundClientId ?? "mobile-client",
       kind: "sendText",
       text: input.text,
-      // 附件面端侧还没接（composer 的附件上传走的是桌面传输层）；协议要数组，给空。
-      attachments: [],
+      attachments: input.attachments ?? [],
       ...(input.modelSelection ? { modelSelection: input.modelSelection } : {}),
       ...(itemMode ? { mode: itemMode } : {}),
       ...(itemPlan !== undefined ? { planEnabled: itemPlan } : {}),
@@ -1842,6 +2193,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     const handles = startTurn(session, {
       workspacePath: session.workspacePath,
       text: item.text,
+      attachments: item.attachments,
       sourceCommandId: item.sourceCommandId,
       config: item.modelSelection ? { modelSelection: item.modelSelection } : undefined,
     });
@@ -1912,7 +2264,14 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         return `Delete:${call.arguments.slice(0, 200)}`;
       }
     }
-    return `Bash:${tryParseCommandText(call.arguments)}`;
+    if (call.name === "Bash") return `Bash:${tryParseCommandText(call.arguments)}`;
+    // 写文件等工具也可以选“始终允许”；记忆必须按工具和目标区分，不能误放行另一类操作。
+    const parsed = safeParseToolInput(call.arguments);
+    const path = parsed && typeof parsed === "object"
+      ? (parsed as { path?: unknown; file_path?: unknown }).path ??
+        (parsed as { file_path?: unknown }).file_path
+      : undefined;
+    return `${call.name}:${typeof path === "string" ? path : call.arguments.slice(0, 200)}`;
   }
 
   function requestToolApproval(
@@ -1921,6 +2280,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     toolCallId: string,
     call: { name: string; arguments: string },
   ): Promise<"allow" | "deny" | "abort"> {
+    if (executionModeOf(session) === "yolo") return Promise.resolve("allow");
     // 命中"始终允许"记忆：不再弹窗，直接放行（弹窗消失、composer 不进 pending 态）。
     if (alwaysApproved.get(session)?.has(alwaysKey(call))) return Promise.resolve("allow");
     const signal = session.run?.abort.signal;
@@ -1930,7 +2290,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       toolName: call.name,
       summary: `端上请求执行${call.name === "Bash" ? "命令" : "操作"}：${call.name}`,
       // 0.7.2：Delete 也进了审批面（build=变更前确认），弹窗里要显示"删哪个"而不是一坨 JSON。
-      detail: { command: approvalDetailOf(call) },
+      // 复用桌面 PermissionDialog 的文件变更预览：Write/Edit 传原始工具入参，
+      // 让它从 file_path/content 生成文件摘要；命令和删除仍展示精简的目标文本。
+      detail: call.name === "Write" || call.name === "Edit"
+        ? safeParseToolInput(call.arguments)
+        : { command: approvalDetailOf(call) },
       options: [
         { optionId: "allow_once", label: "允许这一次", kind: "allowOnce" as const },
         { optionId: "allow_always", label: "始终允许", kind: "allowAlways" as const },
@@ -1946,7 +2310,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     };
     updateState(session, {
       revision: session.revision + 1,
-      pendingInteractions: [interaction as unknown as PendingInteraction],
+      pendingInteractions: [...session.pendingInteractions, interaction as unknown as PendingInteraction],
     });
     const decision = new Promise<"allow" | "deny">((resolveDecision) => {
       pendingInteractionResolvers.set(interactionId, (optionId) => {
@@ -1960,10 +2324,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         resolveDecision(optionId === "allow_once" ? "allow" : "deny");
       });
     });
+    let onAbort: (() => void) | undefined;
     const aborted = signal
       ? new Promise<"abort">((resolveAbort) => {
           if (signal.aborted) resolveAbort("abort");
-          else signal.addEventListener("abort", () => resolveAbort("abort"), { once: true });
+          else { onAbort = () => resolveAbort("abort"); signal.addEventListener("abort", onAbort, { once: true }); }
         })
       : null;
     // 无限时等待（0.5.1，用户点名"审批弹窗的限时应当取消，后台不动回来还是按原来那样原地
@@ -1972,6 +2337,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     // 自己点选项或按停止（aborted 仍在 race 里）；process 死亡由 restore 侧清理挂起交互。
     const race = [decision, ...(aborted ? [aborted] : [])];
     return Promise.race(race).finally(() => {
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
       pendingInteractionResolvers.delete(interactionId);
       // 出口统一清交互：弹窗消失、composer 的 pending 判定解除。
       if (session.pendingInteractions.some((pi) => pi.interactionId === interactionId)) {
@@ -2027,7 +2393,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   /** 从文件端口的 permission_denied 回包里抠出被拒的路径（消息形状见 file-system.mjs 的 guard）。 */
   function deniedPathOf(outcome: { isError: boolean; errorCode?: string; errorMessage?: string; content: string }): string | null {
     if (!outcome.isError || outcome.errorCode !== "permission_denied") return null;
-    const m = /路径越出授权工作区[:：]\s*(\S+)/.exec(`${outcome.errorMessage ?? ""}\n${outcome.content}`);
+    // 授权路径可能包含空格；按整行读取，避免弹窗只显示并授权到第一个空格之前。
+    const m = /路径越出授权工作区[:：]\s*([^\n]+?)(?=\s+::\s+\{|\n|$)/.exec(`${outcome.errorMessage ?? ""}\n${outcome.content}`);
     const p = m?.[1]?.trim();
     return p && p.startsWith("/") ? p : null;
   }
@@ -2050,6 +2417,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     deniedPath: string,
     scope: string,
   ): Promise<"allow_once" | "allow_always" | "deny" | "abort"> {
+    if (executionModeOf(session) === "yolo") return Promise.resolve("allow_always");
     const alwaysKey = `Path:${scope}`;
     if (alwaysApproved.get(session)?.has(alwaysKey)) return Promise.resolve("allow_always");
     const signal = session.run?.abort.signal;
@@ -2074,7 +2442,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     };
     updateState(session, {
       revision: session.revision + 1,
-      pendingInteractions: [interaction as unknown as PendingInteraction],
+      pendingInteractions: [...session.pendingInteractions, interaction as unknown as PendingInteraction],
     });
     const decision = new Promise<"allow_once" | "allow_always" | "deny">((resolveDecision) => {
       pendingInteractionResolvers.set(interactionId, (optionId) => {
@@ -2088,14 +2456,16 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         resolveDecision(optionId === "allow_once" ? "allow_once" : "deny");
       });
     });
+    let onAbort: (() => void) | undefined;
     const aborted = signal
       ? new Promise<"abort">((resolveAbort) => {
           if (signal.aborted) resolveAbort("abort");
-          else signal.addEventListener("abort", () => resolveAbort("abort"), { once: true });
+          else { onAbort = () => resolveAbort("abort"); signal.addEventListener("abort", onAbort, { once: true }); }
         })
       : null;
     // 同 Bash 审批（0.5.1）：无限时等待，后台回来原地继续；收口只有用户选项/停止。
     return Promise.race([decision, ...(aborted ? [aborted] : [])]).finally(() => {
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
       pendingInteractionResolvers.delete(interactionId);
       if (session.pendingInteractions.some((pi) => pi.interactionId === interactionId)) {
         updateState(session, {
@@ -2146,6 +2516,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     }
     try {
       target = await resolveModelTarget(targets, selection);
+      session.contextWindow = target.contextWindow ?? 64_000;
       if (options.deviceId) target.metadataUserId = options.deviceId;
     } catch (e) {
       settleTurn(session, handles, {
@@ -2159,7 +2530,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
     // 引擎按 workspace 取（首轮加载 core bundle，之后命中缓存）；null = 这台没工具，
     // 下面整段与 0.4.2 的行为逐字一致：不发 tools 字段、prompt 保留"工具不可用"的实话。
-    const engine = options.toolEngine ? await options.toolEngine(params.workspacePath) : null;
+    const engine = options.toolEngine ? await options.toolEngine(session.workspacePath, session.sessionId, signal) : null;
 
     // ── 钩子（0.7.1，用户点名"钩子未接入，请接入"）──
     // 一轮装配一次：读工作区/用户配置 → 建快照与信任门禁 → 从 core bundle 拿桌面同款 runner。
@@ -2263,6 +2634,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     const maxOutputTokens = Math.min(
       MAX_OUTPUT_TOKENS,
       ...(target.maxOutputTokensCap ? [target.maxOutputTokensCap] : []),
+      ...(target.contextWindow ? [Math.max(1, Math.floor(target.contextWindow / 4))] : []),
     );
 
     let streamed = "";
@@ -2272,6 +2644,12 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     // 两者都能注入 additionalContext（进系统提示，与桌面同类）；UserPromptSubmit 还能阻止
     // 这次提交（continue:false / decision:block）——阻止时这一轮不开跑，如实收成失败并写出原因。
     const hookNotes: string[] = [];
+    if (options.memoryContext && engine) {
+      try {
+        const memory = await options.memoryContext(localWorkspacePath(session.workspacePath));
+        if (memory) {engine.grantRoot(memory.root);hookNotes.push(memory.content);}
+      } catch (error) {say(`工作区记忆读取失败：${String((error as Error)?.message ?? error)}`);}
+    }
     if (hookRuntime?.enabled && !signal.aborted) {
       const promptRow = session.rows.find((candidate) => candidate.rowId === handles.inputRowId);
       const promptText = promptRow && promptRow.kind === "userInput" ? promptRow.text : "";
@@ -2310,33 +2688,176 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     const MAX_STOP_HOOK_CONTINUES = 5;
     // ── 自动压缩（0.7.4，症状②接线）──
     // 装配本轮 transcript 之前先看水位：估算占用 ≥ 阈值就把早期段压成摘要。
-    // 失败/中断不打死本轮：runCompact 自己收 marker，历史退回兜底截断（带省略标记），
-    // 本轮照常跑 —— 上下文问题绝不能再变成对话不可用。
-    const compactTriggerTokens = options.compactTriggerTokens ?? COMPACT_TRIGGER_TOKENS;
+    // 失败/中断如实落 marker；后续仍核对完整历史预算，超限时拒绝调用并给出可读原因。
+    // 留出系统提示和完整输出预算；配置上下文窗口时按该模型能力计算触发线，
+    // 未提供窗口的模型仍使用保守默认值，但不按固定消息条数截断历史。
+    const systemReserve = estimateTextTokens(systemPrompt(params.workspacePath, engine, executionModeOf(session))) + 512;
+    // provider 未声明窗口时使用可解释的保守上界，避免把无限历史直接发送给未知容量模型。
+    const effectiveContextWindow = target.contextWindow ?? 64_000;
+    const compactOutputReserve = Math.min(20_000, target.maxOutputTokensCap ?? 20_000,
+      target.contextWindow ? Math.max(1, Math.floor(target.contextWindow / 4)) : 20_000);
+    const compactTriggerTokens = options.compactTriggerTokens ?? Math.max(512,
+      effectiveContextWindow - Math.max(maxOutputTokens, compactOutputReserve) - systemReserve -
+      Math.min(13_000, Math.floor(effectiveContextWindow * 0.1)),
+    );
     if (options.compactEnabled !== false && estimateHistoryTokens(session) >= compactTriggerTokens) {
-      say(
-        `上下文估算 ${estimateHistoryTokens(session)} token ≥ 阈值 ${compactTriggerTokens}，开轮前自动压缩`,
-      );
-      await runCompact(session, { origin: "auto", selection: params.selection ?? session.config.modelSelection ?? null });
-      if (signal.aborted) {
-        settleTurn(session, handles, { kind: "interrupted" });
-        return;
+      const compactFailures = session.consecutiveCompactFailures ?? 0;
+      if (compactFailures >= MAX_CONSECUTIVE_COMPACT_FAILURES) {
+        // 连着失败这么多次，再自动压一次也是同样的失败（桌面端 policy.ts 的 circuit_breaker
+        // 同口径）：停下来，把选择权交回用户——手动 /compact，或缩短当前输入/工具结果。
+        if (!session.autoCompactPausedNotified) {
+          session.autoCompactPausedNotified = true;
+          say(
+            `自动压缩已连续失败 ${compactFailures} 次，本会话不再自动压缩；` +
+              "请手动运行 /compact，或缩短当前输入/工具结果后重试",
+          );
+        }
+      } else {
+        say(
+          `上下文估算 ${estimateHistoryTokens(session)} token ≥ 阈值 ${compactTriggerTokens}，开轮前自动压缩`,
+        );
+        await runCompact(session, { origin: "auto", selection: params.selection ?? session.config.modelSelection ?? null, parentSignal: signal });
+        if (signal.aborted) {
+          settleTurn(session, handles, { kind: "interrupted" });
+          return;
+        }
       }
     }
     // 本轮私有的模型 transcript：历史 + 每步的 assistant(tool_calls)/tool(结果)。
     // 循环第二步起模型必须看得见"自己调了什么、拿到什么"，否则只会重复调用。
     // 执行模式（0.7.2）：本轮所有审批/禁写判据的唯一来源（提交时已落进 session.config）。
     const execMode = executionModeOf(session);
+    let capabilities: Awaited<ReturnType<typeof discoverMobileCapabilities>> | null = null;
+    if (options.capabilities && engine) {
+      try {
+        const promptRow = session.rows.find(row => row.rowId === handles.inputRowId);
+        capabilities = await discoverMobileCapabilities(options.capabilities, { workspacePath: session.workspacePath },
+          promptRow?.kind === "userInput" ? promptRow.text : "");
+        for (const diagnostic of capabilities.diagnostics) say(`能力发现：${diagnostic.message}`);
+      } catch (error) {
+        say(`Skills/Subagents 发现失败，本轮不可用：${String((error as Error)?.message ?? error)}`);
+      }
+    }
+    let history: ModelTurnMessage[];
+    try {
+      history = historyMessages(session);
+      const requestSystem = systemPrompt(params.workspacePath, engine, execMode) +
+        (capabilities ? capabilities.catalog : "") + hookNotes.join("\n");
+      const toolSchemaText = JSON.stringify(engine ? (capabilities ? [...engine.tools, SKILL_TOOL, AGENT_TOOL] : engine.tools) : []);
+      const requestReserve = estimateTextTokens(requestSystem) + estimateTextTokens(toolSchemaText) + 512;
+      const historyBudget = Math.max(1, effectiveContextWindow - maxOutputTokens - requestReserve);
+      if (options.compactEnabled !== false &&
+          history.reduce((sum, message) => sum + estimateMessageTokens(message), 0) > historyBudget &&
+          (session.consecutiveCompactFailures ?? 0) < MAX_CONSECUTIVE_COMPACT_FAILURES) {
+        await runCompact(session, { origin: "auto", selection: params.selection ?? session.config.modelSelection ?? null, parentSignal: signal });
+        if (signal.aborted) throw new DOMException("已取消", "AbortError");
+        history = historyMessages(session);
+      }
+      assertHistoryFitsBudget(history, historyBudget);
+    } catch (e) {
+      const detail = String((e as Error)?.message ?? e);
+      // 上下文装不下与"附件读不出来"是两种失败，分开报：混成一条会让用户以为要去
+      // 重传附件，而真正的原因是这一轮的历史已经超过模型预算。
+      const overflow = detail.startsWith("完整历史估算");
+      settleTurn(session, handles, {
+        kind: "failed",
+        code: overflow ? "mobile.context.overflow" : "mobile.attachment.unavailable",
+        message: overflow ? detail : `附件无法读取：${detail}`,
+        source: "runtime",
+      });
+      return;
+    }
     const transcript: ModelTurnMessage[] = [
       {
         role: "system",
         content: [
           systemPrompt(params.workspacePath, engine, execMode),
+          ...(capabilities ? [capabilities.catalog] : []),
           ...hookNotes.map((note) => `Hook context: ${note}`),
         ].join("\n"),
       },
-      ...historyMessages(session),
+      ...history,
     ];
+    // 子代理使用同一轮的 Hook、审批和文件端口；不能直接把 engine.execute 暴露给子模型。
+    const executeChildTool: ExecuteSubagentTool = async (call, child) => {
+      const timeline = sessions.get(child.agentId) ?? session;
+      const childTurn = timeline === session ? handles.turnId : timeline.rows[0]!.turnId;
+      const rowId = takeRowId(timeline);
+      const toolCallId = call.id || `child-tool-${rowId}`;
+      const base = {
+        rowId, turnId: childTurn, entityId: String(rowId), createdAt: now(), createdAtSeq: timeline.seq,
+        kind: "toolCall" as const, toolCallId, toolName: call.name, status: "running" as const, inputText: call.arguments,
+      };
+      appendRow(timeline, base);
+      const fail = (message: string): ToolRunResult => {
+        upsertRow(timeline, { ...base, inputText: call.arguments, status: "error", error: { code: "mobile.childToolDenied", message } });
+        return { isError: true, content: message, errorCode: "mobile.childToolDenied", errorMessage: message };
+      };
+      if (!engine || !child.allowedToolNames.includes(call.name)) return fail("子代理无权使用此工具。");
+      let allowedByHook = false;
+      const extra: string[] = [];
+      if (hookRuntime?.enabled && !signal.aborted) {
+        try {
+          const pre = await hookRuntime.run("PreToolUse", { ...hookInputBase(), toolName: call.name,
+            toolInput: safeParseToolInput(call.arguments), toolCallId }, { matchValues: [call.name], signal });
+          extra.push(...(pre.additionalContexts ?? []));
+          if (pre.updatedInput !== undefined) call.arguments = JSON.stringify(pre.updatedInput);
+          if (pre.permissionBehavior === "deny") return fail(String(pre.hookPermissionDecisionReason ?? pre.stopReason ?? "Hook 拒绝此调用。"));
+          allowedByHook = pre.permissionBehavior === "allow";
+        } catch (error) { say(`子代理 PreToolUse 异常：${String((error as Error)?.message ?? error)}`); }
+      }
+      // Hook 可改写参数，必须重新检查最终操作，避免 Fetch/Git 的只读动作被改为写入。
+      const childMode = executionModeOf(session);
+      if (childMode === "plan" && (isPlanModeBlocked(call) || !["Read", "Glob", "Grep", "Skill", "Fetch", "Git"].includes(call.name))) {
+        return fail("计划模式不允许此子代理操作。");
+      }
+      const needsApproval = mobileNeedsToolApproval(childMode, call.name, engine.approvalRequired(call.name));
+      if (needsApproval && !allowedByHook) {
+        let decision: { behavior?: "allow" | "deny"; message?: string } | null = null;
+        if (hookRuntime?.enabled && !signal.aborted) {
+          try {
+            const permission = await hookRuntime.run("PermissionRequest", { ...hookInputBase(), toolName: call.name,
+              toolInput: safeParseToolInput(call.arguments), toolCallId }, { matchValues: [call.name], signal });
+            extra.push(...(permission.additionalContexts ?? []));
+            decision = permission.permissionRequestResult ?? (permission.permissionBehavior === "deny"
+              ? { behavior: "deny", message: permission.hookPermissionDecisionReason ?? permission.stopReason }
+              : permission.permissionBehavior === "allow" ? { behavior: "allow" } : null);
+          } catch (error) { say(`子代理 PermissionRequest 异常：${String((error as Error)?.message ?? error)}`); }
+        }
+        if (decision?.behavior === "deny") return fail(String(decision.message ?? "Hook 拒绝此调用。"));
+        if (decision?.behavior !== "allow") {
+          const approval = await requestToolApproval(session, `pi-${child.agentId}-${rowId}`, toolCallId, call);
+          if (approval !== "allow") return fail(approval === "abort" ? "操作已取消。" : "用户拒绝了此操作。");
+        }
+      }
+      if (signal.aborted) return fail("操作已取消。");
+      persistSession(timeline);
+      let result = call.name === "Skill" && capabilities ? executeMobileSkill(capabilities.skills, call.arguments) : await engine.execute(call, signal);
+      const denied = result.isError ? deniedPathOf(result) : null;
+      if (denied && !signal.aborted) {
+        const scope = grantScopeOf(denied);
+        const approved = executionModeOf(session) === "yolo" ? "allow_always" : await requestPathApproval(session, `pi-${child.agentId}-${rowId}-fs`, toolCallId, call, denied, scope);
+        if (approved === "allow_once" || approved === "allow_always") {
+          engine.grantRoot(scope);
+          try { result = await engine.execute(call, signal); } finally { if (approved === "allow_once") engine.revokeRoot(scope); }
+        } else return fail(approved === "abort" ? "操作已取消。" : "用户拒绝了对该路径的访问。");
+      }
+      if (hookRuntime?.enabled && !signal.aborted) {
+        try {
+          const post = await hookRuntime.run(result.isError ? "PostToolUseFailure" : "PostToolUse", {
+            ...hookInputBase(), toolName: call.name, toolInput: safeParseToolInput(call.arguments), toolCallId,
+            ...(result.isError ? { error: { message: result.errorMessage ?? result.content }, isInterrupt: signal.aborted }
+              : { toolResponse: { text: capToolContent(result.content) } }),
+          }, { matchValues: [call.name], signal });
+          extra.push(...(post.additionalContexts ?? []));
+        } catch (error) { say(`子代理 PostToolUse 异常：${String((error as Error)?.message ?? error)}`); }
+      }
+      upsertRow(timeline, result.isError
+        ? { ...base, inputText: call.arguments, status: "error", error: { code: result.errorCode ?? "mobile.toolFailed", message: result.errorMessage ?? result.content } }
+        : { ...base, inputText: call.arguments, status: "success", output: { text: capToolContent(result.content), ...(result.display !== undefined ? { display: result.display as never } : {}) } });
+      persistSession(timeline);
+      return { ...result, content: [result.content, ...extra.map(note => `Hook context: ${note}`)].join("\n") };
+    };
     // 重复签名账本（0.5.0）：key = 工具名+入参+错误回包摘要，value = 连续次数。
     // 只在**出错**的调用上累计（见调用点），任何一次成功调用/新的不同签名都清零——
     // 长任务里"同一工具连发、内容不同"是正常推进，不该被误判成循环。
@@ -2364,9 +2885,32 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         // 模型自己不再发工具调用（正常收口）、同签名连续出错检测（失控循环）、abort/上下文
         // 撑爆（provider 如实报错进 catch）。`step` 只留给日志与诊断用。
         void step;
+        // 多步工具往返与 length/网络续写会继续增长同一 transcript；每次发请求前重新
+        // 每个模型调用前核对完整 transcript；超窗则失败，不删除旧历史或拆散工具调用。
+        if (transcript.length > 1) {
+          const systemMessage = transcript[0]!;
+          const turnSystem = transcript[0]?.content ?? "";
+          const toolsText = JSON.stringify(engine ? (capabilities ? [...engine.tools, SKILL_TOOL, AGENT_TOOL] : engine.tools) : []);
+          const budget = Math.max(1, effectiveContextWindow - maxOutputTokens - estimateTextTokens(turnSystem) - estimateTextTokens(toolsText) - 512);
+          const requestHistory = transcript.slice(1);
+          assertHistoryFitsBudget(requestHistory, budget);
+          void systemMessage;
+        }
         // 本步正文的独立账（0.6.9）：流中断自动续写要把"这一步已生成的部分"回填 transcript——
         // `streamed` 是整轮累加（跨步），直接用它会把前几步的正文重复喂回模型。
+        const requestInputEstimate = transcript.reduce((sum, message) => sum + estimateMessageTokens(message), 0) +
+          estimateTextTokens(JSON.stringify(engine ? (capabilities ? [...engine.tools, SKILL_TOOL, AGENT_TOOL] : engine.tools) : []));
+        session.contextUsedTokens = Math.max(session.lastPromptTokens ?? 0, requestInputEstimate);
+        updateState(session, { usage: usageState(session) });
         let stepText = "";
+        let activeReasoningRow: Extract<ConversationRow, { kind: "reasoning" }> | null =
+          session.reasoningRowId === null
+            ? null
+            : session.rows.find((r): r is Extract<ConversationRow, { kind: "reasoning" }> =>
+                r.rowId === session.reasoningRowId && r.kind === "reasoning") ?? null;
+        let activeAssistantRow: Extract<ConversationRow, { kind: "assistantText" }> | null =
+          session.rows.find((r): r is Extract<ConversationRow, { kind: "assistantText" }> =>
+            r.rowId === currentAssistantRowId && r.kind === "assistantText") ?? null;
         let result: ModelStreamResult;
         try {
           result = await streamModelCompletionWithRetry({
@@ -2375,7 +2919,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
             maxOutputTokens,
             signal,
             // 有引擎才声明工具；无引擎时整个键缺席，请求体与 0.4.2 逐字节一致（地基冒烟钉过）。
-            ...(engine ? { tools: engine.tools } : {}),
+            ...(engine ? { tools: capabilities ? [...engine.tools, SKILL_TOOL, AGENT_TOOL] : engine.tools } : {}),
             // 重连旁路（0.4.10）：只记进 agentLog（装机报告可读"这一轮悄悄重连了几次"），
             // 不进正文、不改状态——用户看到的是"慢一点但成了"，而不是桌面端同款的重试噪音。
             onRetry: (attempt, waitMs, reason) =>
@@ -2383,12 +2927,17 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
             // 思考流（0.7.3）：与正文分道——reasoning 增量落 reasoning 行（可折叠"深度思考"卡），
             // content 增量落正文行；两段交替时先关旧行再开新行（openReasoning 懒建、close 幂等）。
             onReasoning: (piece) => {
-              if (session.reasoningRowId === null) openReasoningRow(session, handles.turnId);
+              if (session.reasoningRowId === null) {
+                openReasoningRow(session, handles.turnId);
+                const row = session.rows[session.rows.length - 1];
+                activeReasoningRow = row?.kind === "reasoning" ? row : null;
+              }
               // 服务端副本同步累加（与正文靠 streamed/settleTurn 回填同理）：row.delta 只走线，
               // session.rows 不跟着变的话，closeReasoningRow 的 upsert 会把整行 text:"" 发回去，
               // 客户端攒好的思考全文被盖成空（chat-smoke 判据 11 抓到的正是这条）。
-              const rRow = session.rows.find((r) => r.rowId === session.reasoningRowId);
-              if (rRow && rRow.kind === "reasoning") rRow.text += piece;
+              if (activeReasoningRow && activeReasoningRow.rowId === session.reasoningRowId) {
+                activeReasoningRow.text += piece;
+              }
               stageDelta(session, {
                 op: "row.delta",
                 rowId: session.reasoningRowId as number,
@@ -2417,13 +2966,15 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                 });
                 currentAssistantRowId = rowId;
                 handles.assistantRowId = rowId; // settleTurn / DSML / 截断标注都跟最新一行走
+                activeAssistantRow = session.rows[session.rows.length - 1] as Extract<ConversationRow, { kind: "assistantText" }>;
               }
               // 服务端副本同步累加（0.7.4 插话失忆修复，与上面 reasoning 行同法）：row.delta
               // 只走线，session.rows 里这条正文行的 text 不跟着变的话，被打断收口后行内永远
               // 停在开轮预建的空串，下一轮 historyMessages 按 row.text 取历史时整行跳过 ——
               // 模型"完全忘记做到一半的工作重新开始"。文本在此实时入账。
-              const aRow = session.rows.find((r) => r.rowId === currentAssistantRowId);
-              if (aRow && aRow.kind === "assistantText") aRow.text += piece;
+              if (activeAssistantRow && activeAssistantRow.rowId === currentAssistantRowId) {
+                activeAssistantRow.text += piece;
+              }
               stageDelta(session, {
                 op: "row.delta",
                 rowId: currentAssistantRowId,
@@ -2461,8 +3012,16 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         roundUsage.outputTokens += result.usage?.outputTokens ?? 0;
         session.cumulative.inputTokens += result.usage?.inputTokens ?? 0;
         session.cumulative.outputTokens += result.usage?.outputTokens ?? 0;
+        // 一轮可能包含多次模型调用；后续工具、续写或请求失败时也要保留已返回的用量。
+        if (roundUsage.inputTokens || roundUsage.outputTokens) turnUsage.set(handles.turnId, {
+          ...roundUsage, modelId: target.model, providerId: selection.providerId,
+        });
         // 网关报回的输入水位是下一轮自动压缩触发估算的最新基线（每步刷新，取本轮最后一次）。
         if (result.usage?.inputTokens) session.lastPromptTokens = result.usage.inputTokens;
+        // 上下文占用是最新请求的输入加本次生成，不是累计计费 token 或请求次数。
+        session.contextUsedTokens = (result.usage?.inputTokens ?? requestInputEstimate) +
+          (result.usage?.outputTokens ?? estimateTextTokens(result.text + result.reasoning));
+        updateState(session, { usage: usageState(session) });
 
         if (result.toolCalls.length === 0) {
           // GLM 方言兜底（0.4.8）：模型偶发把工具调用写成 DSML 标记文本而不是 tool_calls JSON，
@@ -2548,7 +3107,6 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                 say(`Stop 钩子执行异常（已忽略）：${String((e as Error)?.message ?? e)}`);
               }
             }
-            if (roundUsage.inputTokens || roundUsage.outputTokens) turnUsage.set(handles.turnId, { ...roundUsage });
             settleTurn(
               session,
               handles,
@@ -2581,7 +3139,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           appendRow(session, base);
           // ── 执行模式闸（0.7.2）：计划模式不落盘——写类工具拦在入口，理由原样回给模型，
           // 让它把"打算怎么改"写成计划，而不是靠执行失败去猜。──
-          if (execMode === "plan" && PLAN_MODE_BLOCKED_TOOLS.has(call.name)) {
+          if (executionModeOf(session) === "plan" && isPlanModeBlocked(call)) {
             const planNote = `计划模式：${call.name} 不会被执行。请先把计划写出来（改哪些文件、每处怎么改），等用户确认后再动手。`;
             say(`计划模式拦下 ${call.name}`);
             upsertRow(session, { ...base, status: "cancelled" });
@@ -2637,21 +3195,31 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
             transcript.push({ role: "tool", content: `已阻止：${hookDeniedReason}`, toolCallId });
             continue;
           }
-          // 审批闸（引擎标了 approvalRequired 的调用才走）：先立一条 permission 交互投进
+          // 钩子可以改写动作；权限必须在改写之后再检查，钩子的 allow 不能覆盖计划模式。
+          if (executionModeOf(session) === "plan" && isPlanModeBlocked(call)) {
+            const planNote = `计划模式：${call.name} 的最终操作会修改状态，不会执行。`;
+            upsertRow(session, { ...base, inputText: call.arguments, status: "cancelled" });
+            transcript.push({ role: "tool", content: planNote, toolCallId });
+            continue;
+          }
+          // 审批闸：文件改动与引擎标了 approvalRequired 的调用先立 permission 交互投进
           // 快照（UI 的 V4InteractionDialogs 据此弹窗），await 用户点头/摇头或本轮被停止。
           // 0.5.1 起无限时等待（用户点名"审批限时取消，后台回来原地继续"）：切后台 timer 冻结
           // 会让固定上限在回前台那一刻准点误杀，不如等用户自己决定；收口是选项或停止键。
           // 先判交互再判 execute：审批没过的调用绝不能碰到执行器。
           // 0.7.2 起"要不要问"由执行模式定（见文件头模式表）：
           //   yolo（完全访问）一律不问；
-          //   build（变更前确认）问引擎标过的全部（Bash + Delete）；
-          //   edit（自动编辑）只问命令（Delete 不再问——"改动自动"的题中之义）；
+          //   build（变更前确认）问所有文件变更与引擎标过的调用（Bash + Delete）；
+          //   edit（自动编辑）只问命令；
           //   plan（计划模式）时 Delete 已在上面被拦，走到这里的是 Bash：照问（不静默跑命令）。
-          const modeNeedsApproval =
-            execMode === "yolo" || (execMode === "edit" && call.name === "Delete")
-              ? false
-              : engine!.approvalRequired(call.name);
-          if (modeNeedsApproval && !hookAllowedByDecision) {
+          const currentMode = executionModeOf(session);
+          const planBash = currentMode === "plan" && call.name === "Bash";
+          const modeNeedsApproval = mobileNeedsToolApproval(
+            currentMode,
+            call.name,
+            engine!.approvalRequired(call.name),
+          );
+          if (modeNeedsApproval && (!hookAllowedByDecision || planBash)) {
             // ── PermissionRequest 钩子（0.7.1）：可以在弹窗之前就把裁决给掉
             // （decision.behavior=allow 静默放行 / deny 静默拒绝），弹窗只在钩子没表态时出现。──
             let hookPermission: { behavior?: "allow" | "deny"; message?: string } | null = null;
@@ -2688,7 +3256,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
               transcript.push({ role: "tool", content: `已拒绝：${reason}`, toolCallId });
               continue;
             }
-            if (hookPermission?.behavior !== "allow") {
+            if (hookPermission?.behavior !== "allow" || planBash) {
               const interactionId = `pi-${rowId}`;
               const decided = await requestToolApproval(session, interactionId, toolCallId, call);
               if (decided === "abort") {
@@ -2705,7 +3273,102 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           // 冻结归因标注（0.4.10）：工具执行是同步桥重区（Grep/Read 一次几十条桥往返），
           // 心跳证人会把这一段里发生的长 gap 标上"tool:<name>"，装机报告直接看出堵在哪。
           markJankPhase(`tool:${call.name}`);
-          let outcome = await engine!.execute(call);
+          // 副作用前记录正在执行的最终参数：进程被杀后要提示结果未知，不能自动重跑。
+          upsertRow(session, { ...base, inputText: call.arguments, status: "running" });
+          persistSession(session);
+          let outcome: ToolRunResult;
+          if (call.name === "Skill" && capabilities) {
+            outcome = executeMobileSkill(capabilities.skills, call.arguments);
+          } else if (call.name === "Agent" && capabilities) {
+            let childSession: MobileSession | undefined;
+            let childHeaderId = 0;
+            let childTurnId = "";
+            let childStartedAt = 0;
+            let childTextRow: Extract<ConversationRow, { kind: "assistantText" }> | undefined;
+            // 子代理复用主会话增量合帧；整行重发会重复序列化不断增长的长文本。
+            let childLink: Extract<ConversationRow, { kind: "subagent" }> | undefined;
+            outcome = await runMobileSubagent({
+              rawArguments: call.arguments, agents: capabilities.agents, skills: capabilities.skills,
+              workspacePath: session.workspacePath, mode: executionModeOf(session), parentTarget: target, modelTargets: targets,
+              availableTools: [...engine!.tools, SKILL_TOOL], signal,
+              onStarted: info => {
+                childSession = createSession(info.id, { ...session.config, model: info.target.model }, session.workspacePath);
+                childTurnId = newId("child-turn");
+                childStartedAt = now();
+                childHeaderId = takeRowId(childSession);
+                appendRow(childSession, { rowId: childHeaderId, turnId: childTurnId, createdAt: childStartedAt,
+                  createdAtSeq: childSession.seq, kind: "turnHeader", origin: "userInput", executionKind: "agent",
+                  state: "running", startedAt: childStartedAt });
+                const inputId = takeRowId(childSession);
+                appendRow(childSession, { rowId: inputId, turnId: childTurnId, createdAt: now(), createdAtSeq: childSession.seq,
+                  kind: "userInput", text: info.prompt, origin: "realUser", visibility: "visible" });
+                updateState(childSession, { control: { ...runningControl(childStartedAt, info.id), canStop: false,
+                  stopState: "idle" } });
+                const linkId = takeRowId(session);
+                childLink = { rowId: linkId, turnId: handles.turnId, createdAt: now(), createdAtSeq: session.seq,
+                  kind: "subagent", parentToolCallId: toolCallId, subagentType: info.agentType,
+                  childSessionId: info.id, status: "running", summaryText: info.prompt, startedAt: childStartedAt };
+                appendRow(session, childLink);
+                persistSession(childSession);
+                persistSession(session);
+              },
+              onAssistant: text => {
+                if (!childSession) return;
+                if (childTextRow) upsertRow(childSession, { ...childTextRow, text, state: "complete" });
+                else {
+                  const id = takeRowId(childSession);
+                  appendRow(childSession, { rowId: id, turnId: childTurnId, createdAt: now(), createdAtSeq: childSession.seq,
+                    kind: "assistantText", text, state: "complete" });
+                }
+                childTextRow = undefined;
+                persistSession(childSession);
+              },
+              onTextDelta: text => {
+                if (!childSession || !text) return;
+                if (!childTextRow) {
+                  const id = takeRowId(childSession);
+                  childTextRow = { rowId: id, turnId: childTurnId, createdAt: now(), createdAtSeq: childSession.seq,
+                    kind: "assistantText", text: "", state: "streaming" };
+                  appendRow(childSession, childTextRow);
+                }
+                // 与主会话相同的增量通路；发送整段正文会让长响应序列化/渲染成本平方增长。
+                childTextRow.text += text;
+                stageDelta(childSession, {op:"row.delta",rowId:childTextRow.rowId,path:"text",append:text});
+              },
+              onUsage: usage => {
+                if (!childSession) return;
+                childSession.cumulative = { ...usage };
+                turnUsage.set(childTurnId, { ...usage, modelId: childSession.config.model,
+                  providerId: childSession.config.provider });
+              },
+              executeTool: executeChildTool,
+              loadAgentsMd: async workspace => {
+                const path = `${workspace.replace(/\/+$/, "")}/AGENTS.md`;
+                if (!vfs.existsSync(path)) return "";
+                const read = await engine!.execute({ id: `agent-instructions-${rowId}`, name: "Read", arguments: JSON.stringify({ file_path: path }) }, signal);
+                if (read.isError) throw new Error(`无法读取工作区 AGENTS.md：${read.errorMessage ?? read.content}`);
+                return read.content;
+              },
+            });
+            if (childSession && childLink) {
+              if (childTextRow) upsertRow(childSession, { ...childTextRow, state: "interrupted" });
+              const phase = signal.aborted ? "completedInterrupted" : outcome.isError ? "failed" : "completedSuccess";
+              const header = childSession.rows.find(row => row.rowId === childHeaderId);
+              if (header?.kind === "turnHeader") upsertRow(childSession, { ...header, state: phase, endedAt: now() });
+              if (outcome.isError) {
+                const id = takeRowId(childSession);
+                appendRow(childSession, { rowId: id, turnId: childTurnId, createdAt: now(), createdAtSeq: childSession.seq,
+                  kind: "assistantText", text: outcome.errorMessage ?? outcome.content, state: "complete" });
+              }
+              updateState(childSession, { control: settledControl(phase === "failed" ? "error" : phase, null), usage: usageState(childSession) });
+              upsertRow(session, { ...childLink, status: signal.aborted ? "cancelled" : outcome.isError ? "failed" : "success", endedAt: now() });
+              persistSession(childSession);
+              persistUsageProjection(childSession);
+              persistSession(session);
+            }
+          } else {
+            outcome = await engine!.execute(call, signal);
+          }
           // 沙箱授权闸（0.5.0，用户点名"读 sandbox 外的文件被直接禁止不好，应改为询问授权"）：
           // 文件端口对越界路径抛 permission_denied（消息带路径）。这里接住 → 弹一条 permission
           // 交互问用户 → 批了就把该路径（/mnt/<名> 归一为挂载根，其余为文件本身）加进授权根
@@ -2714,11 +3377,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           const deniedPath = outcome.isError ? deniedPathOf(outcome) : null;
           if (deniedPath && !signal.aborted) {
             const scope = grantScopeOf(deniedPath);
-            if (execMode === "yolo") {
+            if (executionModeOf(session) === "yolo") {
               // 完全访问（0.7.2）：越界路径不再弹窗——按"始终允许"授权后重试，本轮不再问同一处。
               say(`完全访问：越界路径自动授权 ${scope}`);
               engine!.grantRoot(scope);
-              outcome = await engine!.execute(call);
+              outcome = await engine!.execute(call, signal);
             } else {
               const interactionId = `pi-${rowId}-fs`;
               const decided = await requestPathApproval(session, interactionId, toolCallId, call, deniedPath, scope);
@@ -2731,7 +3394,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
               if (decided === "allow_once" || decided === "allow_always") {
                 markJankPhase(`tool:${call.name}`);
                 engine!.grantRoot(scope);
-                outcome = await engine!.execute(call);
+                outcome = await engine!.execute(call, signal);
                 // "允许这一次"用完即收：不留会话级放行（对齐选项名，不做静默的永久授权）。
                 if (decided === "allow_once") engine!.revokeRoot(scope);
               } else {
@@ -2767,11 +3430,13 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
             outcome.isError
               ? {
                   ...base,
+                  inputText: call.arguments,
                   status: "error",
                   error: { code: outcome.errorCode ?? "mobile.toolFailed", message: outcome.errorMessage ?? outcome.content },
                 }
               : {
                   ...base,
+                  inputText: call.arguments,
                   status: "success",
                   output: {
                     text: capToolContent(outcome.content),
@@ -2781,6 +3446,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                   },
                 },
           );
+          persistSession(session);
           // ── PostToolUse / PostToolUseFailure 钩子（0.7.1）：工具跑完后注入上下文
           // （additionalContext 追加在工具结果后面回给模型，与桌面同一条路）。──
           if (hookRuntime?.enabled && !signal.aborted) {
@@ -3002,8 +3668,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         mode: session.config.mode as ZCodeSessionMode,
         turnCount: messages.filter((m) => m.info.role === "user").length,
         totalTokenCount: session.cumulative.inputTokens + session.cumulative.outputTokens,
-        contextUsed: session.cumulative.inputTokens,
-        contextWindow: 0,
+        contextUsed: session.contextUsedTokens ?? session.lastPromptTokens ?? 0,
+        contextWindow: session.contextWindow ?? 0,
         ...(session.run ? { currentTurnId: session.run.turnId } : {}),
         pendingPermissions: [],
         activeToolCalls: [],
@@ -3064,11 +3730,16 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       const firstInput = payload.firstInput as
         | {
             text?: string;
+            attachments?: AttachmentRef[];
             modelSelection?: ModelSelectionValue;
             mode?: unknown;
             planEnabled?: unknown;
           }
         | undefined;
+      // 首条输入不能先于会话 ID 上传；拒绝未知引用，不能确认成功后把附件静默丢掉。
+      if (firstInput?.attachments?.length) {
+        return ackFor(envelope, null, "rejected", { reasonCode: "mobile.attachment.sessionRequired", message: "请先创建会话并上传附件，再发送消息。" });
+      }
       const base = await configWithDefaultModel();
       const selection = requested?.modelSelection as ModelSelectionValue | undefined;
       // 执行模式（0.7.2）：草稿 config 与 firstInput 都可能带；首条输入是"这次提交"的意图，
@@ -3137,13 +3808,19 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     switch (envelope.type) {
       case "sendText": {
         const text = String(payload.text ?? "").trim();
-        if (!text) return ackFor(envelope, session, "rejected", { reasonCode: "mobile.input.empty" });
+        const inputAttachments = (payload.attachments ?? []) as AttachmentRef[];
+        if (!text && inputAttachments.length === 0) return ackFor(envelope, session, "rejected", { reasonCode: "mobile.input.empty" });
+        try {
+          for (const ref of inputAttachments) attachments.resolve(session.sessionId, ref);
+        } catch (e) {
+          return ackFor(envelope, session, "rejected", { reasonCode: "mobile.attachment.unavailable", message: `附件无法读取：${String((e as Error)?.message ?? e)}` });
+        }
         // ── "/compact" 输入前缀（0.7.4，症状②）──
         // 桌面 composer 把 "/compact" 解析成 compact 维护命令（v4/slashCommands），端侧
         // 这条 sendText 前缀是"原文直发"路径的兜底：路由到**同一个** runCompact。
         // 乐观气泡的收口凭据（头部规则 3）：先落一条带 commandId 的 realUser userInput 行
         // ——用户确实发了这句话，如实留痕；随后就地压缩，不开模型轮。
-        if (/^\/compact(\s|$)/.test(text)) {
+        if (inputAttachments.length === 0 && /^\/compact(\s|$)/.test(text)) {
           if (session.run) {
             return ackFor(envelope, session, "rejected", {
               reasonCode: "mobile.p0.busy",
@@ -3225,6 +3902,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           const handles = startTurn(session, {
             workspacePath,
             text,
+            attachments: inputAttachments,
             sourceCommandId: envelope.commandId,
             config: modelSelection ? { modelSelection } : undefined,
           });
@@ -3243,6 +3921,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         if (requestedDelivery === "startNow") {
           const item = enqueueInput(session, envelope, {
             text,
+            attachments: inputAttachments,
             modelSelection,
             mode: payload.mode,
             planEnabled: payload.planEnabled,
@@ -3266,6 +3945,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
         const item = enqueueInput(session, envelope, {
           text,
+          attachments: inputAttachments,
           modelSelection,
           mode: payload.mode,
           planEnabled: payload.planEnabled,
@@ -3404,14 +4084,14 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                 ? "当前上下文还太短，没有可压缩的早期段落"
                 : outcome === "cancelled"
                   ? "压缩被中断，上下文未变动"
-                  : "压缩失败，本轮起历史按兜底截断送模型（不静默丢弃）",
+                  : "压缩失败，本轮起历史按模型窗口预算送入请求（完整时间线仍保留）",
         });
         commandResults.set(commandKey(envelope), ack);
         return ack;
       }
       case "stop": {
         const run = session.run;
-        // 压缩进行中按停止 = 中断压缩（marker 如实收 cancelled，历史不动，退回兜底截断），
+        // 压缩进行中按停止 = 中断压缩（marker 如实收 cancelled，摘要水位不变），
         // 不是"停对话"——0.7.4：stop 对 compactRun 同样有效，绝不出现"停止键按不动"。
         if (!run) {
           if (session.compactRun) {
@@ -3591,6 +4271,10 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   return {
     // ── 握手 ──
+    isSessionRunning(sessionId: string): boolean {
+      const session = sessions.get(sessionId);
+      return Boolean(session?.run || session?.compactRun);
+    },
     async helloConversationV4(): Promise<HelloMessage> {
       const capabilities: HostCapabilities = {
         nativeDialogs: false,
@@ -3711,12 +4395,62 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           revisionAtDecision: 0,
         };
       }
+      // 幂等命中不能跳过归属校验，否则另一个工作区能拿到旧命令的成功回执。
+      if (validated.envelope.sessionId) sessionOrRestore(validated.envelope.sessionId, params.workspacePath);
       const key = commandKey(validated.envelope);
       const cached = commandResults.get(key);
       if (cached) {
+        if (!validated.envelope.sessionId && cached.result?.type === "createSession") {
+          sessionOrRestore(cached.result.sessionId, params.workspacePath);
+        }
         return { ...cached, status: "duplicate", commandId: params.envelope.commandId };
       }
       return executeCommand(params.workspacePath, validated.envelope);
+    },
+
+    async attachmentBeginV4(params: { workspacePath: string; sessionId: string; uploadId: string; fileName: string; mime: string; totalBytes: number; totalChunks: number; checksum: string }) {
+      requireHandshake();
+      const session = sessions.get(params.sessionId) ?? restoreSession(params.sessionId, params.workspacePath);
+      if (!session) throw new Error("附件会话不存在或不属于当前工作区");
+      assertSessionWorkspace(params.sessionId, session.workspacePath, params.workspacePath);
+      return attachments.begin(params);
+    },
+    async attachmentChunkV4(params: { workspacePath: string; sessionId: string; uploadId: string; chunkIndex: number; dataBase64: string }) {
+      requireHandshake();
+      const session = sessions.get(params.sessionId) ?? restoreSession(params.sessionId, params.workspacePath);
+      if (!session) throw new Error("附件会话不存在或不属于当前工作区");
+      assertSessionWorkspace(params.sessionId, session.workspacePath, params.workspacePath);
+      return attachments.chunk(params);
+    },
+    async attachmentCommitV4(params: { workspacePath: string; sessionId: string; uploadId: string }) {
+      requireHandshake();
+      const session = sessions.get(params.sessionId) ?? restoreSession(params.sessionId, params.workspacePath);
+      if (!session) throw new Error("附件会话不存在或不属于当前工作区");
+      assertSessionWorkspace(params.sessionId, session.workspacePath, params.workspacePath);
+      return attachments.commit(params);
+    },
+    async attachmentAbortV4(params: { workspacePath: string; sessionId: string; uploadId: string }) {
+      requireHandshake();
+      const session = sessions.get(params.sessionId) ?? restoreSession(params.sessionId, params.workspacePath);
+      if (!session) throw new Error("附件会话不存在或不属于当前工作区");
+      assertSessionWorkspace(params.sessionId, session.workspacePath, params.workspacePath);
+      attachments.abort(params);
+    },
+    async attachmentPreviewSourceV4() { return { kind: "chunked" as const }; },
+    async attachmentReadV4(params: { workspacePath: string; sessionId: string; ref: string; offset: number; limit: number; target?: { rowId: number; entityId: string }; attachmentIndex?: number }) {
+      requireHandshake();
+      const session = sessions.get(params.sessionId) ?? restoreSession(params.sessionId, params.workspacePath);
+      if (!session) throw new Error("附件会话不存在或不属于当前工作区");
+      assertSessionWorkspace(params.sessionId, session.workspacePath, params.workspacePath);
+      if ((params.target === undefined) !== (params.attachmentIndex === undefined)) throw new Error("附件读取目标不完整");
+      const row = params.target
+        ? session.rows.find((item) => item.rowId === params.target!.rowId && item.entityId === params.target!.entityId)
+        : undefined;
+      const ref = params.target
+        ? row?.kind === "userInput" ? row.attachments?.[params.attachmentIndex!] : undefined
+        : session.rows.flatMap((item) => item.kind === "userInput" ? item.attachments ?? [] : []).find((item) => item.ref === params.ref);
+      if (!ref || ref.ref !== params.ref) throw new Error("附件不属于当前会话消息");
+      return attachments.read(params.sessionId, ref, params.offset, params.limit);
     },
 
     async queryConversationCommandsV4(params: {
@@ -3909,13 +4643,17 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
 
     disposeAll(): void {
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", checkpointOnBackground);
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = null;
       pendingDeltas.clear();
       for (const session of sessions.values()) {
+        if (session.run) persistSession(session);
         session.run?.abort.abort();
         session.compactRun?.abort.abort();
       }
+      for (const timer of checkpointTimers.values()) clearTimeout(timer);
+      checkpointTimers.clear();
       subscriptions.clear();
       indexSubs.clear();
       configSubs.clear();
@@ -3957,7 +4695,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
  */
 function usageState(session: MobileSession): ConversationSnapshot["usage"] {
   return {
-    contextWindow: null,
+    contextWindow: session.contextWindow ? {
+      usedTokens: session.contextUsedTokens ?? session.lastPromptTokens ?? 0,
+      maxTokens: session.contextWindow,
+      autoCompactThresholdTokens: null,
+    } : null,
     cumulative: {
       inputTokens: session.cumulative.inputTokens,
       outputTokens: session.cumulative.outputTokens,

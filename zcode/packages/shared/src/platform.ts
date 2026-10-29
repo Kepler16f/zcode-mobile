@@ -239,6 +239,8 @@ export interface OpenInEditorOptions {
 export interface CreateTempTextAttachmentRequest {
   text: string;
   filename?: string;
+  /** 移动端附件必须归属发起时的工作区，桌面仍可使用系统临时目录。 */
+  workspacePath?: string;
 }
 
 export interface CreateTempTextAttachmentResult {
@@ -527,6 +529,20 @@ export type CuaOsSupport =
  * 业务服务（文件、终端、凭据等）走 IServiceAccessor 的 RPC 通道。
  */
 export interface IPlatformService {
+  /**
+   * 宿主是否支持在后台线程里做语法高亮。
+   * 桌面与 Web 为 true；手机端为 false —— 高亮器（含 oniguruma wasm）一旦在启动期
+   * 初始化，会在主线程编译 WASM 并最多拉起 4 个 Worker，装机表现是"一打开就卡住"。
+   * 端侧改为惰性：等用户真的打开代码块时才在主线程建一次高亮器。
+   */
+  supportsBackgroundHighlighting?: boolean;
+  supportsPortraitSideDrawer?: boolean;
+  supportsProjectMemory?: boolean;
+  getMobileClientCompatibility?(): Promise<{desktopVersion:string;defaultVersion:string;appVersion:string}>;
+  setMobileDesktopVersion?(version:string): Promise<void>;
+  upgradeLegacyLocalWorkspaces?(): Promise<{migrated:number;needsStoragePermission:boolean}>;
+  /** 宿主支持在运行中立即更新工具审批模式。 */
+  supportsLiveExecutionMode?: boolean;
   /** 当前平台的文件选择框是否能返回 agent 可访问的本地绝对路径 */
   canSelectFilePath?: boolean;
 

@@ -18,17 +18,33 @@ import java.util.concurrent.TimeUnit
  *     把用户输入拼进 `sh -c` 就等于让模型的一句话决定设备上跑什么。
  *  2. stdout 与 stderr 必须并发读。顺序读会死锁：管道缓冲区（Linux 默认 64 KB）满了之后
  *     子进程阻塞在写，父进程还阻塞在读另一条流上，两边都不放手，表现为"命令挂死"。
- *  3. 同步通道被 JS 占住就没有中途取消：@JavascriptInterface 是阻塞调用，取消只能等
- *     timeoutMs 到。这里如实回 timedOut，不假装能中断。
+ *  3. 长命令在后台任务中执行，轮询只传任务 ID；取消由任务所有者结束正在运行的进程。
  */
 class ExecBridge(private val context: Context) {
+    private val jobs = AsyncBridgeJobs()
 
     @JavascriptInterface
-    fun exec(request: String): String {
+    fun start(request: String): String = jobs.start { job -> execute(request, job) }
+
+    @JavascriptInterface
+    fun poll(id: String): String = jobs.poll(id)
+
+    @JavascriptInterface
+    fun cancel(id: String): Boolean = jobs.cancel(id)
+
+    fun cancelAll() = jobs.cancelAll()
+
+    /** 旧版自检继续使用同步入口；应用会优先使用 start/poll/cancel。 */
+    @JavascriptInterface
+    fun exec(request: String): String = execute(request, null)
+
+    private fun execute(request: String, job: AsyncBridgeJobs.Job?): String {
         val started = System.currentTimeMillis()
-        val json = JSONObject(request)
-        val timeoutMs = json.optLong("timeoutMs", DEFAULT_TIMEOUT_MS)
-        val maxBytes = json.optInt("maxOutputBytes", DEFAULT_MAX_OUTPUT_BYTES)
+        val json = try { JSONObject(request) } catch (e: Exception) {
+            return errorPayload("${e.javaClass.simpleName}: ${e.message}", started)
+        }
+        val timeoutMs = json.optLong("timeoutMs", DEFAULT_TIMEOUT_MS).coerceAtLeast(1)
+        val maxBytes = json.optInt("maxOutputBytes", DEFAULT_MAX_OUTPUT_BYTES).coerceIn(0, 2_000_000)
 
         val builder = try {
             if (json.optBoolean("useShell")) {
@@ -45,7 +61,9 @@ class ExecBridge(private val context: Context) {
         }
 
         val cwdPath = json.optString("cwd")
-        val cwd = if (cwdPath.isNotEmpty()) workspaceFile(cwdPath) else null
+        val cwd = try { if (cwdPath.isNotEmpty()) workspaceFile(cwdPath) else null } catch (e: Exception) {
+            return errorPayload("${e.javaClass.simpleName}: ${e.message}", started)
+        }
         if (cwd != null) {
             if (!cwd.isDirectory) return errorPayload("工作目录不存在：${cwd.absolutePath}", started)
             builder.directory(cwd)
@@ -57,6 +75,7 @@ class ExecBridge(private val context: Context) {
             }
         }
 
+        if (job?.cancelled?.get() == true) return cancelledPayload(started)
         val process = try {
             builder.start()
         } catch (e: Exception) {
@@ -64,26 +83,29 @@ class ExecBridge(private val context: Context) {
             return errorPayload("${e.javaClass.simpleName}: ${e.message}", started)
         }
 
-        val stdin = json.optString("stdin").takeIf { it.isNotEmpty() }
-        if (stdin != null) {
+        job?.onCancel { process.destroyForcibly() }
+        // 先读两条输出，再异步写 stdin；否则子进程输出填满管道时父进程可能卡在写入，
+        // 连 waitFor 的超时都到不了。未提供 stdin 也必须关闭，通知子进程收到 EOF。
+        val out = readStreamAsync(process.inputStream, maxBytes)
+        val err = readStreamAsync(process.errorStream, maxBytes)
+        val stdin = json.optString("stdin", "")
+        Thread {
             try {
                 process.outputStream.use { it.write(stdin.toByteArray()) }
             } catch (_: Exception) {
                 /* 子进程没读 stdin 就退出，写会断管；退出码才是结论。 */
             }
-        }
-
-        // 并发抽两条流：见类注释第 2 条。
-        val out = readStreamAsync(process.inputStream, maxBytes)
-        val err = readStreamAsync(process.errorStream, maxBytes)
+        }.apply { isDaemon = true; start() }
         val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
         if (!finished) process.destroyForcibly()
+        val cancelled = job?.cancelled?.get() == true
 
         val stdout = awaitCapture(out)
         val stderr = awaitCapture(err)
         return JSONObject()
             .put("exitCode", if (finished) process.exitValue() else -1)
-            .put("timedOut", !finished)
+            .put("timedOut", !finished && !cancelled)
+            .put("cancelled", cancelled)
             .put("stdout", stdout.text)
             .put("stderr", stderr.text)
             .put("stdoutBytes", stdout.bytes)
@@ -164,6 +186,10 @@ class ExecBridge(private val context: Context) {
             .put("stderr", message)
             .put("durationMs", System.currentTimeMillis() - started)
             .toString()
+
+    private fun cancelledPayload(started: Long): String =
+        JSONObject().put("exitCode", -1).put("cancelled", true).put("timedOut", false)
+            .put("stdout", "").put("stderr", "").put("durationMs", System.currentTimeMillis() - started).toString()
 
     private companion object {
         const val DEFAULT_TIMEOUT_MS = 60_000L

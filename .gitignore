@@ -6,6 +6,7 @@ tmp/
 tmp-core.cjs
 tmp-core.mjs
 mobile-runtime/build/dist-ui/
+mobile-runtime/build/dist/
 mobile-runtime/build/.tmp-*
 android-app/app/build/
 android-app/.gradle/
@@ -19,3 +20,8 @@ zcode/coverage/
 *.tsbuildinfo
 *.jks
 *.keystore
+mobile-runtime/build/.mobile-build-fingerprint.json
+*.apk
+*.aab
+*.p12
+local.properties

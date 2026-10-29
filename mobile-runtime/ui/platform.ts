@@ -5,6 +5,11 @@
 // 工作区选择用服务端目录浏览器（本来就是端侧 vfs）。其余保持同样的显式"不支持"措辞。
 import type { IPlatformService, RemoteTarget } from "@zcode/shared";
 import { traceOAuthEvent } from "./oauth-trace.js";
+import * as workspaceFs from "../compat/vfs.mjs";
+import { createMobileFileSystemPort } from "../ports/file-system.mjs";
+import { ZCODE_VERSION } from "@zcode/shared";
+import { desktopCompatibilityVersion, setDesktopCompatibilityVersion } from "./server-compat.js";
+import { workspaceAliases } from "../compat/workspace-aliases.mjs";
 
 type DeviceBridge = { openExternal?(url: string): string } | undefined;
 
@@ -12,10 +17,10 @@ type DeviceBridge = { openExternal?(url: string): string } | undefined;
 type OAuthLinkBridge = { take?(): string; stats?(): string } | undefined;
 
 /** WorkspaceBridge.kt：pickDirectory() 同步回"已发出"，路径晚一步经 __zcodeWorkspacePicked 推回来。 */
-type WorkspaceBridge = { pickDirectory?(): string } | undefined;
+type WorkspaceBridge = { pickDirectory?(requestId: string): string; cancelDirectory?(requestId: string): void } | undefined;
 
 function workspaceBridge(): WorkspaceBridge {
-  const b = (globalThis as { zcodeWorkspace?: { pickDirectory?(): string } }).zcodeWorkspace;
+  const b = (globalThis as { zcodeWorkspace?: NonNullable<WorkspaceBridge> }).zcodeWorkspace;
   return b && typeof b.pickDirectory === "function" ? b : undefined;
 }
 
@@ -26,28 +31,34 @@ function workspaceBridge(): WorkspaceBridge {
  * 回调有丢失的可能（用户在系统选择器开着时切去自检页/进程被杀）——那条 Promise 绝不能悬着，
  * "打开工作区"按钮会永久转圈：超时 5 分钟如实当取消，与 FileChooser 的 ValueCallback 同一条纪律。
  */
+let directoryPick: Promise<string | null> | null = null;
+let directoryPickSerial = 0;
 function pickDirectoryViaBridge(): Promise<string | null> {
+  if (directoryPick) return directoryPick;
   const b = workspaceBridge();
   if (!b) return Promise.resolve(null);
-  return new Promise<string | null>((resolve) => {
+  const requestId = `directory-${Date.now()}-${++directoryPickSerial}`;
+  directoryPick = new Promise<string | null>((resolve) => {
     let settled = false;
-    const host = globalThis as { __zcodeWorkspacePicked?: (v: string | null) => void };
-    const finish = (value: string | null) => {
+    const host = globalThis as { __zcodeWorkspacePicked?: (v: string | null, requestId?: string) => void };
+    const finish = (value: string | null, responseId?: string) => {
+      if (responseId !== undefined && responseId !== requestId) return;
       if (settled) return;
       settled = true;
       if (host.__zcodeWorkspacePicked === finish) delete host.__zcodeWorkspacePicked;
       clearTimeout(timer);
       resolve(value);
     };
-    const timer = setTimeout(() => finish(null), PICKER_TIMEOUT_MS);
+    const timer = setTimeout(() => { b.cancelDirectory?.(requestId); finish(null); }, PICKER_TIMEOUT_MS);
     host.__zcodeWorkspacePicked = finish;
     try {
-      const res = JSON.parse(String(b.pickDirectory?.() ?? "{}"));
+      const res = JSON.parse(String(b.pickDirectory?.(requestId) ?? "{}"));
       if (res.started !== true) finish(null);
     } catch {
       finish(null);
     }
-  });
+  }).finally(() => { directoryPick = null; });
+  return directoryPick;
 }
 
 const PICKER_TIMEOUT_MS = 5 * 60_000;
@@ -65,31 +76,6 @@ function deviceBridge(): DeviceBridge {
 /** 原生侧上报"这次调用没做成"时给出的显式原因，别让 UI 看到 undefined。 */
 function bridgeUnavailable(what: string) {
   return Promise.resolve({ success: false, error: `端侧外壳未提供 ${what}（原生桥缺失，不是权限问题）` });
-}
-
-/**
- * 往工作区写一个文本文件，返回 vfs 的虚拟绝对路径。
- *
- * 为什么落 `/work/.zcode/` 而不是桌面临时目录：桌面把长粘贴写到 OS temp（`homedir` 之外），
- * 端侧唯一被 Agent 看得见、且重启还在的树就是 vfs 根，`/work` 之外一律 permission_denied。
- * 写在这里的附件和会话库同一棵树，Agent 用 `Read` 就能读到 —— 不需要再走一遍上传。
- */
-function writeWorkspaceText(virtualPath: string, text: string): { path: string; sizeBytes: number } {
-  const b = (globalThis as { zcodeFs?: { call(request: string): string } }).zcodeFs;
-  if (!b || typeof b.call !== "function") {
-    throw new Error("端侧没有文件桥（zcodeFs），写不了工作区文件");
-  }
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  // 分片转 binary：单片 String.fromCharCode(...bytes) 在几 MB 时会把参数栈撑爆。
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  const res = JSON.parse(
-    b.call(JSON.stringify({ op: "write", path: virtualPath, base64: btoa(binary), createParents: true })),
-  ) as { ok?: boolean; path?: string; code?: string; message?: string };
-  if (!res.ok) throw new Error(res.message ?? res.code ?? "写入失败");
-  return { path: res.path ?? virtualPath, sizeBytes: bytes.length };
 }
 
 /** 附件文件名要能在同一目录里共存，但不能带用户粘贴内容里的路径分隔符。 */
@@ -148,6 +134,23 @@ export function createMobilePlatform(): IPlatformService {
   };
 
   return {
+    supportsLiveExecutionMode: true,
+    // 手机端没有后台线程高亮：启动期建池会在主线程编译 WASM 并拉起多个 Worker，
+    // 装机表现是打开应用就卡住。端侧改成惰性高亮（第一次打开代码块才建）。
+    supportsBackgroundHighlighting: false,
+    supportsPortraitSideDrawer: true,
+    supportsProjectMemory: true,
+    getMobileClientCompatibility: async () => {
+      let appVersion="";
+      try {appVersion=JSON.parse((globalThis as {zcodeDevice?:{deviceInfo?():string}}).zcodeDevice?.deviceInfo?.()??"{}").appVersion??"";} catch {}
+      return {desktopVersion:desktopCompatibilityVersion(""),defaultVersion:ZCODE_VERSION,appVersion};
+    },
+    setMobileDesktopVersion: async version => {setDesktopCompatibilityVersion(version.trim());},
+    upgradeLegacyLocalWorkspaces: async () => {
+      const device=(globalThis as {zcodeDevice?:{allFilesGranted?():boolean;openAllFilesPermission?():string}}).zcodeDevice;
+      if (device?.allFilesGranted?.() === false) {device.openAllFilesPermission?.();return {migrated:0,needsStoragePermission:true};}
+      return {migrated:Object.keys(workspaceAliases(true)).length,needsStoragePermission:false};
+    },
     canSelectFilePath: false,
     // 工作区选择（0.3.7）：系统文件管理器（DocumentsUI 的 OPEN_DOCUMENT_TREE）。返回的是
     // SAF 树在 vfs 里的挂载点（`/mnt/<文件夹名>`），读写经 zcodeTree（TreeBridge.kt）派发。
@@ -167,18 +170,22 @@ export function createMobilePlatform(): IPlatformService {
     getPathForFile: () => null,
     // 长粘贴（≥15k 字符）落成真文件再按路径发，桌面走 OS temp；端侧写进工作区，
     // 于是粘贴进来的日志在手机上重启后还在、Agent 也能直接 Read 到。
-    createTempTextAttachment: (payload) => {
+    createTempTextAttachment: async (payload) => {
       try {
         const name = safeAttachmentName(payload.filename ?? `pasted-${Date.now()}.txt`);
-        const written = writeWorkspaceText(`/work/.zcode/attachments/${name}`, payload.text);
+        const root = payload.workspacePath?.trim().replace(/\/+$/, "");
+        if (!root || !root.startsWith("/")) throw new Error("未指定附件所属工作区");
+        // 附件使用发起粘贴时的路径，避免切换工作区后仍写到固定 /work。
+        const port = createMobileFileSystemPort(workspaceFs, { workspaceRoot: root });
+        const written = await port.writeTextFile({ path: `.zcode/attachments/${Date.now()}-${name}`, content: payload.text });
         return Promise.resolve({
           filename: name,
           localPath: written.path,
           mimeType: "text/plain",
-          sizeBytes: written.sizeBytes,
+          sizeBytes: written.bytesWritten,
         });
       } catch (e) {
-        // 显式抛出去：UI 的粘贴分支会退回"整段文本内联"，而不是悄悄丢掉用户粘贴的内容。
+        // 显式抛出去，让粘贴分支展示失败原因，避免返回不存在的附件路径。
         return Promise.reject(new Error(`端侧长粘贴临时文件写失败：${String((e as Error)?.message ?? e)}`));
       }
     },
@@ -198,12 +205,12 @@ export function createMobilePlatform(): IPlatformService {
     listWSLDistros: () => Promise.resolve([]),
     listDockerContainers: () => Promise.resolve([]),
     listSSHConfigAliases: () => Promise.resolve([]),
-    // MCP 配置的落点由 mcpSyncService 决定（端侧 vfs），外壳不再另存一份用户目录副本。
-    loadMcpFromUserDirectory: () => Promise.resolve({ servers: [] }),
+    // 旧平台 fallback 也必须明确失败，不能绕过服务边界伪造“没有 MCP 配置”。
+    loadMcpFromUserDirectory: () => Promise.reject(new Error("移动端尚未接入 MCP 运行时，无法加载配置。")),
     saveMcpToUserDirectory: () =>
-      Promise.resolve({ success: false, error: "端侧 MCP 配置由 mcpSyncService 拥有" }),
+      Promise.resolve({ success: false, error: "移动端尚未接入 MCP 运行时，无法保存配置。" }),
     migrateLegacyCommonMcp: () =>
-      Promise.resolve({ servers: {}, totalCount: 0, importedCount: 0, skippedCount: 0 }),
+      Promise.reject(new Error("移动端尚未接入 MCP 运行时，无法迁移配置。")),
     openExternal: (url) => {
       const bridge = deviceBridge();
       if (bridge) {

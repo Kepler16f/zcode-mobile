@@ -161,8 +161,13 @@ export function createMobileWindowControllerService(options: {
   taskIndexRepo: TaskListReader;
   taskIndexSyncer: TaskIndexBroadcaster;
   onDiagnostic?: (message: string) => void;
+  isSessionRunning?: (sessionId: string) => boolean;
 }) {
   const say = (message: string) => options.onDiagnostic?.(message);
+  const visibleTask = (meta: ZCodeTaskMeta) => !meta.taskId.startsWith("mobile-subagent-");
+  // 数据库running只代表退出前的一拍，当前运行权威是本进程中的任务。
+  const currentMeta = (meta: ZCodeTaskMeta): ZCodeTaskMeta => meta.status === "running" &&
+    options.isSessionRunning && !options.isSessionRunning(meta.taskId) ? {...meta,status:undefined} : meta;
   const frameEmitter = new Emitter<WindowHostControllerFrame>();
   // 订阅 id → 它订的那个 topic。值类型写成协议联合（与下面 topicStates 同一个理由）：
   // resyncControllerV4 拿到的 topic 要直接投给 sendSnapshot / topicStates，
@@ -187,11 +192,12 @@ export function createMobileWindowControllerService(options: {
     const result = await options.taskIndexRepo.queryTaskList({
       // "active" = 只排除 archived；端侧没有归档，等价于该 workspace 的全部行。
       kind: "active",
+      excludeTaskIdPrefix: "mobile-subagent-",
       workspaceScopes: [scope],
       sortBy: "updated",
       provider: ZCODE_AGENT_PROVIDER,
     });
-    return result.items.map((m) => rowOf(m));
+    return result.items.filter(visibleTask).map((m) => rowOf(currentMeta(m)));
   }
 
   function publishDeltas(
@@ -314,8 +320,9 @@ export function createMobileWindowControllerService(options: {
       options.taskIndexSyncer.onDynamicWorkspaceEvent(scope)((event) => {
         if (event.type !== "workspace_task_list_changed") return;
         if (event.taskMeta) {
+          if (!visibleTask(event.taskMeta)) return;
           publishDeltas(CONTROLLER_TASKS_INDEX_TOPIC, [
-            { op: "task.upserted", task: rowOf(event.taskMeta, membershipOf(event.reason)) },
+            { op: "task.upserted", task: rowOf(currentMeta(event.taskMeta), membershipOf(event.reason)) },
           ]);
           sidebarDelta("upserted");
           say(
@@ -351,9 +358,10 @@ export function createMobileWindowControllerService(options: {
       for (const scope of params.workspaceScopes) watchScope(scope);
       const result = await options.taskIndexRepo.queryTaskList({
         ...params,
+        excludeTaskIdPrefix: "mobile-subagent-",
         provider: ZCODE_AGENT_PROVIDER,
       });
-      const items = result.items.map((item) => ({
+      const items = result.items.filter(visibleTask).map(currentMeta).map((item) => ({
         ...item,
         sourceAvailability: "online" as const,
         liveStatus: liveStatusFromMeta(item),

@@ -45,6 +45,7 @@ const serviceLog = createServiceLogger("oauthService");
 interface PendingState {
   state: string;
   provider: OAuthProviderId;
+  expiresAt: number;
   timeout: NodeJS.Timeout;
   phase: "awaiting-attribution-or-code" | "awaiting-code-after-attribution";
   completionPromise?: Promise<OAuthCallbackResult | null>;
@@ -56,6 +57,16 @@ interface PendingState {
     pollToken: string;
     pollUrl: string;
   };
+}
+
+/** 仅供受信任宿主加密保存；不包含计时器及兑换结果。 */
+export interface PendingOAuthSnapshot {
+  version: 1;
+  state: string;
+  provider: OAuthProviderId;
+  expiresAt: number;
+  phase: PendingState["phase"];
+  polling?: { flowId: string; pollIntervalMs: number; pollToken: string };
 }
 
 interface OAuthFlowEnvelope {
@@ -591,6 +602,58 @@ export class OAuthService implements IOAuthService {
     return this.startOAuthInternal(provider);
   }
 
+  /** 持久化由宿主负责；本服务仍是待完成事务的唯一所有者。 */
+  exportPendingOAuth(): PendingOAuthSnapshot | null {
+    const pending = this.pendingState;
+    if (!pending || this.now() >= pending.expiresAt) return null;
+    return {
+      version: 1,
+      state: pending.state,
+      provider: pending.provider,
+      expiresAt: pending.expiresAt,
+      phase: pending.phase,
+      ...(pending.polling ? { polling: {
+        flowId: pending.polling.flowId,
+        pollIntervalMs: pending.polling.pollIntervalMs,
+        pollToken: pending.polling.pollToken,
+      } } : {}),
+    };
+  }
+
+  /** 从可信宿主的加密存储恢复；过期、异常或已被新流程替换的快照必须拒绝。 */
+  restorePendingOAuth(value: unknown): boolean {
+    if (this.pendingState || !isUnknownRecord(value)) return false;
+    const { version, state, provider, expiresAt, phase, polling } = value;
+    const adapter = typeof provider === "string" ? this.adapters.get(provider) : undefined;
+    const remaining = typeof expiresAt === "number" ? expiresAt - this.now() : NaN;
+    if (version !== 1 || typeof state !== "string" || !state.trim() || state.length > 1024 ||
+        !adapter?.meta.enabled || !Number.isFinite(remaining) || remaining <= 0 ||
+        remaining > OAUTH_TIMEOUT_MS ||
+        (phase !== "awaiting-attribution-or-code" && phase !== "awaiting-code-after-attribution")) return false;
+    let restoredPolling: PendingState["polling"];
+    if (polling !== undefined) {
+      if (!isUnknownRecord(polling) || typeof polling.flowId !== "string" || !polling.flowId.trim() ||
+          polling.flowId.length > 512 || typeof polling.pollToken !== "string" ||
+          !/^[0-9a-f]{64}$/i.test(polling.pollToken) || typeof polling.pollIntervalMs !== "number" ||
+          !Number.isFinite(polling.pollIntervalMs) || polling.pollIntervalMs < 1_000 ||
+          polling.pollIntervalMs > OAUTH_TIMEOUT_MS) return false;
+      restoredPolling = {
+        expiresAt: expiresAt as number,
+        flowId: polling.flowId,
+        nextPollAt: this.now(),
+        pollIntervalMs: polling.pollIntervalMs,
+        pollToken: polling.pollToken,
+        // 修复原因：不能信任落盘快照中的 URL，否则轮询令牌可能被发送到任意域名。
+        pollUrl: buildZCodeApiUrlFromEnv(this.env, `/api/v1/oauth/cli/poll/${encodeURIComponent(polling.flowId)}`),
+      };
+    }
+    const timeout = setTimeout(() => {
+      if (this.pendingState?.state === state) this.clearPendingState();
+    }, remaining);
+    this.pendingState = { state, provider: adapter.providerId, expiresAt: expiresAt as number, timeout, phase, ...(restoredPolling ? { polling: restoredPolling } : {}) };
+    return true;
+  }
+
   async startOAuthWithPolling(provider: OAuthProviderId): Promise<OAuthStartResponse> {
     if (provider !== ZAI_PROVIDER_ID && provider !== BIGMODEL_PROVIDER_ID) {
       return this.startOAuthInternal(provider);
@@ -675,6 +738,7 @@ export class OAuthService implements IOAuthService {
     this.pendingState = {
       state,
       provider: adapter.providerId,
+      expiresAt: this.now() + timeoutMs,
       timeout,
       phase: "awaiting-attribution-or-code",
       polling: {
@@ -845,6 +909,7 @@ export class OAuthService implements IOAuthService {
     this.pendingState = {
       state,
       provider: adapter.providerId,
+      expiresAt: this.now() + OAUTH_TIMEOUT_MS,
       timeout,
       phase: "awaiting-attribution-or-code",
     };
@@ -896,7 +961,7 @@ export class OAuthService implements IOAuthService {
     if (!state || state !== pending.state) {
       throw new Error("OAuth state 不匹配或已过期");
     }
-    if (pending.polling && this.now() >= pending.polling.expiresAt) {
+    if (this.now() >= pending.expiresAt) {
       this.clearPendingState();
       throw new Error("OAuth flow 已过期");
     }

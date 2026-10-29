@@ -20,6 +20,7 @@ import { GIT_ACTIONS, makeGitTool } from "./git-tool.js";
 import { sanitizeToolArguments } from "./tool-sanitize.js";
 import { browserControlEnabled, BROWSER_CONTROL_EVENT } from "./plugins-mobile.js";
 import { makeFetchTool } from "./fetch-tool.js";
+import { callNativeJob, hasNativeJobs } from "../ports/native-async.mjs";
 
 /** 移动端开哪些工具。
  *  文件五件套（Read/Write/Edit/Glob/Grep）：只读写 app 私有工作区，越界由端口 guard 拒——工作区内自动放行。
@@ -34,6 +35,7 @@ const BROWSER_TOOL = "Browser";
 
 /** core bundle 的运行时位置：相对 entry.js（assets/ui/）→ assets/mobile/dist/zcode-core.mobile.js。 */
 const CORE_BUNDLE_HREF = "../mobile/dist/zcode-core.mobile.js";
+import { localWorkspacePath } from "../compat/workspace-aliases.mjs";
 
 /** 工具结果回给模型的截断上限：单次 Grep 全文命中能到几百 KB，原样喂回去会把下一轮请求撑爆。 */
 export const TOOL_RESULT_MAX_CHARS = 20_000;
@@ -63,7 +65,7 @@ export interface ToolEngine {
   tools: ModelToolSpec[];
   /** 哪些调用需要用户点头才能执行（Bash 是唯一一个；审批闸在 agent 的循环里，见 runTurn）。 */
   approvalRequired: (toolName: string) => boolean;
-  execute: (call: ModelToolCall) => Promise<ToolRunResult>;
+  execute: (call: ModelToolCall, signal?: AbortSignal) => Promise<ToolRunResult>;
   /** 0.5.0 沙箱授权（"读 sandbox 外的文件应先询问"）：全量文件端口挂在引擎上，
    *  agent 在审批通过后调 grantRoot，拒绝/用完即 revokeRoot。未装配引擎（null）时不存在。 */
   grantRoot: (path: string) => void;
@@ -71,7 +73,7 @@ export interface ToolEngine {
 }
 
 /** agent.ts 消费的形状：按 workspacePath 取（并缓存）一台引擎；null = 这台没工具。 */
-export type ToolEngineFactory = (workspacePath: string) => Promise<ToolEngine | null>;
+export type ToolEngineFactory = (workspacePath: string, sessionId?: string, signal?: AbortSignal) => Promise<ToolEngine | null>;
 
 /** core bundle 暴露的这一小片面（形状来自 build/entry.mjs 的再导出，不另起一份类型事实）。 */
 interface CoreLike {
@@ -126,12 +128,12 @@ interface CoreLike {
   createToolExecutor: (options: Record<string, unknown>) => {
     execute: (
       call: { id: string; name: string; input: Record<string, unknown> },
-      ctx: { traceContext: { traceId: string; spanId: string } },
+      ctx: { traceContext: { traceId: string; spanId: string }; signal?: AbortSignal },
     ) => Promise<Record<string, unknown>>;
   };
 }
 
-async function loadCoreFromAsset(): Promise<CoreLike | null> {
+export async function loadCoreFromAsset(): Promise<CoreLike | null> {
   try {
     const href = new URL(CORE_BUNDLE_HREF, import.meta.url).href;
     const mod = (await import(/* @vite-ignore */ href)) as { default?: CoreLike } & Partial<CoreLike>;
@@ -231,6 +233,7 @@ export function createToolEngineFactory(
   };
 
   const build = async (workspacePath: string): Promise<ToolEngine | null> => {
+    workspacePath = localWorkspacePath(workspacePath);
     const core = await coreOnce();
     if (!core) return null;
     try {
@@ -273,7 +276,7 @@ export function createToolEngineFactory(
             if (!rawPath) throw new Error("path 不能为空");
             // 路径归一与文件工具同一语义：相对路径按工作区根解析（vfs 的根就是 /work 或 /mnt/<名>）。
             const resolved = rawPath.startsWith("/") ? rawPath : `${workspacePath}/${rawPath}`;
-            core.vfs.rmSync(resolved, {
+            fileSystemPort.removePath({ path: resolved,
               recursive: input.recursive === true,
               force: false,
             });
@@ -314,12 +317,19 @@ export function createToolEngineFactory(
                 "内置浏览器：打开网页并读取页面内容（标题+正文纯文本）。用户能看见浏览器页面并随时自己操作。" +
                 "只支持 http/https。适合查资料/看文档/验证线上页面；登录态与工作区文件无关。",
             },
-            handler: async (raw: unknown) => {
+            handler: async (raw: unknown, context?: { signal?: AbortSignal }) => {
               const input = (raw ?? {}) as { action?: unknown; url?: unknown };
               const action = typeof input.action === "string" ? input.action : "";
-              const call = (fn: string, req?: unknown) => {
+              const call = async (fn: string, req?: unknown) => {
                 const api = (globalThis as { zcodeBrowser?: Record<string, (r?: unknown) => string> }).zcodeBrowser;
                 if (!api || typeof api[fn] !== "function") throw new Error(`浏览器桥不可用（${fn}）`);
+                // 即使调用者是 async，直接调用同步 JavaInterface 仍会冻结 JS。
+                // 页面加载/读取等待放到原生任务线程，UI 只短轮询状态。
+                if (hasNativeJobs(api)) {
+                  const args = typeof req === "string" ? JSON.parse(req) : {};
+                  const result = await callNativeJob(api, { ...args, action: fn }, context?.signal);
+                  return String(result.content ?? "");
+                }
                 return api[fn](typeof req === "string" ? req : undefined);
               };
               switch (action) {
@@ -345,7 +355,6 @@ export function createToolEngineFactory(
       // 内置网络下载（0.7.3，用户点名"内置 curl/wget 工具"）：等效 curl/wget，复用 0.6.7 的
       // 原生 HTTP 桥（bridgeHttpRaw，HttpURLConnection 代发、无 CORS 概念），落盘走 vfs（工作区内，
       // 越界仍由文件端口的授权闸拦）。不依赖 shell，只要有 HTTP 桥就注册（桌面 harness 桥不在就不声明）。
-      registry.register(makeFetchTool(workspacePath, core.vfs), { silentDuplicateWarnings: true });
       // 内置 git（0.6.1 起；0.6.2 扩到 SAF）：isomorphic-git（纯 JS）+ vfs 适配器。
       //  - /work 工作区：gitFs 走派发层（私有盘直通）。
       //  - /mnt/<名>（SAF）工作区：gitFs 走 **native 后端**——/mnt/<名> 的虚拟路径经
@@ -397,7 +406,12 @@ export function createToolEngineFactory(
       }) as {
         grantRoot?: (path: string) => void;
         revokeRoot?: (path: string) => void;
+        checkAccess: (path: string) => string;
+        removePath: (input: { path: string; recursive?: boolean; force?: boolean }) => unknown;
+        writeBinaryFile: (input: { path: string; content: Uint8Array; createParents?: boolean }) => Promise<{ path: string; bytesWritten: number }>;
       };
+      // 下载与文件工具共用同一个授权端口；直接访问 VFS 会绕过工作区边界。
+      registry.register(makeFetchTool(workspacePath, fileSystemPort), { silentDuplicateWarnings: true });
       const executionPort = execBridge && core.createMobileExecutionPort
         ? core.createMobileExecutionPort({ bridge: execBridge })
         : undefined;
@@ -451,7 +465,7 @@ export function createToolEngineFactory(
         // 沙箱授权口（0.5.0）：端口上确实挂了才暴露，没挂就如实 no-op（老 core bundle 兼容）。
         grantRoot: (path: string) => fileSystemPort.grantRoot?.(path),
         revokeRoot: (path: string) => fileSystemPort.revokeRoot?.(path),
-        execute: async (call) => {
+        execute: async (call, signal) => {
           let input: Record<string, unknown> = {};
           let parseError = "";
           // 隐形字符净化（0.6.8，装机"命令碎成一列竖排"）：GLM 系偶发把零宽/双向控制字符
@@ -482,6 +496,11 @@ export function createToolEngineFactory(
           // 的规则在物化落地后会把合法命令也误拦，这里按"是不是当前工作区挂载"分叉。
           const stageApi = core.vfs.stage;
           const stageMount = call.name === BASH_TOOL && stageApi ? stageApi.mountOf(workspacePath) : null;
+          if (call.name === BASH_TOOL && (workspacePath === "/mnt" || workspacePath.startsWith("/mnt/"))) {
+            // 旧镜像会跳过读取失败的文件，也不能检测其他应用并发修改；回写可能覆盖真实工作区。
+            const hint = "SAF 工作区暂不支持运行 Bash：镜像无法保证完整性和并发一致性。请改用本地文件夹，或使用文件工具直接访问此目录。";
+            return { content: hint, isError: true, errorCode: "mobile.safBashUnsafe", errorMessage: hint };
+          }
           if (call.name === BASH_TOOL) {
             const command = typeof input.command === "string" ? input.command : "";
             const mountRefRe = /(^|[\s"'(])\/mnt\/([^\s"'/;&|)]+)/g;
@@ -539,9 +558,9 @@ export function createToolEngineFactory(
                 "端侧 bash 没有 git 二进制（Android 沙箱不带版本控制工具）。git 操作请改用 **Git 工具**" +
                 // 动作清单从 git-tool 的单一事实源派生（0.7.6 装机"未知 action"案：别再手抄一份漂移清单）。
                 `（action: ${GIT_ACTIONS.join("/")}，纯 JS 实现；` +
-                (workspacePath.startsWith("/work")
-                  ? "私有盘工作区直跑）。"
-                  : "SAF 工作区会自动经终端镜像在私有盘上加速执行并回写工作区，首次较慢）。");
+                (stageMount
+                  ? "SAF 工作区暂不支持 Git，请使用本地文件夹）。"
+                  : "本地文件夹工作区直跑）。");
               return { content: hint, isError: true, errorCode: "mobile.bashGitUnavailable", errorMessage: hint };
             }
             if (/(?:^|[;&|]+\s*|\b(?:sudo|env)\s+)(?:apt|apt-get|dpkg|pkg|pacman|yum|dnf|brew|apk)\s/.test(command)) {
@@ -552,18 +571,36 @@ export function createToolEngineFactory(
               return { content: hint, isError: true, errorCode: "mobile.bashPackageManagerUnavailable", errorMessage: hint };
             }
           }
+          let stageWrittenBack = false;
+          const writeBackStage = async () => {
+            if (stageWrittenBack || !stageMount || !stageApi || !stageSnapshot) return;
+            stageWrittenBack = true;
+            try {
+              const wb = await stageApi.writeBackStaging(stageMount, stageSnapshot);
+              if (wb && wb.failed > 0) {
+                stageNotes.push(
+                  `回写告警：${wb.failed} 处改动未能写回工作区（${wb.errors.join("；")}）。` +
+                    "这些文件在终端镜像里已改，但文件工具读到的是未改版本。",
+                );
+              }
+            } catch (e) {
+              stageNotes.push(`回写告警：${String((e as Error)?.message ?? e)}`);
+            }
+          };
           try {
             const r = await executor.execute(
               { id: call.id || `tool-${Date.now().toString(36)}`, name: call.name, input },
-              { traceContext: { traceId: "mobile-agent", spanId: call.name } },
+              { traceContext: { traceId: "mobile-agent", spanId: call.name }, signal },
             );
+            // 失败命令也可能已写文件，不能因为 error 提前返回而丢失 SAF 镜像的修改。
+            await writeBackStage();
             // 回包映射照 m1-run 的实测形状：{error} 是执行器错误；content/output 双形状都见过。
             if (r?.error) {
               const err = r.error as { message?: string; code?: string; details?: unknown; context?: unknown };
               // zod 的 issues 数组藏在 error.context/details 里：只留 message 会把
               // "哪个字段哪一项不合法"的定位信息丢掉（0.4.5 排查 Write strict 拒载时正缺它）。
               const extra = (err?.details ?? err?.context) ? JSON.stringify(err.details ?? err.context).slice(0, 800) : "";
-              const message = (typeof r.error === "string" ? r.error : (err?.message ?? JSON.stringify(r.error))) + (extra ? ` :: ${extra}` : "");
+              const message = (typeof r.error === "string" ? r.error : (err?.message ?? JSON.stringify(r.error))) + (extra ? ` :: ${extra}` : "") + (stageNotes.length ? `\n\n${stageNotes.join("\n")}` : "");
               return {
                 content: `工具执行失败：${message}`,
                 isError: true,
@@ -575,20 +612,12 @@ export function createToolEngineFactory(
             let text = typeof content === "string" ? content : JSON.stringify(content);
             // 回写（物化工作区的另一半）：命令对镜像的改动落回 SAF。失败必须可见——"命令说改了、
             // 模型 Read 一看没变"这种半真状态比报错更难查（TreeBridge 侧的窄化清单同级纪律）。
-            if (stageMount && stageApi && stageSnapshot) {
-              const wb = await stageApi.writeBackStaging(stageMount, stageSnapshot);
-              if (wb && wb.failed > 0) {
-                stageNotes.push(
-                  `回写告警：${wb.failed} 处改动未能写回工作区（${wb.errors.join("；")}）。` +
-                    `这些文件在终端镜像里已改，但文件工具读到的是未改版本。`,
-                );
-              }
-            }
             if (stageNotes.length > 0) text = `${text || "（无输出）"}\n\n${stageNotes.join("\n")}`;
             // display 透传（0.7.3）：core 已算好的结构化展示载荷直接带回，agent 落进行卡的 output.display。
             return { content: text || "（无输出）", isError: false, display: (r as { display?: unknown }).display };
           } catch (e) {
-            const message = String((e as Error)?.message ?? e);
+            await writeBackStage();
+            const message = String((e as Error)?.message ?? e) + (stageNotes.length ? `\n\n${stageNotes.join("\n")}` : "");
             return { content: `工具执行异常：${message}`, isError: true, errorCode: "mobile.toolThrew", errorMessage: message.slice(0, 500) };
           }
         },
@@ -601,11 +630,13 @@ export function createToolEngineFactory(
     }
   };
 
-  return (workspacePath: string) => {
-    let engine = engines.get(workspacePath);
+  return (workspacePath: string, sessionId?: string) => {
+    // 永久目录授权和已读版本仅属于当前会话，不能通过工作区缓存泄漏给另一个会话。
+    const key = JSON.stringify([workspacePath, sessionId ?? "legacy"]);
+    let engine = engines.get(key);
     if (!engine) {
       engine = build(workspacePath);
-      engines.set(workspacePath, engine);
+      engines.set(key, engine);
     }
     return engine;
   };

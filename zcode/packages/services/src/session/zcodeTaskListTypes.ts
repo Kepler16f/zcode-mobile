@@ -15,6 +15,8 @@ export interface ZCodeTaskListQuery {
   sortBy: ZCodeTaskListSortBy;
   search?: string;
   limit?: number;
+  /** 平台内部子会话从查询阶段排除，保证分页与总数仍以可见任务计算。 */
+  excludeTaskIdPrefix?: string;
 }
 
 export type ZCodeTaskListItem = ZCodeTaskMeta & {

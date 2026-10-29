@@ -41,8 +41,28 @@
     <style>
       html, body, #root { height: 100%; margin: 0; }
       /* 兜底底色交给上面的首帧脚本按主题设；这里不写死深色，浅色主题才不会闪一屏黑。 */
-      /* 首屏之前的兜底：JS 起不来时屏幕上至少有一行字，而不是一个白框。 */
-      #booting { position: fixed; inset: 0; display: grid; place-items: center; color: #9a9a9a; font: 13px/1.6 ui-monospace, Consolas, monospace; }
+      /* 首屏之前的兜底：JS 起不来时屏幕上至少有一行字，而不是一个白框。
+         0.9.1：端侧首屏要解析 7MB 级的入口脚本并装配服务，真实手机上一两秒到七八秒不等。
+         空白等待会被当成"卡死"，所以这里给一个安静的启动态：呼吸点 + 阶段文案 +
+         不确定进度条。它只说明"还在动、在做哪一步"，不谎报进度百分比。 */
+      #booting { position: fixed; inset: 0; display: grid; place-items: center; z-index: 9999;
+        background: var(--color-background, #161616); color: #9a9a9a;
+        font: 13px/1.6 ui-monospace, Consolas, monospace; transition: opacity 220ms ease; }
+      #booting[hidden] { display: none; }
+      #booting.leaving { opacity: 0; pointer-events: none; }
+      .boot-wrap { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 0 24px; }
+      .boot-dot { width: 10px; height: 10px; border-radius: 50%; background: #7c7c7c;
+        animation: boot-breathe 1.4s ease-in-out infinite; }
+      @keyframes boot-breathe { 0%, 100% { opacity: .25; transform: scale(.75); } 50% { opacity: 1; transform: scale(1); } }
+      .boot-title { color: #d4d4d4; font-size: 14px; letter-spacing: .02em; }
+      .boot-step { min-height: 1.6em; font-size: 12px; opacity: .75; text-align: center; }
+      .boot-bar { width: 148px; height: 2px; border-radius: 2px; background: rgba(255,255,255,.12); overflow: hidden; }
+      .boot-bar > i { display: block; width: 40%; height: 100%; border-radius: 2px; background: rgba(255,255,255,.45);
+        animation: boot-slide 1.6s ease-in-out infinite; }
+      @keyframes boot-slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(320%); } }
+      @media (prefers-reduced-motion: reduce) {
+        .boot-dot, .boot-bar > i { animation: none; }
+      }
     </style>
     <script type="importmap">
       { "imports": { "typescript": "./shims/typescript-stub.js" } }
@@ -52,7 +72,14 @@
   </head>
   <body>
     <div id="root"></div>
-    <div id="booting">aZCode 端侧启动中…</div>
+    <div id="booting">
+      <div class="boot-wrap">
+        <div class="boot-dot" aria-hidden="true"></div>
+        <div class="boot-title">aZCode</div>
+        <div class="boot-step" id="boot-step">正在启动…</div>
+        <div class="boot-bar" aria-hidden="true"><i></i></div>
+      </div>
+    </div>
     <script type="module" src="./entry.js">
     </script>
     <script>

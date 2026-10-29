@@ -231,6 +231,8 @@ async function discoverFileAgents(params: {
         if (parsed.agent) {
           agents.push({
             ...parsed.agent,
+            // 工作区 profile 原来的 id 只有名称，导致同名项目共享状态。
+            id: root.scope === "workspace" ? workspaceAgentId(parsed.agent.id, params.workspacePath) : parsed.agent.id,
             projectPath: root.scope === "workspace" ? params.workspacePath : undefined,
           });
         }
@@ -284,7 +286,7 @@ function attachEnabledState(agents: AgentSummary[], state: AgentsStateFile): Age
   const disabledSet = new Set(state.disabledAgentIds);
   return agents.map((agent) => ({
     ...agent,
-    enabled: agent.scope === "user" ? !disabledSet.has(agent.id) : true,
+    enabled: agent.scope === "user" || agent.scope === "workspace" ? !disabledSet.has(agent.id) : true,
   }));
 }
 
@@ -540,6 +542,31 @@ function normalizeBuiltInSelectionOverrides(
   return result;
 }
 
+function workspaceAgentId(id: string, workspacePath: string): string {
+  return `${id}:workspace:${encodeURIComponent(resolve(workspacePath))}`;
+}
+
+async function assertAgentPath(rootPath: string, path: string, basePath: string): Promise<void> {
+  const root = resolve(rootPath);
+  const target = resolve(path);
+  const base = resolve(basePath);
+  const rel = relative(root, target);
+  const baseToTarget = relative(base, target);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel) || baseToTarget.startsWith("..") || isAbsolute(baseToTarget)) {
+    throw new Error("Subagent path is outside its authorized agent directory");
+  }
+  let current = base;
+  for (const segment of baseToTarget.split(/[\\/]/).filter(Boolean)) {
+    current = join(current, segment);
+    try {
+      const stat = await lstat(current);
+      if (stat.isSymbolicLink()) throw new Error(`Subagent path contains a symbolic link: ${current}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
 export function createSubagentsService(options?: SubagentsServiceOptions): ISubagentsService & {
   /** Host 启动 Agent 前的一次性存储导入，不暴露为 Renderer RPC。 */
   prepareRuntimeState(): Promise<void>;
@@ -548,6 +575,18 @@ export function createSubagentsService(options?: SubagentsServiceOptions): ISuba
   const storageOptions: SubagentsServiceOptions = {
     homeDir: options?.homeDir,
   };
+  // deleteAgent 的 RPC 没有 workspacePath；只接受本服务已发现或创建的身份和路径。
+  const knownAgents = new Map<string, AgentSummary>();
+  const remember = (agent: AgentSummary) => {
+    if (agent.source === "user" && (agent.scope === "workspace" || agent.scope === "user")) knownAgents.set(agent.id, agent);
+  };
+  async function guardProfile(agent: AgentSummary, path: string): Promise<void> {
+    const root = agent.scope === "workspace"
+      ? resolveWorkspaceSubagentRoot(requireWorkspacePath(agent.projectPath))
+      : await resolveUserSubagentRoot(storageOptions);
+    const base = agent.scope === "workspace" ? requireWorkspacePath(agent.projectPath) : dirname(root);
+    await assertAgentPath(root, path, base);
+  }
 
   return {
     async prepareRuntimeState() {
@@ -619,6 +658,7 @@ export function createSubagentsService(options?: SubagentsServiceOptions): ISuba
               ...pluginAgentDiscovery.runtimeAgents,
             ]);
       const agents = attachEnabledState(discoveredAgents, state);
+      agents.forEach(remember);
 
       return {
         agents,
@@ -710,7 +750,10 @@ export function createSubagentsService(options?: SubagentsServiceOptions): ISuba
           ? resolveWorkspaceSubagentRoot(requireWorkspacePath(params.workspacePath))
           : await resolveUserSubagentRoot(storageOptions);
       const filePath = join(agentDir, `${params.config.name.trim().toLowerCase()}.md`);
+      const base = scope === "workspace" ? requireWorkspacePath(params.workspacePath) : dirname(agentDir);
+      await assertAgentPath(agentDir, filePath, base);
       await mkdir(agentDir, { recursive: true });
+      await assertAgentPath(agentDir, filePath, base);
       if (await exists(filePath)) {
         throw new Error(`Agent file "${basename(filePath)}" already exists`);
       }
@@ -719,6 +762,7 @@ export function createSubagentsService(options?: SubagentsServiceOptions): ISuba
       const agent = parseSavedAgent(content, filePath, scope, params.workspacePath);
       // 先验证即将写入的 Markdown 可解析，避免 serializer 回归时把坏 profile 落盘。
       await writeFile(filePath, content, { encoding: "utf-8", flag: "wx" });
+      remember(agent);
       return { agent };
     },
 
@@ -732,6 +776,13 @@ export function createSubagentsService(options?: SubagentsServiceOptions): ISuba
           ? resolveWorkspaceSubagentRoot(requireWorkspacePath(params.workspacePath))
           : await resolveUserSubagentRoot(storageOptions);
       const filePath = join(agentDir, `${params.config.name.trim().toLowerCase()}.md`);
+      const existing = knownAgents.get(params.agentId);
+      if (!existing || existing.scope !== scope || !params.oldFilePath || resolve(existing.path) !== resolve(params.oldFilePath) ||
+          (scope === "workspace" && resolve(requireWorkspacePath(existing.projectPath)) !== resolve(requireWorkspacePath(params.workspacePath)))) {
+        throw new Error("Subagent identity or original path is not present in the current discovered list");
+      }
+      await guardProfile(existing, params.oldFilePath);
+      await guardProfile(existing, filePath);
       await mkdir(agentDir, { recursive: true });
 
       if (params.oldFilePath && params.oldFilePath !== filePath && (await exists(filePath))) {
@@ -748,11 +799,19 @@ export function createSubagentsService(options?: SubagentsServiceOptions): ISuba
       if (params.oldFilePath && params.oldFilePath !== filePath) {
         await rm(params.oldFilePath, { force: true });
       }
+      knownAgents.delete(params.agentId);
+      remember(agent);
       return { agent };
     },
 
     async deleteAgent(params: AgentDeleteParams): Promise<void> {
+      const agent = knownAgents.get(params.agentId);
+      if (!agent || resolve(agent.path) !== resolve(params.filePath)) {
+        throw new Error("Subagent identity or path is not present in the current discovered list");
+      }
+      await guardProfile(agent, params.filePath);
       await rm(params.filePath, { force: true });
+      knownAgents.delete(params.agentId);
 
       const state = await readAgentStateFile(storageOptions);
       const disabledSet = new Set(state.disabledAgentIds);
@@ -844,6 +903,7 @@ function parseSavedAgent(
   }
   return {
     ...parsed.agent,
+    id: scope === "workspace" ? workspaceAgentId(parsed.agent.id, requireWorkspacePath(workspacePath)) : parsed.agent.id,
     projectPath: scope === "workspace" ? workspacePath : undefined,
   };
 }

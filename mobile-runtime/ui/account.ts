@@ -162,6 +162,10 @@ export function createMobileAccountSource(options: {
   return {
     accountSource,
     resolveCodingPlanApiKey: async ({ providerId, family, forceRefresh }) => {
+      // Start Plan消费账号ZCode JWT，不签发Coding Plan API key。
+      if (isStartPlanModelProviderId(providerId)) {
+        return (await runtime.credentialRepo.loadTokenSet(family === "zai" ? ZAI_PROVIDER_ID : BIGMODEL_PROVIDER_ID))?.zcodeJwtToken ?? null;
+      }
       const accountIdentity = await runtime.loadAccountIdentity(family);
       // 没有身份 = 这个 family 根本没登录，返回 null 让上层给出"请先登录"，
       // 而不是拿 undefined 去调远端换取、再报一句看不懂的 HTTP 错。

@@ -1,4 +1,4 @@
-import { memo, useMemo } from "react";
+import { Activity, memo, useMemo } from "react";
 import type { MessageFileLinkTarget } from "@/components/ai-elements/message.js";
 import type { CodeViewerSource } from "@/lib/codeViewer.js";
 import type {
@@ -37,25 +37,27 @@ export const SubagentSessionSidePane = memo(function SubagentSessionSidePane({
   );
 
   return (
-    <V4PaneConversationProvider scope={scope}>
-      <SessionPane
-        paneId={tab.id}
-        sessionId={tab.childSessionId}
-        openTrigger="subagent"
-        rootSessionId={tab.rootSessionId}
-        readOnly
-        allowWorkspaceFileRewind
-        focused={focused}
-        telemetryVisible={focused}
-        workspacePath={tab.workspacePath}
-        workspaceIdentity={tab.workspaceIdentity}
-        remoteSessionId={tab.remoteSessionId}
-        onOpenBrowserUrl={onOpenBrowserUrl}
-        onOpenCodeViewer={onOpenCodeViewer}
-        onOpenFileLink={onOpenFileLink}
-        onOpenSubagentSession={onOpenSubagentSession}
-        onOpenBackgroundBash={onOpenBackgroundBash}
-      />
-    </V4PaneConversationProvider>
+    <Activity mode={focused ? "visible" : "hidden"}>
+      <V4PaneConversationProvider scope={scope}>
+        <SessionPane
+          paneId={tab.id}
+          sessionId={tab.childSessionId}
+          openTrigger="subagent"
+          rootSessionId={tab.rootSessionId}
+          readOnly
+          allowWorkspaceFileRewind
+          focused={focused}
+          telemetryVisible={focused}
+          workspacePath={tab.workspacePath}
+          workspaceIdentity={tab.workspaceIdentity}
+          remoteSessionId={tab.remoteSessionId}
+          onOpenBrowserUrl={onOpenBrowserUrl}
+          onOpenCodeViewer={onOpenCodeViewer}
+          onOpenFileLink={onOpenFileLink}
+          onOpenSubagentSession={onOpenSubagentSession}
+          onOpenBackgroundBash={onOpenBackgroundBash}
+        />
+      </V4PaneConversationProvider>
+    </Activity>
   );
 });

@@ -4,8 +4,10 @@
 //
 // 只走一条窄通道：zcodeExec.exec(JSON 字符串) → JSON 字符串。参数不经过 shell 拼接
 // （argv 形态在 Kotlin 侧直接 ProcessBuilder(list)），所以模型写什么参数都变不成另一条命令。
+import { callNativeJob, hasNativeJobs } from "./native-async.mjs";
+
 export function isNativeExecAvailable() {
-  return typeof globalThis.zcodeExec?.exec === "function";
+  return hasNativeJobs(globalThis.zcodeExec) || typeof globalThis.zcodeExec?.exec === "function";
 }
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -28,13 +30,17 @@ export function createNativeExecBridge() {
       if (request.env) payload.env = request.env;
       if (request.stdin) payload.stdin = request.stdin;
 
-      const result = JSON.parse(raw.exec(JSON.stringify(payload)));
+      // 新版桥在原生后台线程执行；旧版宿主保留同步调用，避免升级 JS 后旧壳立即失效。
+      const result = hasNativeJobs(raw)
+        ? await callNativeJob(raw, payload, request.signal)
+        : JSON.parse(raw.exec(JSON.stringify(payload)));
       if (result.error) throw new Error(result.error);
       return {
         stdout: result.stdout ?? "",
         stderr: result.stderr ?? "",
         exitCode: result.exitCode,
         timedOut: Boolean(result.timedOut),
+        cancelled: Boolean(result.cancelled),
         // 契约（contracts ExecutionResult.signal 与 BashOutputSchema.signal）都是 string **可选**，
         // 没有信号=键缺省；Kotlin 桥不报 signal，曾经这里硬编码 `signal: null`——core 的 toBashOutput
         // 把它原样搬进 Bash output，strict 的 BashOutputSchema.safeParse 就炸在 signal: null

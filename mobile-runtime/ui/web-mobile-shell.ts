@@ -112,7 +112,11 @@ let lastKey = "";
  * 桥不在（桌面 harness）时静默 no-op；状态只在变化时推（幂等，避免每帧空转）。
  */
 let lastPushedDrawerOpen: boolean | null = null;
+/** 右侧抽屉开合的缓存投影：观察器更新它，sync() 只读值，不再每帧查一次全文档。 */
+let sideDrawerOpen = false;
 function pushDrawerOpen(open: boolean): void {
+  // 右侧抽屉由sidePaneState拥有；原生返回只消费两侧抽屉是否可关闭的投影。
+  open = open || (!coveredBySettingsLayer() && sideDrawerOpen);
   if (lastPushedDrawerOpen === open) return;
   lastPushedDrawerOpen = open;
   try {
@@ -120,6 +124,12 @@ function pushDrawerOpen(open: boolean): void {
   } catch {
     // 桥调用失败不致命：返回键拦截退化成默认行为（退出），抽屉本身不受影响。
   }
+}
+
+/** 右侧抽屉的真实状态（面板用 aria-hidden 表达开关）。流式期 sync 每帧都会调它。 */
+function refreshSideDrawerState(): void {
+  sideDrawerOpen =
+    doc()?.querySelector('[data-testid="mobile-side-pane-drawer"][aria-hidden="false"]') != null;
 }
 
 function hideScrim(): void {
@@ -153,9 +163,13 @@ function coveredBySettingsLayer(): boolean {
  * 下一次 settle/sync 再补。桌面开发宿主没有 zcodeDevice 桥 → 不显示（不编一个假版本号）。
  */
 const VERSION_CHIP_ID = "zcode-version-chip";
+let cachedDeviceVersion: { bridge: object; label: string } | null = null;
 function readAppVersion(): string | null {
   const bridge = (globalThis as { zcodeDevice?: { deviceInfo?(): string } }).zcodeDevice;
   if (!bridge || typeof bridge.deviceInfo !== "function") return null;
+  // 版本在进程生命周期内不会变化。避免每次全页 DOM 更新都同步调用原生桥，
+  // 该桥线程被其他操作占用时，反复读版本也会把页面输入一起堵住。
+  if (cachedDeviceVersion?.bridge === bridge) return cachedDeviceVersion.label;
   try {
     const info = JSON.parse(String(bridge.deviceInfo())) as {
       appVersion?: unknown;
@@ -164,7 +178,9 @@ function readAppVersion(): string | null {
     const v = typeof info.appVersion === "string" ? info.appVersion.trim() : "";
     if (!v) return null;
     const code = typeof info.appVersionCode === "number" ? info.appVersionCode : null;
-    return code ? `aZCode ${v} (${code})` : `aZCode ${v}`;
+    const label = code ? `aZCode ${v} (${code})` : `aZCode ${v}`;
+    cachedDeviceVersion = { bridge, label };
+    return label;
   } catch {
     return null;
   }
@@ -343,6 +359,8 @@ function attachObservers(): void {
       navScheduled = true;
       requestAnimationFrame(() => {
         navScheduled = false;
+        // 右侧抽屉的开关就体现在这个属性上：在这里更新缓存，sync() 就不必每帧查文档。
+        refreshSideDrawerState();
         sync();
       });
     });
@@ -350,7 +368,7 @@ function attachObservers(): void {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["data-root-workspace-surface"],
+      attributeFilter: ["data-root-workspace-surface", "aria-hidden"],
     });
     // 顶栏证人（0.4.7）：#sidebar 与浮层按钮同一棵 React 树挂载，settle 时两者都在 DOM 里了。
     // 拍三枪（0/1.5s/4s）覆盖"按钮晚于侧栏挂载"的宿主差异；旋转/缩放由 resize 那条补记。
@@ -380,6 +398,9 @@ function attachObservers(): void {
  *  3. 抽屉展开时 ☰ 会被遮罩盖住（标准移动抽屉形态）：点遮罩 = 收起，见下面的点击代理。
  */
 const NARROW_CSS = `
+html.zcode-narrow [data-app-usage] button { min-height:44px; }
+html.zcode-narrow [data-app-usage] [role="tablist"] { height:auto; min-height:44px; }
+html.zcode-narrow [data-usage-heatmap-scroll] { overscroll-behavior-x:contain; }
 /* 顶栏那一排浮层按钮（☰/返回/前进/新建）：装机逐版反馈"继续下移并调大"，每一版都在上一版
    基础上再抬一档（0.3.9 44px → 0.3.10 48px → 0.4.0 56px → 本版 68px；下移 0.5→1.25→2rem）。
    冲突的真相：0.3.8 起原生已给 WebView setPadding(状态栏高度)（M9 top=94 证明通道在），

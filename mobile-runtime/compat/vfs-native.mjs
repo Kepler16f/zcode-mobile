@@ -86,7 +86,9 @@ function statJSON(path) {
   try {
     return call("stat", path, {}, "stat");
   } catch (e) {
-    return null;
+    // 权限/IO 错误不是文件不存在，吞掉会让上层误判并覆盖工作区内容。
+    if (e?.code === "ENOENT") return null;
+    throw e;
   }
 }
 

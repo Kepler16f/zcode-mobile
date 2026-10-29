@@ -18,6 +18,7 @@ import { Textarea } from "@/components/ui/textarea.js";
 import type { CodeCommentPreview, CodeCommentRange } from "@/lib/codeCommentContext.js";
 import { isDarkCodePreviewTheme } from "@/lib/codePreviewPreferences.js";
 import { DIFFS_PREFERRED_HIGHLIGHTER } from "@/lib/diffsHighlighterEngine.js";
+import { useOptionalPlatform } from "@/hooks/usePlatform.js";
 import {
   formatCommandShortcutLabel,
   isAppleKeyboardPlatform,
@@ -468,6 +469,7 @@ export function CodeViewer({
   style,
   ...props
 }: CodeViewerProps) {
+  const platform = useOptionalPlatform();
   const viewerRef = useRef<HTMLDivElement>(null);
   const [activeDraftRange, setActiveDraftRange] = useState<CodeCommentRange | null>(null);
   const [draftText, setDraftText] = useState("");
@@ -683,7 +685,12 @@ export function CodeViewer({
       disableLineNumbers: !showLineNumbers,
       overflow: wrapLongLines ? "wrap" : "scroll",
       theme,
-      preferredHighlighter: DIFFS_PREFERRED_HIGHLIGHTER,
+      // 手机端不用 oniguruma WASM 引擎：WASM 在 WebView 里的编译与实例化都在主线程上，
+      // 代价远大于 JS 正则引擎换来的一点吞吐，代价是首屏打开代码块时更明显。
+      preferredHighlighter:
+        platform?.supportsBackgroundHighlighting === false
+          ? "shiki-js"
+          : DIFFS_PREFERRED_HIGHLIGHTER,
       enableLineSelection: canUseCommentLineSelection,
       enableGutterUtility: canUseCommentGutterUtility,
       lineHoverHighlight:
@@ -703,6 +710,7 @@ export function CodeViewer({
       handleLineSelectionEnd,
       markedLinesCss,
       showLineNumbers,
+      platform?.supportsBackgroundHighlighting,
       theme,
       wrapLongLines,
     ],

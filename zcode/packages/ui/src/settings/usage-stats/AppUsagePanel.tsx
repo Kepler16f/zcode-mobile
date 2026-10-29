@@ -80,7 +80,7 @@ export function AppUsagePanel() {
   }
 
   return (
-    <div className="space-y-5">
+    <div data-app-usage="true" className="min-w-0 space-y-5">
       <AppUsageLifetimeSummaryStrip snapshot={lifetimeSnapshot} />
       {lifetimeSnapshot?.heatmap.weeks.length ? (
         <UsageHeatmap locale={locale} intl={intl} weeks={lifetimeSnapshot.heatmap.weeks} />
@@ -158,13 +158,13 @@ function AppUsageLifetimeSummaryStrip({ snapshot }: { snapshot: AppUsageSnapshot
   ];
 
   return (
-    <section className="flex flex-col overflow-hidden rounded-xl bg-surface sm:flex-row sm:items-center">
+    <section className="grid grid-cols-2 overflow-hidden rounded-xl bg-surface sm:flex sm:items-center">
       {items.map((item, index) => (
         <Fragment key={item.label}>
           {index > 0 ? (
             <div aria-hidden="true" className="hidden h-7 w-px bg-border sm:block" />
           ) : null}
-          <div className="min-w-0 flex-1 px-4 py-3 text-center">
+          <div className="min-w-0 flex-1 px-3 py-3 text-center">
             <div className="truncate text-ui-lg font-medium text-foreground">{item.value}</div>
             <div className="mt-1 truncate text-ui-base text-foreground-subtle">{item.label}</div>
           </div>

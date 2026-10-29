@@ -91,12 +91,42 @@ await check("① SSE 全事件流：text_delta 进正文、thinking_delta 不进
     const r = await streamModelCompletion({ target: TARGET, messages: MSGS, onDelta: () => {} });
     expect(r.text === "你好，世界", `正文抽取错：${JSON.stringify(r.text)}`);
     expect(r.finishReason === "end_turn", `finishReason：${r.finishReason}`);
+    expect(r.usage?.inputTokens === 62 && r.usage?.outputTokens === 9, `流式用量错误：${JSON.stringify(r.usage)}`);
     expect(r.truncated === false, "有 message_stop 就不是截断");
     expect(String(captured().url) === "http://pool.test:8899/v1/messages", `URL：${captured().url}`);
     return { text: r.text, finishReason: r.finishReason };
   } finally {
     restore();
   }
+});
+
+await check("缓存提示词仍占上下文，后续增量帧不清零缓存输入", async () => {
+  const { restore } = installFakeSse([
+    { event: "message_start", data: { type: "message_start", message: { usage: {
+      input_tokens: 1, cache_read_input_tokens: 32000, cache_creation_input_tokens: 4000,
+    } } } },
+    { event: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn" },
+      usage: { input_tokens: 1, output_tokens: 12 } } },
+    { event: "message_stop", data: { type: "message_stop" } },
+  ]);
+  try {
+    const result = await streamModelCompletion({ target: TARGET, messages: MSGS, onDelta: () => {} });
+    expect(result.usage.inputTokens === 36001, JSON.stringify(result.usage));
+    expect(result.usage.outputTokens === 12, JSON.stringify(result.usage));
+  } finally { restore(); }
+});
+
+await check("OpenAI流式请求声明include_usage（供应商仅在声明后回传用量）", async () => {
+  const { restore, captured } = installFakeSse([
+    { event: "message", data: { choices: [{ delta: {}, finish_reason: "stop" }], usage: {
+      prompt_tokens: 12000, completion_tokens: 700,
+    } } },
+  ]);
+  try {
+    const result = await streamModelCompletion({ target: { ...TARGET, apiFormat: "openai-chat-completions" }, messages: MSGS, onDelta: () => {} });
+    expect(JSON.parse(captured().init.body).stream_options.include_usage === true, "没有声明usage");
+    expect(result.usage.inputTokens === 12000 && result.usage.outputTokens === 700, JSON.stringify(result.usage));
+  } finally { restore(); }
 });
 
 await check("② 流内 anthropic 错误帧（无 event 行）→ model.business.*，不装作空回答", async () => {
@@ -175,6 +205,7 @@ await check("⑤ 非流式 message JSON（8899 实测形状，含 thinking 块�
   try {
     const r = await streamModelCompletion({ target: TARGET, messages: MSGS, onDelta: () => {} });
     expect(r.text === "最终回答", `非流式抽取：${JSON.stringify(r.text)}`);
+    expect(r.usage?.inputTokens === 62 && r.usage?.outputTokens === 30, `非流式用量错误：${JSON.stringify(r.usage)}`);
     expect(r.finishReason === "end_turn", `finishReason：${r.finishReason}`);
     return { text: r.text };
   } finally {
