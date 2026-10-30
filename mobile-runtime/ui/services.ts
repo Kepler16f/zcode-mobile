@@ -479,6 +479,8 @@ export async function createMobileServices(options: {
             taskIndexSyncer,
             onDiagnostic: trace,
             isSessionRunning: id => mobileAgent?.isSessionRunning(id) === true,
+            // 实时会话摘要：侧栏的「等待确认」与转圈都从这份投影来（桌面 windowHostControllerService 同款）。
+            sessionSummaries: workspacePath => mobileAgent?.liveSessionSummaries(workspacePath) ?? [],
           }),
           "mobile:windowControllerService",
           "端侧接了列表读取口与 tasks-index/workspaces 实时帧，列表组织操作（置顶/归档/删除）没有",

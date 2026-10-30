@@ -188,37 +188,45 @@ tasks.named("preBuild") {
     dependsOn("copyMobileRuntime", "copyMobileUi", "copyWebDist", "checkNativeLibExtraction", "checkMobileBundleFingerprint")
 }
 
-// APK 重打包（压缩率）：AGP 的 debug 构建对资源用最快压缩等级（BEST_SPEED）。同一份内容，
-// entry.js 7.8 MB 正文在等级 1 下压成 2.48 MB、等级 9 只要 2.06 MB；端侧 UI 有 5000 多个小文件，
-// 全包累计差约 1.7 MB。AGP 任务上的 compressionLevel 属性在 8.13.2 上不生效（由构建类型内部决定），
-// 所以在产物层重压：重压条目 → zipalign 恢复对齐 → 用**同一个 keystore** 重新签名（证书不变，可覆盖安装）。
-// 只在 debug 变体上做；release 变体本身就用较高等级，不需要。
-val repackDebugApk = tasks.register<Exec>("repackDebugApk") {
-    description = "把 debug APK 的条目按最大压缩率重压并重新签名（省约 1.7 MB）"
-    dependsOn("packageDebug")
-    val apk = file("build/outputs/apk/debug/aZCode-$appVersion.apk")
-    inputs.file(apk)
-    outputs.upToDateWhen { false }
-    doFirst {
-        val sdkRoot = Properties().apply {
-            val file = rootProject.file("local.properties")
-            if (file.exists()) file.inputStream().use { load(it) }
-        }.getProperty("sdk.dir").orEmpty()
-        // 用版本号最大的那套 build-tools（只要里面有 zipalign 与 apksigner）。
-        val buildTools = File(sdkRoot, "build-tools").listFiles()
-            ?.filter { File(it, "zipalign.exe").isFile && File(it, "lib/apksigner.jar").isFile }
-            ?.sortedBy { it.name }
-            ?.lastOrNull()
-            ?: error("在 $sdkRoot/build-tools 里找不到带 zipalign/apksigner 的版本")
-        val java = File(System.getProperty("java.home"), "bin/java.exe").takeIf { it.exists() }?.absolutePath ?: "java"
-        val keystore = File(System.getProperty("user.home"), ".android/debug.keystore")
-        exec {
-            workingDir(rootProject.projectDir.parentFile)
-            commandLine("node", "mobile-runtime/build/repack-apk.mjs", "--apk", apk.absolutePath,
-                "--sdk", buildTools.absolutePath, "--java", java, "--keystore", keystore.absolutePath)
+// APK 重打包（压缩率）：AGP 对资源用最快压缩等级（BEST_SPEED）。同一份内容，entry.js 7.8 MB
+// 正文在等级 1 下压成 2.48 MB、等级 9 只要 2.06 MB；端侧 UI 有 5000 多个小文件，全包差约 4 MB。
+// AGP 任务上的 compressionLevel 属性在 8.13.2 上不生效（由构建类型内部决定），所以在产物层重压：
+// 重压条目 → zipalign 恢复对齐 → 用**该变体自己的 keystore** 重新签名（证书不变，可覆盖安装）。
+fun registerApkRepack(buildType: String) {
+    val apk = file("build/outputs/apk/$buildType/aZCode-$appVersion.apk")
+    val repack = tasks.register<Exec>("repack${buildType.replaceFirstChar { it.uppercase() }}Apk") {
+        description = "把 $buildType APK 的条目按最大压缩率重压并重新签名（省约 4 MB）"
+        dependsOn("package$buildType")
+        inputs.file(apk)
+        outputs.upToDateWhen { false }
+        doFirst {
+            val sdkRoot = Properties().apply {
+                val file = rootProject.file("local.properties")
+                if (file.exists()) file.inputStream().use { load(it) }
+            }.getProperty("sdk.dir").orEmpty()
+            // 用版本号最大的那套 build-tools（只要里面有 zipalign 与 apksigner）。
+            val buildTools = File(sdkRoot, "build-tools").listFiles()
+                ?.filter { File(it, "zipalign.exe").isFile && File(it, "lib/apksigner.jar").isFile }
+                ?.sortedBy { it.name }
+                ?.lastOrNull()
+                ?: error("在 $sdkRoot/build-tools 里找不到带 zipalign/apksigner 的版本")
+            val java = File(System.getProperty("java.home"), "bin/java.exe").takeIf { it.exists() }?.absolutePath ?: "java"
+            val signing = signingConfigs.getByName(if (buildType == "release") "release" else "local")
+            val keystoreFile = signing.storeFile ?: error("$buildType 变体没有 storeFile，无法重签")
+            exec {
+                workingDir(rootProject.projectDir.parentFile)
+                environment("ZCODE_KS_PASS", signing.storePassword.orEmpty())
+                environment("ZCODE_KEY_PASS", signing.keyPassword.orEmpty())
+                environment("ZCODE_KEY_ALIAS", signing.keyAlias.orEmpty())
+                commandLine("node", "mobile-runtime/build/repack-apk.mjs", "--apk", apk.absolutePath,
+                    "--sdk", buildTools.absolutePath, "--java", java, "--keystore", keystoreFile.absolutePath)
+            }
         }
     }
+    tasks.matching { it.name == "assemble$buildType" }.configureEach { finalizedBy(repack) }
 }
+registerApkRepack("debug")
+registerApkRepack("release")
 
 // 在任务运行前检查，即使打包任务命中 UP-TO-DATE 也不能跳过本次版本确认。
 gradle.taskGraph.whenReady {
@@ -250,7 +258,8 @@ registerApkDelivery("debug")
 registerApkDelivery("release")
 
 // 交付出去的是重压过的包：重打包在 packageDebug 之后、发布之前。
-tasks.named("publishDebugApk") { dependsOn(repackDebugApk) }
+tasks.named("publishDebugApk") { dependsOn("repackDebugApk") }
+tasks.named("publishReleaseApk") { dependsOn("repackReleaseApk") }
 
 dependencies {
     // 外壳只用原生 Activity，避免 appcompat 连带 kotlinx-coroutines 等传递依赖。

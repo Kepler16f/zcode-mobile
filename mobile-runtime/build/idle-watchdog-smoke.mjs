@@ -64,9 +64,14 @@ const sseFrame = (content) => ({
  *     一旦 signal 被 abort，用 rejectRead 打断挂住的 read（复刻真 fetch 的 abort→reject 语义），
  *     否则看门狗"叫得响但没人应"，测的就不是真链路。
  */
-function installFakeFetch(frames, { closeAfter = true, errorBody = false } = {}) {
+function installFakeFetch(frames, { closeAfter = true, errorBody = false, freezeMs = 0 } = {}) {
   const original = globalThis.fetch;
   globalThis.fetch = async (_url, init) => {
+    // 冻结页面：事件循环被占住，timer 只能晚点触发（切后台/锁屏的宿主行为）。
+    if (freezeMs > 0) {
+      const until = Date.now() + freezeMs;
+      while (Date.now() < until) { /* 故意阻塞事件循环 */ }
+    }
     const encoder = new TextEncoder();
     let i = 0;
     let rejectRead = null;
@@ -158,6 +163,26 @@ await check("吐了一帧后卡住 → 仍报 model.streamIdle（帧间上限独
   } finally {
     restore();
     collect.length = 0;
+  }
+});
+
+await check("页面被冻结（锁屏/切后台）后 timer 迟到 → 赦免，不掐断这一轮", async () => {
+  // 复刻 Android WebView 的冻结：事件循环被卡住，timer 只能晚点触发。
+  // 窗口 1000ms、冻结 1500ms：迟到量 1.5 倍窗口。旧判据（迟到要超过 3 倍窗口才赦免）
+  // 会把这一轮判成"网关卡死"并 abort —— 用户报的就是"一锁屏工作流就被掐断"。
+  const restore = installFakeFetch([sseFrame("回来之后")], { closeAfter: true, freezeMs: 1500 });
+  try {
+    const r = await streamModelCompletion({
+      target: TARGET,
+      messages: MSGS,
+      onDelta,
+      firstByteTimeoutMs: 1000,
+      frameIdleTimeoutMs: 1000,
+    });
+    if (!r || r.text !== "回来之后") throw new Error("正文不对：" + JSON.stringify(r));
+    return { text: r.text };
+  } finally {
+    restore();
   }
 });
 

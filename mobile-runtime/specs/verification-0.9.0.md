@@ -85,3 +85,16 @@ Git 面板（真实本地 HTTP 推送）；回归对话 137/137、会话存储 2
 启动路径、真实路径、原生异步桥、APK 交付、输入恢复、MCP、Skills/Subagents、能力真实性全部通过；
 界面回归 mobile-090-e2e 与 fork-ui-e2e 通过（分叉按钮 → 切到子会话 → 渲染派生来源标记）；
 类型检查通过，Lint 70 warnings / 0 errors，架构 0 violations。
+
+## 0.10.1 增补（弹窗主题、待确认标识、后台存活）
+
+- 文件选择弹窗：新增 Theme.ZcodeMobile.Dialog.Dark/Light（Material 强制深浅），
+  WorkspaceBridge 与 MainActivity 的原生弹窗改用 UIChromeBridge.dialogContext（读 zcode-ui-chrome/theme-dark）。
+- 待确认标识：sessions-index 在待确认状态变化时改投快照；端侧 Controller 补上桌面同款的实时
+  activity/pendingInteraction 投影。新增 pending-badge-smoke（6/6）与 pending-badge-e2e（3/3）。
+- 后台存活：看门狗迟到判据改为「有没有迟到」（原为 3 倍窗口）；原生加 setRendererPriorityPolicy(IMPORTANT,false)；
+  命令/Git/模型三个桥改为进程级单例（NativeBridges.kt），onDestroy 不再取消正在跑的任务。
+  idle-watchdog-smoke 增补「冻结 1.5 倍窗口仍不断」一条（5/5）。
+- 回归：对话 137/137、会话存储 25/25、分叉 19/19、子代理后台 20/20、Git 面板、文件监视 12/12、
+  MCP、启动路径、用量 13/13、任务写链 11/11、界面回归 mobile-090-e2e 与 pending-badge-e2e 均通过；
+  仓库与移动类型检查通过，Lint 70 warnings / 0 errors，架构 0 violations。

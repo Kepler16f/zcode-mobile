@@ -7,6 +7,7 @@ import android.os.Build
 import android.view.View
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import android.view.ContextThemeWrapper
 import org.json.JSONObject
 
 /**
@@ -141,6 +142,21 @@ class UIChromeBridge(
             val dark = activity.getSharedPreferences("zcode-ui-chrome", Context.MODE_PRIVATE)
                 .getBoolean(KEY_DARK, true) // 无记录 = 出厂默认深色（与 ui.html 的 zai-dark 兜底一致）
             UIChromeBridge(activity).applyChrome(dark)
+        }
+
+        /**
+         * 原生弹窗用的上下文：主题跟**应用内**的深浅色走，不跟系统走。
+         *
+         * 为什么不用 Activity 本身：Activity 的主题是 DeviceDefault，跟系统深浅色。
+         * 用户在应用设置里选浅色、系统仍是深色时，文件选择弹窗就会是深色的（用户报的问题）。
+         * 应用主题的布尔就存在 zcode-ui-chrome 里（页面每次 applyTheme 后调 setThemeDark 写进来），
+         * 这里读同一份事实，不另造状态。
+         */
+        fun dialogContext(context: Context): Context {
+            val dark = context.getSharedPreferences("zcode-ui-chrome", Context.MODE_PRIVATE)
+                .getBoolean(KEY_DARK, true)
+            val theme = if (dark) R.style.Theme_ZcodeMobile_Dialog_Dark else R.style.Theme_ZcodeMobile_Dialog_Light
+            return ContextThemeWrapper(context, theme)
         }
     }
 }

@@ -163,10 +163,19 @@ const MAX_ERROR_BODY_CHARS = 8_192;
  *  90s 帧间仍远小于"永远挂住"，防挂死语义保留；后台冻结另有专闸（见 fire 判定）。 */
 const FIRST_BYTE_TIMEOUT_MS = 120_000;
 const FRAME_IDLE_TIMEOUT_MS = 90_000;
-/** 看门狗"迟到即赦免"的倍数：timer 只有在页面被宿主冻结（切后台）时才会大幅晚点。
- *  真正的网关卡死发生在前台，setTimeout 按点触发（主线程同步桥最长阻塞几秒，到不了 3 倍）。
- *  迟到超过 3 倍上限 → 不算超时，重新计时——这正是"后台不动，回来原地继续"。 */
-const IDLE_LATE_FORGIVE_FACTOR = 3;
+/**
+ * 看门狗"迟到即赦免"的判定改成**绝对迟到量**而不是倍数。
+ *
+ * 之前写的是「迟到超过 3 倍上限才赦免」，那是错的：页面被宿主冻结（切后台、锁屏）后回来，
+ * 积压的 timer 会在「窗口 + 冻结时长」时触发——冻结 30–120 秒回来，迟到量只有 1–2 倍窗口，
+ * 于是被当成"网关卡死"直接 abort，这一轮就此被掐断（用户报的就是"一锁屏/切后台工作流就没了"）。
+ *
+ * 正确的判据是：**JS 的 timer 只有在页面被冻结或主线程被长时间阻塞时才会晚点**。
+ * 真的网关卡死发生在页面响应正常时，timer 准点响 → 照旧 abort。
+ * 所以「迟到了」就重新计时（重新给满一窗），冻结多久都不会误杀；页面恢复后流真的死了，
+ * 下一窗准点触发时照样收口。
+ */
+const IDLE_TIMER_LATE_TOLERANCE_MS = 1_000;
 const ANTHROPIC_VERSION = "2023-06-01";
 
 function trimTrailingSlash(value: string): string {
@@ -988,10 +997,10 @@ export async function streamModelCompletion(params: {
       const hidden =
         typeof document !== "undefined" && document.visibilityState === "hidden";
       // 迟到即赦免（0.5.1，用户点名"后台不动回来还是按原来那样原地继续"）：Android WebView
-      // 切后台会冻结/节流 setTimeout，回前台后积压的 timer 立刻触发——这不是网关卡死，
-      // 是宿主把钟停了。真死锁发生在前台：timer 准点响（同步桥阻塞到不了 3 倍上限），
-      // 那才走到 abort。赦免后重新给满一窗；流真的死了，前台下一窗照样会掐。
-      if (hidden || elapsed > ms * IDLE_LATE_FORGIVE_FACTOR) {
+      // 切后台/锁屏会冻结 setTimeout，回前台后积压的 timer 立刻触发——这不是网关卡死，
+      // 是宿主把钟停了。真死锁发生在前台：timer 准点响，那才走到 abort。
+      // 判据是「有没有迟到」而不是「迟到多少倍」：锁屏几十秒回来也是迟到，照样赦免。
+      if (hidden || elapsed > ms + IDLE_TIMER_LATE_TOLERANCE_MS) {
         armIdle(ms);
         return;
       }

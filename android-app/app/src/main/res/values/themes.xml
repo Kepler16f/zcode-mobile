@@ -5,4 +5,13 @@
         <item name="android:navigationBarColor">#161616</item>
         <item name="android:windowBackground">#161616</item>
     </style>
+
+    <!--
+      原生弹窗（文件选择、权限询问）跟随**应用内**主题，而不是系统主题。
+      Theme.DeviceDefault 跟的是系统深浅色：用户在应用设置里选了浅色、系统仍是深色时，
+      弹窗就是一块深色（装机反馈「文件选择弹窗一直是深色的」）。
+      Material 的 Dialog 两个父主题是**写死**的深/浅，不看系统，正好用来做这件事。
+    -->
+    <style name="Theme.ZcodeMobile.Dialog.Dark" parent="android:Theme.Material.Dialog.Alert" />
+    <style name="Theme.ZcodeMobile.Dialog.Light" parent="android:Theme.Material.Light.Dialog.Alert" />
 </resources>

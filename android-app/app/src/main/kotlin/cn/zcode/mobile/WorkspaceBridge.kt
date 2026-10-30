@@ -62,7 +62,7 @@ class WorkspaceBridge(
             } else if (Environment.isExternalStorageManager()) {
                 showLocalDirectory(Environment.getExternalStorageDirectory(), requestId)
             } else {
-                pickerDialog = AlertDialog.Builder(activity)
+                pickerDialog = AlertDialog.Builder(UIChromeBridge.dialogContext(activity))
                     .setTitle("选择工作区目录")
                     .setMessage("本地文件夹可直接读写，无需 SAF 镜像。请先授予所有文件访问权限；也可使用系统文档提供方。")
                     .setPositiveButton("授权本地文件夹") { _, _ ->
@@ -112,7 +112,7 @@ class WorkspaceBridge(
                 }
                 val parent = if (current == base) null else current.parentFile
                 val labels = (if (parent != null) listOf("↑ 上一级") else emptyList()) + children.map { "📁 ${it.name}" }
-                pickerDialog = AlertDialog.Builder(activity)
+                pickerDialog = AlertDialog.Builder(UIChromeBridge.dialogContext(activity))
                     .setTitle("/sdcard" + current.path.removePrefix(base.path))
                     .setItems(labels.toTypedArray()) { _, index ->
                         if (parent != null && index == 0) showLocalDirectory(parent, requestId)

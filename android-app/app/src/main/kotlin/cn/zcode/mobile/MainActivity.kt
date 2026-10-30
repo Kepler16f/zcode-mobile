@@ -126,7 +126,7 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences("zcode-mobile", android.content.Context.MODE_PRIVATE)
         if (prefs.getBoolean("all-files-asked", false)) return
         prefs.edit().putBoolean("all-files-asked", true).apply()
-        android.app.AlertDialog.Builder(this)
+        android.app.AlertDialog.Builder(UIChromeBridge.dialogContext(this))
             .setTitle("允许管理文件？")
             .setMessage(
                 "aZCode 的助手要读写你手机上的本地文件（下载、文档等）需要「所有文件访问」权限。" +
@@ -219,7 +219,12 @@ class MainActivity : Activity() {
                 }
             }
             // 不装这个，`<input type="file">` 在 WebView 里是死的：Chromium 把选择请求直接丢掉。
-            webChromeClient = fileChooser
+            // 切后台/锁屏时系统可能回收 WebView 的渲染进程，正在跑的那一轮就此中断
+        // （用户报"一锁屏工作流就被掐断"）。这个开关告诉系统：本 WebView 很重要，
+        // 即使不可见也尽量留着渲染进程。第二个参数 false = 不随可见性降级。
+        webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+
+        webChromeClient = fileChooser
 
             // 沉浸后状态栏/键盘那条带露出来的是 WebView 自己的 padding 底，所以这块必须跟主题：
             // 0.3.7 写死 #161616，浅色主题就会在状态栏底下压一条深带。读上次存的主题布尔
@@ -235,7 +240,7 @@ class MainActivity : Activity() {
             addJavascriptInterface(DeviceProbe(applicationContext), "zcodeDevice")
             // L1 执行能力：真机自检已证明这个 WebView 能派生 /system/bin/sh，这里把它接上
             // ExecutionPort。argv 形态不经过 shell，参数拼不出第二条命令。
-            execBridge = ExecBridge(applicationContext)
+            execBridge = NativeBridges.exec(applicationContext)
             addJavascriptInterface(execBridge!!, "zcodeExec")
             // 真盘文件桥：真机实测这个 WebView 没有 OPFS（navigator.storage.getDirectory() 抛
             // TypeError），vfs 只能落到应用私有目录，否则 Write/Edit 的结果重启就没了。
@@ -257,9 +262,9 @@ class MainActivity : Activity() {
             addJavascriptInterface(BrowserBridge(applicationContext), "zcodeBrowser")
             // Git 传输 HTTP 桥（0.6.7）：isomorphic-git 的 fetch 传输在 WebView 里被 CORS
             // 全拦（git 端点普遍不答 CORS，GitHub 也是），改走原生 HttpURLConnection。
-            gitHttpBridge = GitHttpBridge()
+            gitHttpBridge = NativeBridges.gitHttp()
             addJavascriptInterface(gitHttpBridge!!, "zcodeGitHttp")
-            modelHttpBridge = ModelHttpBridge()
+            modelHttpBridge = NativeBridges.modelHttp()
             // 默认挂着模型桥：真界面从第一帧脚本执行起就要能发模型请求，不能等 onPageFinished
             // （那个时机既晚、又可能不触发，缺桥会直接变成「原生模型桥不可用」）。
             addJavascriptInterface(modelHttpBridge!!, "zcodeModelHttp")
@@ -407,9 +412,9 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        execBridge?.cancelAll()
-        gitHttpBridge?.cancelAll()
-        modelHttpBridge?.cancelAll()
+        // 这里**不**取消正在跑的命令与模型请求：Activity 重建（系统回收、渲染进程自愈）
+        // 不等于进程结束，取消会让"切后台/锁屏后工作流被掐断"。任务是进程级的（NativeBridges），
+        // 进程真退出时线程自然结束。
         super.onDestroy()
     }
 

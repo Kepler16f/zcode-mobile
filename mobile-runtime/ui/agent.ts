@@ -749,12 +749,27 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     const previous = state.summaries.get(session.sessionId);
     if (previous && JSON.stringify(previous) === JSON.stringify(summary)) return;
     state.summaries.set(session.sessionId, summary);
+    // 「等待确认」是侧栏唯一关心的易丢字段：它挂在增量帧的水位上，中间丢一帧或水位漂移，
+    // 侧栏就会一直留着旧标识（用户报的就是这个：确认以后标识不消失）。
+    // 所以待确认状态发生变化时直接投**快照**——快照不校验水位，丢了也只能是下一帧，不会留下旧状态。
+    const pendingChanged = pendingStateOf(previous) !== pendingStateOf(summary);
     emitWorkspaceTopicFrame(
       "sessions-index",
       state,
-      { kind: "deltas", deltas: [{ op: "session.upserted", session: summary }] },
+      pendingChanged
+        ? workspaceSnapshotOf("sessions-index", state)
+        : { kind: "deltas", deltas: [{ op: "session.upserted", session: summary }] },
       "online",
     );
+  }
+
+  /** 待确认状态的指纹：有没有挂起的交互、各有几条。用它判断要不要改投快照。 */
+  function pendingStateOf(summary: SessionSummary | undefined): string {
+    if (!summary) return "none";
+    const counts = summary.pendingInteractionSummary;
+    const permission = counts?.permissionCount ?? (summary.pendingInteraction ? 1 : 0);
+    const userInput = counts?.userInputCount ?? 0;
+    return `${summary.pendingInteraction?.interactionId ?? ""}|${permission}|${userInput}`;
   }
 
   // ── 发帧 ──
@@ -4597,6 +4612,17 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
   return {
     // ── 握手 ──
+    /**
+     * 端侧实时会话摘要（Controller 侧栏投影用）。
+     *
+     * 桌面 windowHostControllerService 把 sessions-index 的摘要投影成每一行的 activity 与
+     * pendingInteraction（windowHostControllerService.ts:82-120），侧栏的转圈与「等待确认」
+     * 都从这份投影来。端侧此前只给 task-index 行 —— 侧栏拿不到实时态，只能等别处补。
+     */
+    liveSessionSummaries(workspacePath: string): SessionSummary[] {
+      return [...stateForSessionPath(workspacePath).summaries.values()];
+    },
+
     isSessionRunning(sessionId: string): boolean {
       const session = sessions.get(sessionId);
       return Boolean(session?.run || session?.compactRun);

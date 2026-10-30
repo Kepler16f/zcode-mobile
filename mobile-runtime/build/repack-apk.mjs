@@ -25,6 +25,10 @@ const level = Number(value("--level", "9"));
 const sdkDir = value("--sdk");
 const javaExe = value("--java", process.env.JAVA_HOME ? path.join(process.env.JAVA_HOME, "bin", "java") : "java");
 const keystore = value("--keystore", path.join(process.env.USERPROFILE ?? "", ".android", "debug.keystore"));
+// 口令走环境变量而不是命令行：命令行参数在进程列表里是公开的。
+const ksPass = value("--ks-pass", process.env.ZCODE_KS_PASS ?? "android");
+const keyPass = value("--key-pass", process.env.ZCODE_KEY_PASS ?? "android");
+const alias = value("--alias", process.env.ZCODE_KEY_ALIAS ?? "androiddebugkey");
 
 const buffer = readFileSync(apkPath);
 const { entries } = parseEntries(buffer);
@@ -61,7 +65,7 @@ if (!existsSync(keystore)) {
 const signed = path.join(workDir, "signed.apk");
 execFileSync(javaExe, [
   "-jar", apksignerJar, "sign",
-  "--ks", keystore, "--ks-pass", "pass:android", "--key-pass", "pass:android",
+  "--ks", keystore, "--ks-pass", "pass:" + ksPass, "--key-pass", "pass:" + keyPass, "--ks-key-alias", alias,
   "--v1-signing-enabled", "false", "--v2-signing-enabled", "true", "--v3-signing-enabled", "true",
   "--out", signed, aligned,
 ], { stdio: "inherit" });

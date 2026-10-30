@@ -17,6 +17,7 @@
 //   - row.activity（侧栏那一行的运行中细节）：端侧的活状态直接来自库里 status，见下面 liveStatus。
 import { Emitter, type Event } from "@zcode/rpc";
 import { ZCODE_AGENT_PROVIDER, type ZCodeTaskMeta, type ZCodeWorkspaceEvent } from "@zcode/shared";
+import type { SessionSummary } from "@zcode/shared/zcode-protocol-v4";
 // 侧栏诊断（0.3.9）：say() 的读数只活在 UI 页内存里，切去自检页复制报告时就丢了——
 // 连续三版"侧栏空"每次都靠猜，根因是没有跨页的证人。这一格把链上关键读数落进
 // localStorage（与自检页同源），下一次报告直接按读数定位。见 sidebar-diagnostics.ts。
@@ -143,8 +144,9 @@ function membershipOf(reason: string | undefined): {
 function rowOf(
   meta: ZCodeTaskMeta,
   membership?: { pinned: boolean; archived: boolean; active: boolean },
+  summary?: SessionSummary,
 ): WindowHostControllerTaskRow {
-  return {
+  const row = {
     address: addressOf(
       { workspacePath: meta.workspacePath, workspaceIdentity: meta.workspaceIdentity },
       meta.taskId,
@@ -155,6 +157,34 @@ function rowOf(
     sourceAvailability: "online",
     liveStatus: liveStatusFromMeta(meta),
   } as WindowHostControllerTaskRow;
+  // 实时投影（桌面同款，windowHostControllerService.ts:82-120）：把会话摘要里的待确认与
+  // 运行态投到这一行。少了它，端侧侧栏的「等待确认」只能等另一条 lane 兜底，那条 lane
+  // 一旦丢帧，旧标识就永远留在侧栏（用户报的就是这个）。
+  if (summary) {
+    row.liveStatus = liveStatusFromSummary(summary);
+    row.activity = {
+      phase: summary.phase,
+      lastActivityAt: summary.lastActivityAt,
+      hasBackgroundWork: summary.hasBackgroundWork,
+      ...(summary.pendingInteractionSummary
+        ? { pendingInteractions: summary.pendingInteractionSummary }
+        : {}),
+    };
+  }
+  return row;
+}
+
+/** 桌面 sessionOverlay 的同一套判据：有待确认就是 waiting，其次看 phase。 */
+function liveStatusFromSummary(summary: SessionSummary): WindowHostControllerTaskRow["liveStatus"] {
+  if (summary.pendingInteraction ||
+    (summary.pendingInteractionSummary &&
+      summary.pendingInteractionSummary.permissionCount + summary.pendingInteractionSummary.userInputCount > 0)) {
+    return "waiting";
+  }
+  if (summary.phase === "prewarming" || summary.phase === "running") return "running";
+  if (summary.phase === "error") return "error";
+  if (summary.phase === "completedSuccess" || summary.phase === "completedInterrupted") return "completed";
+  return "idle";
 }
 
 export function createMobileWindowControllerService(options: {
@@ -162,6 +192,8 @@ export function createMobileWindowControllerService(options: {
   taskIndexSyncer: TaskIndexBroadcaster;
   onDiagnostic?: (message: string) => void;
   isSessionRunning?: (sessionId: string) => boolean;
+  /** 实时会话摘要（由 Agent 服务提供）：侧栏的待确认/运行态投影来源，桌面同款。 */
+  sessionSummaries?: (workspacePath: string) => SessionSummary[];
 }) {
   const say = (message: string) => options.onDiagnostic?.(message);
   const visibleTask = (meta: ZCodeTaskMeta) => !meta.taskId.startsWith("mobile-subagent-");
@@ -197,7 +229,10 @@ export function createMobileWindowControllerService(options: {
       sortBy: "updated",
       provider: ZCODE_AGENT_PROVIDER,
     });
-    return result.items.filter(visibleTask).map((m) => rowOf(currentMeta(m)));
+    const summaries = new Map(
+      (options.sessionSummaries?.(scope.workspacePath) ?? []).map((summary) => [summary.sessionId, summary]),
+    );
+    return result.items.filter(visibleTask).map((m) => rowOf(currentMeta(m), undefined, summaries.get(m.taskId)));
   }
 
   function publishDeltas(
@@ -361,11 +396,33 @@ export function createMobileWindowControllerService(options: {
         excludeTaskIdPrefix: "mobile-subagent-",
         provider: ZCODE_AGENT_PROVIDER,
       });
-      const items = result.items.filter(visibleTask).map(currentMeta).map((item) => ({
-        ...item,
-        sourceAvailability: "online" as const,
-        liveStatus: liveStatusFromMeta(item),
-      }));
+      const summaries = new Map<string, SessionSummary>();
+      for (const scope of params.workspaceScopes) {
+        for (const summary of options.sessionSummaries?.(scope.workspacePath) ?? []) {
+          summaries.set(summary.sessionId, summary);
+        }
+      }
+      const items = result.items.filter(visibleTask).map(currentMeta).map((item) => {
+        const summary = summaries.get(item.taskId);
+        const row = rowOf(item, undefined, summary);
+        const pending = summary?.pendingInteraction;
+        return {
+          ...item,
+          sourceAvailability: "online" as const,
+          liveStatus: row.liveStatus,
+          // 实时摘要投影（桌面同款）：待确认与运行态随这一行一起给出。
+          ...(pending
+            ? {
+                pendingInteraction: {
+                  interactionId: pending.interactionId,
+                  kind: pending.kind,
+                  ...(pending.toolName ? { toolName: pending.toolName } : {}),
+                },
+              }
+            : {}),
+          ...(row.activity ? { activity: row.activity } : {}),
+        };
+      });
       say(
         `listTaskList kind=${params.kind} scopes=${params.workspaceScopes.length} ` +
           `返回 ${items.length}/${result.total} 行`,
