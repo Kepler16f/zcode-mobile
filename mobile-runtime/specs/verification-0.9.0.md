@@ -98,3 +98,27 @@ Git 面板（真实本地 HTTP 推送）；回归对话 137/137、会话存储 2
 - 回归：对话 137/137、会话存储 25/25、分叉 19/19、子代理后台 20/20、Git 面板、文件监视 12/12、
   MCP、启动路径、用量 13/13、任务写链 11/11、界面回归 mobile-090-e2e 与 pending-badge-e2e 均通过；
   仓库与移动类型检查通过，Lint 70 warnings / 0 errors，架构 0 violations。
+
+## 0.10.1 正式签名包（release）
+
+- 版本名 0.10.1，versionCode 10001，APK 12,629,042 B。
+- 签名：v2 + v3，证书 SHA256 `ee396b8368300c6aab74f89d22fb88c0dc739ba98d84499462bc1bc94eb56443`（CN=aZCode，与 0.8.0 release 同一证书）。
+  **与此前交付的 debug 签名包（3780e70f…）不是同一张证书**：正式包不能覆盖安装在 debug 签名版上，
+  需要先卸载旧版（会清掉应用私有目录里的会话与登录态）。
+- SHA256 `827f823a25f8592f9b52b4c381923240c5ad2def2934e8804972bfc8d35e06fe`；下载副本与构建产物一致。
+- 包内：assets/ui 与 dist-ui 逐一对应，59 个 KaTeX 字体齐全，无 assets/www；entry.js / zcode-ui.css /
+  core bundle 与已测产物哈希一致。
+- 交付到下载目录并清理了旧版 aZCode 包 1 个。
+
+## CI（mobile-checks）修复
+
+最近几次工作流**每次都红在同一处**：安装依赖步骤里多跑了一次
+`pnpm --dir zcode/apps/zcode-cli install --frozen-lockfile`，而那份嵌套锁文件是旧的
+（还带 vitest、缺 @withfig/autocomplete），于是 ERR_PNPM_OUTDATED_LOCKFILE。
+根安装本来就覆盖全部 18 个工作区包，这一步纯属多余，已删除。
+另外：超时 60 → 90 分钟（上游 core + web + 移动端三份 bundle 再加 APK 打包，本机就要 15–30 分钟）；
+新增 11 条回归（会话存储、用量、任务写链、看门狗、文件监视、分叉、子代理后台、待确认标识、SAF 写回、MCP）；
+CI 用的固定测试版本号同步到 0.10.1。
+
+APK 重压任务也改成**永不失败**：缺 keystore、缺 build-tools、CI 环境一律跳过并记一行日志
+（Exec 任务里 return 不等于跳过，必须放 onlyIf）。

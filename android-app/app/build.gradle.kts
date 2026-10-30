@@ -192,34 +192,83 @@ tasks.named("preBuild") {
 // 正文在等级 1 下压成 2.48 MB、等级 9 只要 2.06 MB；端侧 UI 有 5000 多个小文件，全包差约 4 MB。
 // AGP 任务上的 compressionLevel 属性在 8.13.2 上不生效（由构建类型内部决定），所以在产物层重压：
 // 重压条目 → zipalign 恢复对齐 → 用**该变体自己的 keystore** 重新签名（证书不变，可覆盖安装）。
+/**
+ * 重压重签要用的签名材料：release 用正式 keystore，debug 用本机 debug keystore。
+ * 取不到正式材料时**不**回退到 debug 签名出 release——那会换证书，用户装不上。
+ */
+data class RepackSigning(val keystore: String, val storePassword: String, val keyAlias: String, val keyPassword: String)
+
+fun repackSigning(buildType: String): RepackSigning {
+    val props = Properties().apply {
+        val file = rootProject.file("keystore/keystore.properties")
+        if (file.exists()) file.inputStream().use { load(it) }
+    }
+    if (buildType == "release") {
+        val storeFile = props.getProperty("store.file")
+            ?: error("缺少 keystore/keystore.properties，不能构建 release")
+        val storePassword = props.getProperty("store.password")
+            ?: error("keystore.properties 缺 store.password")
+        val keyAlias = props.getProperty("key.alias")
+            ?: error("keystore.properties 缺 key.alias")
+        val keyPassword = props.getProperty("key.password")
+            ?: error("keystore.properties 缺 key.password")
+        return RepackSigning(rootProject.file(storeFile).absolutePath, storePassword, keyAlias, keyPassword)
+    }
+    val debugKeystore = File(System.getProperty("user.home"), ".android/debug.keystore")
+    return RepackSigning(debugKeystore.absolutePath, "android", "androiddebugkey", "android")
+}
+
 fun registerApkRepack(buildType: String) {
     val apk = file("build/outputs/apk/$buildType/aZCode-$appVersion.apk")
-    val repack = tasks.register<Exec>("repack${buildType.replaceFirstChar { it.uppercase() }}Apk") {
+    // 跳过原因与执行分开：**Exec 任务里 return@doFirst 并不会阻止命令被执行**，
+    // 那样会以「command 'null'」把构建拖红。跳过判定必须放在 onlyIf 里。
+    fun skipReason(): String? {
+        if (providers.gradleProperty("repackApk").orNull == "false") return "-PrepackApk=false"
+        if (System.getenv("CI").equals("true", ignoreCase = true)) return "CI 环境不做体积优化"
+        val signing = repackSigning(buildType)
+        if (!File(signing.keystore).isFile) return "找不到签名材料 ${File(signing.keystore).name}"
+        // SDK 路径取 AGP 自己解析出来的（local.properties 里的中文路径用 Properties.load 读会变成乱码）。
+        val sdkRoot = android.sdkDirectory?.absolutePath ?: return "没有 SDK 目录"
+        val buildTools = File(sdkRoot, "build-tools").listFiles()
+            ?.filter { File(it, "zipalign.exe").isFile && File(it, "lib/apksigner.jar").isFile }
+            ?.sortedBy { it.name }
+            ?.lastOrNull()
+            ?: return "$sdkRoot/build-tools 里没有 zipalign/apksigner"
+        return null
+    }
+    // 用普通 task 而不是 Exec task：Exec 自带一个「执行 commandLine」的动作，
+    // 而真正的重压命令是在 doLast 里用 exec{} 跑的 —— Exec 自己那条没有命令，
+    // 最后会以 command 'null' 把构建拖红。
+    val repack = tasks.register("repack${buildType.replaceFirstChar { it.uppercase() }}Apk") {
         description = "把 $buildType APK 的条目按最大压缩率重压并重新签名（省约 4 MB）"
-        dependsOn("package$buildType")
+        dependsOn("package" + buildType.replaceFirstChar { it.uppercase() })
         inputs.file(apk)
         outputs.upToDateWhen { false }
+        onlyIf {
+            val reason = skipReason()
+            if (reason != null) {
+                logger.lifecycle("[aZCode] 跳过 APK 重压（$reason）")
+                false
+            } else {
+                true
+            }
+        }
         doFirst {
-            val sdkRoot = Properties().apply {
-                val file = rootProject.file("local.properties")
-                if (file.exists()) file.inputStream().use { load(it) }
-            }.getProperty("sdk.dir").orEmpty()
-            // 用版本号最大的那套 build-tools（只要里面有 zipalign 与 apksigner）。
+            val signing = repackSigning(buildType)
+            val sdkRoot = android.sdkDirectory?.absolutePath ?: error("没有 SDK 目录")
             val buildTools = File(sdkRoot, "build-tools").listFiles()
                 ?.filter { File(it, "zipalign.exe").isFile && File(it, "lib/apksigner.jar").isFile }
                 ?.sortedBy { it.name }
                 ?.lastOrNull()
-                ?: error("在 $sdkRoot/build-tools 里找不到带 zipalign/apksigner 的版本")
+                ?: error("$sdkRoot/build-tools 里没有 zipalign/apksigner")
             val java = File(System.getProperty("java.home"), "bin/java.exe").takeIf { it.exists() }?.absolutePath ?: "java"
-            val signing = signingConfigs.getByName(if (buildType == "release") "release" else "local")
-            val keystoreFile = signing.storeFile ?: error("$buildType 变体没有 storeFile，无法重签")
             exec {
                 workingDir(rootProject.projectDir.parentFile)
-                environment("ZCODE_KS_PASS", signing.storePassword.orEmpty())
-                environment("ZCODE_KEY_PASS", signing.keyPassword.orEmpty())
-                environment("ZCODE_KEY_ALIAS", signing.keyAlias.orEmpty())
+                environment("ZCODE_KS_PASS", signing.storePassword)
+                environment("ZCODE_KEY_PASS", signing.keyPassword)
+                environment("ZCODE_KEY_ALIAS", signing.keyAlias)
                 commandLine("node", "mobile-runtime/build/repack-apk.mjs", "--apk", apk.absolutePath,
-                    "--sdk", buildTools.absolutePath, "--java", java, "--keystore", keystoreFile.absolutePath)
+                    "--sdk", buildTools.absolutePath, "--java", java, "--keystore", signing.keystore)
             }
         }
     }

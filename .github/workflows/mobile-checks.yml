@@ -21,7 +21,9 @@ permissions:
 jobs:
   android:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 上游 core + web + 移动端三份 bundle 再加 APK 打包，本机实测 15–30 分钟；
+    # 60 分钟在依赖安装慢的机器上会直接超时（超时也是"经常失败"的一种）。
+    timeout-minutes: 90
     env:
       ZCODE_ENV: production
       COREPACK_ENABLE_PROJECT_SPEC: "0"
@@ -42,8 +44,11 @@ jobs:
         run: |
           corepack enable
           corepack prepare pnpm@10.33.2 --activate
+          # 一次根安装就覆盖全部 18 个工作区包（含 apps/zcode-cli 与它的 packages/*）。
+          # 之前额外跑一次 `pnpm --dir zcode/apps/zcode-cli install --frozen-lockfile`，
+          # 那份嵌套锁文件是旧的（还带着 vitest、没有 @withfig/autocomplete），
+          # 于是每次 CI 都在 ERR_PNPM_OUTDATED_LOCKFILE 上红——与代码无关，纯属多余的一步。
           pnpm --dir zcode install --frozen-lockfile
-          pnpm --dir zcode/apps/zcode-cli install --frozen-lockfile
           npm ci --prefix mobile-runtime
           mkdir -p tmp
       - name: Type checks and lint
@@ -64,10 +69,20 @@ jobs:
           node mobile-runtime/build/runtime-reliability-smoke.mjs
           node mobile-runtime/build/chat-smoke.mjs
           node mobile-runtime/build/hooks-smoke.mjs
+          node mobile-runtime/build/session-store-smoke.mjs
+          node mobile-runtime/build/usage-stats-smoke.mjs
+          node mobile-runtime/build/task-mutate-smoke.mjs
+          node mobile-runtime/build/idle-watchdog-smoke.mjs
+          node mobile-runtime/build/file-watcher-smoke.mjs
+          node mobile-runtime/build/fork-assistant-smoke.mjs
+          node mobile-runtime/build/subagent-background-smoke.mjs
+          node mobile-runtime/build/pending-badge-smoke.mjs
+          node mobile-runtime/build/saf-writethrough-smoke.mjs
+          node mobile-runtime/build/mcp-runtime-smoke.mjs
           cd zcode
           node --import tsx --test packages/services/test/mobileOAuthRecovery.test.ts
       - name: Assemble debug APK
         working-directory: android-app
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon -PappVersion=0.8.1
+          ./gradlew :app:assembleDebug --no-daemon -PappVersion=0.10.1
