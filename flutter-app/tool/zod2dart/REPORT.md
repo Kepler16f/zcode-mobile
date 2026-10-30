@@ -1,0 +1,339 @@
+# zod2dart 覆盖率报告（`node flutter-app/tool/zod2dart/generate.mjs --check` 刷新）
+
+- 导出 *Schema 总数：250
+- 已生成：219（class 643 / enum 412 / typedef 1）
+- 未生成：109
+
+## unsupported 与原因
+
+- `actionAvailabilitySchema` — 顶层形状不是具名 object/enum/标量
+- `backgroundBashOutputResultSchema` — 顶层形状不是具名 object/enum/标量
+- `commandResultSchema` — 顶层形状不是具名 object/enum/标量
+- `conversationDeltaSchema` — 顶层形状不是具名 object/enum/标量
+- `conversationRowSchema` — 顶层形状不是具名 object/enum/标量
+- `conversationTelemetryFactSchema` — toJSONSchema 失败: Transforms cannot be represented in JSON Schema
+- `conversationTopicWireCandidateSchema` — 顶层形状不是具名 object/enum/标量
+- `conversationTopicWireFrameSchema` — 顶层形状不是具名 object/enum/标量
+- `interactionAutoResolutionSchema` — 顶层形状不是具名 object/enum/标量
+- `routedTopicFrameSchema` — 顶层形状不是具名 object/enum/标量
+- `routedTopicWireCandidateSchema` — 顶层形状不是具名 object/enum/标量
+- `routedTopicWireFrameSchema` — 顶层形状不是具名 object/enum/标量
+- `sessionsIndexDeltaSchema` — 顶层形状不是具名 object/enum/标量
+- `sessionsIndexTopicWireCandidateSchema` — 顶层形状不是具名 object/enum/标量
+- `sessionsIndexTopicWireFrameSchema` — 顶层形状不是具名 object/enum/标量
+- `sharedContextImportStateSchema` — 顶层形状不是具名 object/enum/标量
+- `timelineMarkerPayloadSchema` — 顶层形状不是具名 object/enum/标量
+- `toolCallDisplaySchema` — 顶层形状不是具名 object/enum/标量
+- `topicWireFrameCandidateSchema` — 顶层形状不是具名 object/enum/标量
+- `v4AttachmentAbortResultSchema` — 顶层形状不是具名 object/enum/标量
+- `v4AttachmentBeginResultSchema` — 顶层形状不是具名 object/enum/标量
+- `v4AttachmentPreviewSourceResultSchema` — 顶层形状不是具名 object/enum/标量
+- `v4ConnectionFlowResultSchema` — 顶层形状不是具名 object/enum/标量
+- `windowHostControllerTaskDeltaSchema` — 顶层形状不是具名 object/enum/标量
+- `windowHostControllerWorkspaceDeltaSchema` — 顶层形状不是具名 object/enum/标量
+- `workflowNotificationMetaSchema` — 顶层形状不是具名 object/enum/标量
+- `workspaceConfigDeltaSchema` — 顶层形状不是具名 object/enum/标量
+- `workspaceConfigTopicWireCandidateSchema` — 顶层形状不是具名 object/enum/标量
+- `workspaceConfigTopicWireFrameSchema` — 顶层形状不是具名 object/enum/标量
+- `(字段降级→Object?)` — 字段 BackgroundResultOriginMeta.workflowNotification: 联合类型（3 支）P0 不生成
+- `(字段降级→Object?)` — 字段 CommandAck.result: 联合类型（8 支）P0 不生成
+- `(字段降级→Object?)` — 字段 CommandEnvelope.payload: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 CommandQueryItem.result: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 ConversationSnapshot.sharedContextImport: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 ConversationTopicFrame.payload: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 PendingInteraction.autoResolution: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 PendingInteraction.payload: 联合类型（3 支）P0 不生成
+- `(字段降级→Object?)` — 字段 PermissionRequestPayload.detail: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 PermissionRequestPayload.display: 联合类型（11 支）P0 不生成
+- `(字段降级→Object?)` — 字段 RowsWindow.window: 联合类型（9 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionActionAvailability.compact: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionActionAvailability.fork: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionActionAvailability.pauseGoal: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionActionAvailability.queueEdit: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionActionAvailability.resumeGoal: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionActionAvailability.sendQueuedNow: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionActionAvailability.setFollowupMode: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionActionAvailability.switchModelConfig: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionPendingInteractionSummary.autoResolution: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 SessionsIndexTopicFrame.payload: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 StatePatch.sharedContextImport: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 TimelineMarkerRow.marker: 联合类型（9 支）P0 不生成
+- `(字段降级→Object?)` — 字段 ToolCallRow.display: 联合类型（11 支）P0 不生成
+- `(字段降级→Object?)` — 字段 ToolCallRow.input: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 ToolOutput.display: 联合类型（15 支）P0 不生成
+- `(字段降级→Object?)` — 字段 UserInputRequestPayload.input: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 UserInputRequestPayload.schema: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 V4ConversationRowsRangeResult.rows: 联合类型（9 支）P0 不生成
+- `(字段降级→Object?)` — 字段 V4ConversationWorkflowRunNodeResultResult.result: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 WindowHostControllerTaskFrame.payload: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 WindowHostControllerWorkspaceFrame.payload: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 WorkflowLaunchMeta.args: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 WorkflowRunArtifact.spec: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 WorkflowRunArtifactVersion.spec: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 WorkflowRunWorkspaceNode.args: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 WorkspaceConfigOption.currentValue: 多型 type [string,boolean] P0 不生成
+- `(字段降级→Object?)` — 字段 WorkspaceConfigTopicFrame.payload: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _121Nested.display: 联合类型（15 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _129Nested.workflowNotification: 联合类型（3 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _131Nested.args: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _139Nested.args: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _150Nested.display: 联合类型（11 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _150Nested.input: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _156Nested.item: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _157Nested.spec: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _158Nested.payload: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _160Nested.args: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _179Nested.spec: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _211Nested.currentValue: 多型 type [string,boolean] P0 不生成
+- `(字段降级→Object?)` — 字段 _22Nested.compact: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _22Nested.fork: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _22Nested.pauseGoal: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _22Nested.queueEdit: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _22Nested.resumeGoal: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _22Nested.sendQueuedNow: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _22Nested.setFollowupMode: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _22Nested.switchModelConfig: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _240Nested.modifiedInput: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _241Nested.modifiedInput: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _257Nested.autoResolution: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _294Nested.display: 联合类型（15 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _298Nested.spec: JSON Schema type "{}"
+- `(字段降级→Object?)` — 字段 _31Nested.autoResolution: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _31Nested.payload: 联合类型（3 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _328Nested.currentValue: 多型 type [string,boolean] P0 不生成
+- `(字段降级→Object?)` — 字段 _34Nested.window: 联合类型（9 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _392Nested.level: 联合类型（5 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _78Nested.autoResolution: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _86Nested.compact: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _86Nested.fork: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _86Nested.pauseGoal: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _86Nested.queueEdit: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _86Nested.resumeGoal: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _86Nested.sendQueuedNow: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _86Nested.setFollowupMode: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _86Nested.switchModelConfig: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _8Nested.result: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _95Nested.autoResolution: 联合类型（2 支）P0 不生成
+- `(字段降级→Object?)` — 字段 _95Nested.payload: 联合类型（3 支）P0 不生成
+
+## generated 清单
+
+- `activeWorkSummarySchema`
+- `amendWorkflowRunSettingsPayloadSchema`
+- `amendWorkflowRunSettingsResultSchema`
+- `apiRetryStateSchema`
+- `artifactRowSchema`
+- `assistantTextRowSchema`
+- `attachmentRefSchema`
+- `backgroundBashOutputSchema`
+- `backgroundResultOriginMetaSchema`
+- `backgroundWorkSummarySchema`
+- `bashOutputDisplaySchema`
+- `clientHelloSchema`
+- `commandAckSchema`
+- `commandEnvelopeSchema`
+- `commandKeySchema`
+- `commandQueryItemSchema`
+- `commandStateSummarySchema`
+- `commandTypeSchema`
+- `commandsQueryParamsSchema`
+- `commandsQueryResultSchema`
+- `controllerResyncParamsSchema`
+- `controllerResyncResultSchema`
+- `controllerSubscribeParamsSchema`
+- `controllerSubscribeResultSchema`
+- `controllerUnsubscribeParamsSchema`
+- `conversationArtifactTypeSchema`
+- `conversationInputDeliverySchema`
+- `conversationInputDispatchSchema`
+- `conversationInputIntentSchema`
+- `conversationInputOrderSchema`
+- `conversationInputSteerSchema`
+- `conversationOpenTimingSchema`
+- `conversationResyncParamsSchema`
+- `conversationRowTargetSchema`
+- `conversationSnapshotSchema`
+- `conversationTopicFrameSchema`
+- `cuaAppIdentitySchema`
+- `cuaPermissionObservationSchema`
+- `cuaRequestAccessStatusSchema`
+- `errorAttributionSchema`
+- `executionOutputPreviewSchema`
+- `goalIterationStateSchema`
+- `goalStateSchema`
+- `helloMessageSchema`
+- `hookExecutionDescriptorSchema`
+- `hookExecutionProjectionSchema`
+- `hookInvocationRowSchema`
+- `hostCapabilitiesSchema`
+- `inputRoutingSchema`
+- `localTtftBatchSchema`
+- `localTtftClockSchema`
+- `localTtftContextSchema`
+- `localTtftDetailSchema`
+- `localTtftFactsSchema`
+- `localTtftIntervalSchema`
+- `localTtftOutputKindSchema`
+- `localTtftRecordSchema`
+- `modelSelectionSchema`
+- `pendingInteractionSchema`
+- `pendingInteractionSummarySchema`
+- `permissionRequestPayloadSchema`
+- `planItemSchema`
+- `planStateSchema`
+- `presentWorkspaceHookReviewRequestSchema`
+- `queueItemSchema`
+- `queueStateSchema`
+- `reasoningRowSchema`
+- `requestWorkspaceHookReviewTargetSchema`
+- `rowActionsSchema`
+- `rowsWindowSchema`
+- `runningSubagentSummarySchema`
+- `savedWorkflowStartRejectionReasonSchema`
+- `sessionActionAvailabilitySchema`
+- `sessionConfigStateSchema`
+- `sessionControlSchema`
+- `sessionErrorInfoSchema`
+- `sessionMetaStateSchema`
+- `sessionModelTransitionSchema`
+- `sessionPendingInteractionSummarySchema`
+- `sessionPhaseSchema`
+- `sessionSummarySchema`
+- `sessionUsageStateSchema`
+- `sessionWorkflowActivitySchema`
+- `sessionWorkflowPhaseStatusSchema`
+- `sessionWorkflowPhaseSummarySchema`
+- `sessionWorkflowRunSummarySchema`
+- `sessionsIndexSnapshotSchema`
+- `sessionsIndexTopicFrameSchema`
+- `sharedContextRefSchema`
+- `stableForkTargetSchema`
+- `statePatchSchema`
+- `stopTargetKindSchema`
+- `streamablePathSchema`
+- `subagentProjectionStateSchema`
+- `subagentRowSchema`
+- `submissionModeSchema`
+- `subscribeAckSchema`
+- `subscribeParamsSchema`
+- `timelineMarkerLaneSchema`
+- `timelineMarkerRowSchema`
+- `timestampSchema`
+- `toolCallCreateWorkflowDisplaySchema`
+- `toolCallEvalWorkflowSnippetDisplaySchema`
+- `toolCallGetWorkflowRunDisplaySchema`
+- `toolCallListModelsDisplaySchema`
+- `toolCallListWorkflowRunsDisplaySchema`
+- `toolCallResumeWorkflowRunDisplaySchema`
+- `toolCallRowSchema`
+- `toolCallSavedWorkflowListDisplaySchema`
+- `toolOutputSchema`
+- `toolProgressSchema`
+- `topicFrameDeliveryKindSchema`
+- `topicWireChecksumSchema`
+- `turnHeaderRowSchema`
+- `turnWorkSegmentSchema`
+- `userInputOptionPayloadSchema`
+- `userInputQuestionPayloadSchema`
+- `userInputRequestPayloadSchema`
+- `userInputRowSchema`
+- `v4AttachmentAbortParamsSchema`
+- `v4AttachmentBeginParamsSchema`
+- `v4AttachmentChunkParamsSchema`
+- `v4AttachmentChunkResultSchema`
+- `v4AttachmentCommitParamsSchema`
+- `v4AttachmentCommitResultSchema`
+- `v4AttachmentPreviewSourceParamsSchema`
+- `v4AttachmentPutParamsSchema`
+- `v4AttachmentPutResultSchema`
+- `v4AttachmentReadParamsSchema`
+- `v4AttachmentReadResultSchema`
+- `v4BackgroundBashOutputParamsSchema`
+- `v4ConnectionFlowParamsSchema`
+- `v4ConnectionFlowStateSchema`
+- `v4ConversationAttachmentReadParamsSchema`
+- `v4ConversationAttachmentReadResultSchema`
+- `v4ConversationAttachmentStatParamsSchema`
+- `v4ConversationAttachmentStatResultSchema`
+- `v4ConversationFileChangesParamsSchema`
+- `v4ConversationFileChangesResultSchema`
+- `v4ConversationFileRewindPreviewParamsSchema`
+- `v4ConversationFileRewindPreviewResultSchema`
+- `v4ConversationPlansParamsSchema`
+- `v4ConversationPlansResultSchema`
+- `v4ConversationResyncParamsSchema`
+- `v4ConversationResyncResultSchema`
+- `v4ConversationRowsRangeParamsSchema`
+- `v4ConversationRowsRangeResultSchema`
+- `v4ConversationSubscribeParamsSchema`
+- `v4ConversationSubscribeResultSchema`
+- `v4ConversationUnsubscribeParamsSchema`
+- `v4ConversationUsageParamsSchema`
+- `v4ConversationUsageResultSchema`
+- `v4ConversationWorkflowRunArtifactDataParamsSchema`
+- `v4ConversationWorkflowRunArtifactDataResultSchema`
+- `v4ConversationWorkflowRunArtifactReadParamsSchema`
+- `v4ConversationWorkflowRunArtifactReadResultSchema`
+- `v4ConversationWorkflowRunArtifactsParamsSchema`
+- `v4ConversationWorkflowRunArtifactsResultSchema`
+- `v4ConversationWorkflowRunEventsParamsSchema`
+- `v4ConversationWorkflowRunEventsResultSchema`
+- `v4ConversationWorkflowRunNodeResultParamsSchema`
+- `v4ConversationWorkflowRunNodeResultResultSchema`
+- `v4ConversationWorkflowRunSummarySchema`
+- `v4ConversationWorkflowRunWorkspaceParamsSchema`
+- `v4ConversationWorkflowRunWorkspaceResultSchema`
+- `v4ConversationWorkflowRunsParamsSchema`
+- `v4ConversationWorkflowRunsResultSchema`
+- `v4SessionsIndexSubscribeResultSchema`
+- `v4UsageStatsParamsSchema`
+- `v4UsageStatsResultSchema`
+- `v4WorkspaceConfigSubscribeResultSchema`
+- `windowHostControllerTaskActivitySchema`
+- `windowHostControllerTaskFrameSchema`
+- `windowHostControllerTaskRowSchema`
+- `windowHostControllerTasksSnapshotSchema`
+- `windowHostControllerTopicSchema`
+- `windowHostControllerWorkspaceFactSchema`
+- `windowHostControllerWorkspaceFrameSchema`
+- `windowHostControllerWorkspacesSnapshotSchema`
+- `windowHostTaskAddressSchema`
+- `workflowLaunchMetaSchema`
+- `workflowRunActorSchema`
+- `workflowRunArtifactKindSchema`
+- `workflowRunArtifactSchema`
+- `workflowRunArtifactSummarySchema`
+- `workflowRunArtifactVersionSchema`
+- `workflowRunConcurrencySchema`
+- `workflowRunEntryRefSchema`
+- `workflowRunHeaderKeySchema`
+- `workflowRunHeaderPatchSchema`
+- `workflowRunHeaderSchema`
+- `workflowRunNodeLastToolSchema`
+- `workflowRunNodeSchema`
+- `workflowRunPendingQuestionSchema`
+- `workflowRunPhaseSchema`
+- `workflowRunReportSchema`
+- `workflowRunSchema`
+- `workflowRunSettingsRejectionReasonSchema`
+- `workflowRunUnlistedPhaseSchema`
+- `workflowRunUsageSchema`
+- `workflowRunWorkspaceNodeErrorSchema`
+- `workflowRunWorkspaceNodeKindSchema`
+- `workflowRunWorkspaceNodeSchema`
+- `workflowRunWorkspaceNodeStatusSchema`
+- `workflowRunWorkspaceNodeSummarySchema`
+- `workflowRunsStateSchema`
+- `workflowSettingsAmendMetaSchema`
+- `workspaceConfigOptionSchema`
+- `workspaceConfigSelectValueSchema`
+- `workspaceConfigSnapshotSchema`
+- `workspaceConfigStateSchema`
+- `workspaceConfigTopicFrameSchema`
+- `workspaceHookAdmissionStateSchema`
+- `workspaceHookReviewCommandTargetSchema`
+- `workspaceHookReviewDecisionSchema`
+- `workspaceHookReviewRequestPayloadSchema`
+- `workspaceHookReviewTrustStateSchema`
+- `workspaceHookTrustRevokeTargetSchema`
+- `workspaceSlashCommandSchema`

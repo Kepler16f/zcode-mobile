@@ -1189,7 +1189,12 @@ async function main() {
       "utf8",
     );
     // Node 版假执行桥（与 Android ExecBridge 同契约）：钩子命令在这里真的被 bash 执行。
-    const bashPath = process.env.ZCODE_SMOKE_BASH ?? "C:/Program Files/Git/bin/bash.exe";
+    // bash 按平台取：CI 是 ubuntu，本机是 Git for Windows。
+    // 写死 Windows 路径时，CI 上钩子命令一条都跑不起来，
+    // 那些「钩子有没有生效」的判据会全部落空（看着像功能没实现，其实是环境路径不对）。
+    const bashPath = process.env.ZCODE_SMOKE_BASH ?? (process.platform === "win32"
+      ? "C:/Program Files/Git/bin/bash.exe"
+      : "/bin/bash");
     (globalThis as { zcodeExec?: unknown }).zcodeExec = {
       exec(payloadJson: string): string {
         const req = JSON.parse(payloadJson) as {
