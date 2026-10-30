@@ -41,7 +41,7 @@ class UIChromeBridge(
     @JavascriptInterface
     fun setThemeDark(dark: Boolean) {
         prefs().edit().putBoolean(KEY_DARK, dark).apply()
-        applyChrome(dark)
+        activity.runOnUiThread { applyChrome(dark) }
     }
 
     /**

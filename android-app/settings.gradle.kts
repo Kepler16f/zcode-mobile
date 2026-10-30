@@ -1,9 +1,11 @@
 pluginManagement {
     repositories {
-        // 走国内镜像：repo.maven.apache.org 在本机直连会 read timeout，白烧 20 分钟构建。
-        maven("https://maven.aliyun.com/repository/public")
-        maven("https://maven.aliyun.com/repository/google")
-        maven("https://maven.aliyun.com/repository/gradle-plugin")
+        // 国内开发机优先镜像；GitHub runner 直接访问官方源，避免镜像 502 禁用仓库后级联失败。
+        if (!System.getenv("CI").equals("true", ignoreCase = true)) {
+            maven("https://maven.aliyun.com/repository/public")
+            maven("https://maven.aliyun.com/repository/google")
+            maven("https://maven.aliyun.com/repository/gradle-plugin")
+        }
         google()
         mavenCentral()
         gradlePluginPortal()
@@ -13,8 +15,10 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        maven("https://maven.aliyun.com/repository/public")
-        maven("https://maven.aliyun.com/repository/google")
+        if (!System.getenv("CI").equals("true", ignoreCase = true)) {
+            maven("https://maven.aliyun.com/repository/public")
+            maven("https://maven.aliyun.com/repository/google")
+        }
         google()
         mavenCentral()
     }

@@ -106,6 +106,13 @@ android {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
         }
     }
+
+    testOptions.unitTests.isIncludeAndroidResources = true
+    testOptions.unitTests.all {
+        it.systemProperty("robolectric.dependency.repo.url", if (System.getenv("CI").equals("true", ignoreCase = true))
+            "https://repo.maven.apache.org/maven2" else "https://maven.aliyun.com/repository/public")
+        it.testLogging.exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
 
 tasks.register<Sync>("copyMobileRuntime") {
@@ -311,6 +318,8 @@ tasks.named("publishDebugApk") { dependsOn("repackDebugApk") }
 tasks.named("publishReleaseApk") { dependsOn("repackReleaseApk") }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
     // 外壳只用原生 Activity，避免 appcompat 连带 kotlinx-coroutines 等传递依赖。
     implementation("androidx.webkit:webkit:1.12.1")
     // SAF 树（外部工作区）的读写口：TreeBridge 用 DocumentFile 走授权 URI，

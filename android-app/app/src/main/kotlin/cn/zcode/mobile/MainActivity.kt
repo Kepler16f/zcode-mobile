@@ -19,6 +19,7 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
 
 class MainActivity : Activity() {
@@ -169,7 +170,11 @@ class MainActivity : Activity() {
             // 深色模式（§1.5.19）：主题由页面 CSS + .dark class 自己管，禁止 WebView 再叠一层
             // 算法反色 —— 两层同时作用时深浅色切一半、图片颜色漂移（OPPO ColorOS 会把强制深色
             // 推给用户，浅色 App 也照样被"优化"）。关掉后深浅色只认页面自己。
-            WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, false)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                settings.isAlgorithmicDarkeningAllowed = false
+            } else if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+                WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, false)
+            }
             // 附件选择（§1.5.17）要求 allowContentAccess 是 **true**：系统选择器交回来的是
             // `content://` URI，Chromium 用 ContentResolver 读它来构造 File 对象。应用私有目录
             // （凭据密文、会话库）只能经 file:// 到达，那条被 allowFileAccess=false 关着。
@@ -219,12 +224,11 @@ class MainActivity : Activity() {
                 }
             }
             // 不装这个，`<input type="file">` 在 WebView 里是死的：Chromium 把选择请求直接丢掉。
-            // 切后台/锁屏时系统可能回收 WebView 的渲染进程，正在跑的那一轮就此中断
-        // （用户报"一锁屏工作流就被掐断"）。这个开关告诉系统：本 WebView 很重要，
-        // 即使不可见也尽量留着渲染进程。第二个参数 false = 不随可见性降级。
-        webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+            // 配置 apply 的接收者：冷启动时 Activity.webView 尚未赋值，读取它会直接闪退；
+            // 渲染进程重建时它也仍指向已销毁的旧视图。false = 不随可见性降级。
+            setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
 
-        webChromeClient = fileChooser
+            webChromeClient = fileChooser
 
             // 沉浸后状态栏/键盘那条带露出来的是 WebView 自己的 padding 底，所以这块必须跟主题：
             // 0.3.7 写死 #161616，浅色主题就会在状态栏底下压一条深带。读上次存的主题布尔

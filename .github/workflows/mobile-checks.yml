@@ -81,8 +81,8 @@ jobs:
           node mobile-runtime/build/mcp-runtime-smoke.mjs
           cd zcode
           node --import tsx --test packages/services/test/mobileOAuthRecovery.test.ts
-      - name: Assemble debug APK
+      - name: Android activity regression and APK
         working-directory: android-app
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --no-daemon -PappVersion=0.10.1
+          ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon -PappVersion=0.10.1

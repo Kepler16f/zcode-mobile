@@ -64,14 +64,9 @@ const sseFrame = (content) => ({
  *     一旦 signal 被 abort，用 rejectRead 打断挂住的 read（复刻真 fetch 的 abort→reject 语义），
  *     否则看门狗"叫得响但没人应"，测的就不是真链路。
  */
-function installFakeFetch(frames, { closeAfter = true, errorBody = false, freezeMs = 0 } = {}) {
+function installFakeFetch(frames, { closeAfter = true, errorBody = false } = {}) {
   const original = globalThis.fetch;
   globalThis.fetch = async (_url, init) => {
-    // 冻结页面：事件循环被占住，timer 只能晚点触发（切后台/锁屏的宿主行为）。
-    if (freezeMs > 0) {
-      const until = Date.now() + freezeMs;
-      while (Date.now() < until) { /* 故意阻塞事件循环 */ }
-    }
     const encoder = new TextEncoder();
     let i = 0;
     let rejectRead = null;
@@ -167,22 +162,49 @@ await check("吐了一帧后卡住 → 仍报 model.streamIdle（帧间上限独
 });
 
 await check("页面被冻结（锁屏/切后台）后 timer 迟到 → 赦免，不掐断这一轮", async () => {
-  // 复刻 Android WebView 的冻结：事件循环被卡住，timer 只能晚点触发。
-  // 窗口 1000ms、冻结 1500ms：迟到量 1.5 倍窗口。旧判据（迟到要超过 3 倍窗口才赦免）
-  // 会把这一轮判成"网关卡死"并 abort —— 用户报的就是"一锁屏工作流就被掐断"。
-  const restore = installFakeFetch([sseFrame("回来之后")], { closeAfter: true, freezeMs: 1500 });
-  try {
-    const r = await streamModelCompletion({
-      target: TARGET,
-      messages: MSGS,
-      onDelta,
-      firstByteTimeoutMs: 1000,
-      frameIdleTimeoutMs: 1000,
+  // 真正触发迟到的回调，再给响应。此前同步阻塞 fetch 后立即返回正文，
+  // 正文会先清掉 timer，根本没覆盖赦免分支。
+  const original = { fetch: globalThis.fetch, now: Date.now, setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout };
+  let clock = 100_000;
+  let nextId = 0;
+  const timers = new Map();
+  let deliver;
+  let signal;
+  Date.now = () => clock;
+  globalThis.setTimeout = (callback, ms) => { const id = ++nextId; timers.set(id, { callback, ms }); return id; };
+  globalThis.clearTimeout = id => timers.delete(id);
+  globalThis.fetch = async (_url, init) => {
+    signal = init.signal;
+    const body = new ReadableStream({
+      start(controller) {
+        signal.addEventListener("abort", () => controller.error(new Error("aborted")));
+        deliver = () => {
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(sseFrame("回来之后"))}\n\ndata: [DONE]\n\n`));
+          controller.close();
+        };
+      },
     });
+    return new Response(body, { headers: { "content-type": "text/event-stream" } });
+  };
+  try {
+    const running = streamModelCompletion({ target: TARGET, messages: MSGS, onDelta, firstByteTimeoutMs: 45_000 });
+    // 防止失败用例提前 reject 产生未处理异常。
+    running.catch(() => {});
+    const timer = [...timers.values()].find(t => t.ms === 45_000);
+    if (!timer || !deliver) throw new Error("没有建立首字节计时器和等待流");
+    clock += 46_500; // 迟到 1.5 秒，远小于旧判据要求的 3 倍窗口。
+    timer.callback();
+    const survived = !signal.aborted && nextId >= 2;
+    if (survived) deliver();
+    else { await running.catch(() => {}); throw new Error("迟到 timer 仍然中止了模型流"); }
+    const r = await running;
     if (!r || r.text !== "回来之后") throw new Error("正文不对：" + JSON.stringify(r));
     return { text: r.text };
   } finally {
-    restore();
+    globalThis.fetch = original.fetch;
+    Date.now = original.now;
+    globalThis.setTimeout = original.setTimeout;
+    globalThis.clearTimeout = original.clearTimeout;
   }
 });
 
