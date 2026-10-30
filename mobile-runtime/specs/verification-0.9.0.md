@@ -62,3 +62,26 @@ APK内entry.js、zcode-ui.css、diffs.worker.js及core bundle均与已测试文�
 用户确认版本 0.9.1；assembleDebug 成功，versionCode 9001。下载副本与构建产物 SHA256 一致：`008f362719186683d9f68462872e3e3decb6334a77af591b3122ed0601047dd2`。
 APK 14,652,014 B，签名证书 SHA256 `3780e70fcf38bd759a502463dbdbd6b91140d0d43904ded2e9c7b65bf01e5dfe`，与 0.9.0 一致。复制验证后清理旧版 aZCode 包 1 个。包内 UI/core/CSS 与已测产物一致，59 个 KaTeX 字体齐全，未包含 assets/www。
 代码提交 `bc8642c` 已推送并核对 origin/main。期间系统长暂停使 Gradle 墙钟耗时包含数小时暂停，不能用作正常构建耗时。
+
+## 0.10.0 安装包交付
+
+用户确认版本 0.10.0。新增能力：会话分叉、子代理后台执行与续接（含跨进程）、Git 面板
+（丢弃改动/分支比较/提交信息/推送/指定起点建分支）、文件监视（轮询形态）。
+
+- 构建：assembleDebug 成功，versionCode 9010，文件名 aZCode-0.10.0.apk。
+- 交付前重压重签：条目按等级 9 重压 → zipalign → 同一 debug keystore 重新签名。
+  重压前后条目数 5236 一致，逐条 CRC/大小/压缩方式一致（verify-repacked-apk）。
+- 体积：17,138,665 B → **12,888,672 B**（省 4.25 MB；0.9.2 为 14,652,462 B）。
+- 签名：v2 + v3，证书 SHA-256 `3780e70fcf38bd759a502463dbdbd6b91140d0d43904ded2e9c7b65bf01e5dfe`，
+  与此前各版一致，可覆盖安装。
+- 下载副本 SHA256 与构建产物一致：`11e2a0ff47a6d85d702d86d07a12545a32fea0d3e58b2d4a096afa015068aa01`。
+- 包内：assets/ui 5163 个文件与 dist-ui 逐一对应，59 个 KaTeX 字体齐全，无 assets/www，
+  entry.js / zcode-ui.css / core bundle 与已测产物哈希一致；zipalign 校验通过。
+- 未验证：真机安装与运行（无真机）；Start Plan 真实领取与消费仍需官方账号。
+
+验证：新增文件监视 12/12、会话分叉 19/19、子代理后台与续接 20/20（含跨进程续接）、
+Git 面板（真实本地 HTTP 推送）；回归对话 137/137、会话存储 25/25、运行时可靠性、任务写链、
+用量统计、工作区隔离、工具边界、Git 工具、移动端 090、SAF 写回、Start Plan、配额传输、
+启动路径、真实路径、原生异步桥、APK 交付、输入恢复、MCP、Skills/Subagents、能力真实性全部通过；
+界面回归 mobile-090-e2e 与 fork-ui-e2e 通过（分叉按钮 → 切到子会话 → 渲染派生来源标记）；
+类型检查通过，Lint 70 warnings / 0 errors，架构 0 violations。
