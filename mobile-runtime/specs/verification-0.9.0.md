@@ -122,3 +122,9 @@ CI 用的固定测试版本号同步到 0.10.1。
 
 APK 重压任务也改成**永不失败**：缺 keystore、缺 build-tools、CI 环境一律跳过并记一行日志
 （Exec 任务里 return 不等于跳过，必须放 onlyIf）。
+
+随后又暴露两处**只在 CI 上出现**的失败：钩子冒烟与对话冒烟里的假执行桥都写死了
+`C:/Program Files/Git/bin/bash.exe`，ubuntu 上每条钩子命令都跑不起来，于是「钩子有没有生效」
+的判据全部落空——看着像功能没实现，其实是环境路径不对。两处都改成按平台取 bash
+（win32 用 Git Bash，其余用 /bin/bash），并在真的找不到 shell 时**如实跳过**而不是报失败。
+修完后 CI 首次转绿（run 41017083092，commit 59a10d6）。
