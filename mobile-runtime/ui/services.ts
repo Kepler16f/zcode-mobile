@@ -90,6 +90,7 @@ import { createMobileMemoryContext } from "./memory-context.js";
 import { desktopCompatibilityVersion } from "./server-compat.js";
 import { createToolEngineFactory } from "./tool-engine.js";
 import { createMobileMcpRuntime } from "./mcp-runtime.js";
+import { localWorkspacePath } from "../compat/workspace-aliases.mjs";
 import { createMobileWindowControllerService } from "./window-controller.js";
 import { notSupportedDeferred, withUnsupportedFallback, unsupportedCalls } from "./stand-in.js";
 
@@ -380,6 +381,7 @@ export async function createMobileServices(options: {
   const skillsService = createSkillsService({ isDesktopRuntime: true });
   const subagentsService = createSubagentsService({ isDesktopRuntime: true });
   const toolEngine: typeof baseToolEngine = async (path, sessionId, signal) => {
+    path = localWorkspacePath(path);
     const base = await baseToolEngine(path, sessionId);
     return base ? mcpRuntime.wrap(base, path, sessionId, signal) : null;
   };
@@ -391,6 +393,8 @@ export async function createMobileServices(options: {
           onDiagnostic: trace,
           sessionStore,
           toolEngine,
+          releaseWorkspaceTools: path => mcpRuntime.releaseWorkspace(localWorkspacePath(path)),
+          releaseAllTools: () => mcpRuntime.invalidate(),
           capabilities: { skillsService, subagentsService },
           memoryContext: createMobileMemoryContext(settingService),
         }),

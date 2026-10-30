@@ -53,8 +53,8 @@ export function createMobileGitService(options: { load?: (workspacePath: string)
     }
     return out;
   }
-  async function summary(workspacePath: string): Promise<GitRepositorySummary> {
-    const ctx = await safeLoad(workspacePath);
+  async function summary(workspacePath: string, contextSnapshot?: GitContext | null, stateSnapshot?: GitFileState[]): Promise<GitRepositorySummary> {
+    const ctx = contextSnapshot === undefined ? await safeLoad(workspacePath) : contextSnapshot;
     const base: GitRepositorySummary = { workspacePath, repoRoot: workspacePath, workspaceInRepoPath: "",
       autoRefreshWatchPaths: [], branchName: null, trackingBranchName: null, headRefType: "branch",
       ahead: 0, behind: 0, isDirty: false, isGitAvailable: Boolean(ctx), isRepository: Boolean(ctx?.isRepository) };
@@ -82,7 +82,7 @@ export function createMobileGitService(options: { load?: (workspacePath: string)
         ahead = local.filter((c) => !remoteIds.has(c.oid)).length;
         behind = upstream.filter((c) => !localIds.has(c.oid)).length;
     }
-    const states = await scanGitStates(ctx);
+    const states = stateSnapshot ?? await scanGitStates(ctx);
     return { ...base, branchName, trackingBranchName: tracking, headRefType: branchName ? "branch" : "detached",
       ahead, behind, isDirty: states.length > 0 };
   }
@@ -181,8 +181,9 @@ export function createMobileGitService(options: { load?: (workspacePath: string)
     getIdentity: ({ workspacePath }) => identity(workspacePath),
     async refresh({ workspacePath, includeIdentity, includeBranchComparison }) {
       const ctx = await safeLoad(workspacePath);
-      const repo = await summary(workspacePath);
       const states = ctx?.isRepository ? await scanGitStates(ctx) : [];
+      // 同一刷新共用扫描事实，避免 summary 与 changes 重复读盘/hash，并减少两次读取间的状态漂移。
+      const repo = await summary(workspacePath, ctx, states);
       return { summary: repo, identity: includeIdentity && ctx?.isRepository ? await identity(workspacePath) : null,
         unstagedChanges: ctx?.isRepository ? await changes(ctx, "unstaged", states) : [],
         stagedChanges: ctx?.isRepository ? await changes(ctx, "staged", states) : [],

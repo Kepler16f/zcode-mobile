@@ -45,6 +45,7 @@ async function unmergedPaths(ctx: GitScanContext): Promise<Set<string>> {
 
 export async function scanGitStates(ctx: GitScanContext, target?: string): Promise<GitFileState[]> {
   const rows: GitFileState[] = [];
+  let yieldedAt = Date.now();
   const filemode = await ctx.git.getConfig({ fs: ctx.fs, dir: ctx.dir, path: "core.filemode" });
   const conflicts = await unmergedPaths(ctx);
   await ctx.git.walk({
@@ -52,7 +53,14 @@ export async function scanGitStates(ctx: GitScanContext, target?: string): Promi
     // 默认 walker 会并发展开所有文件，逐项读取避免整仓库同时分配内存。
     iterate: async (walk: (child: unknown) => Promise<unknown>, children: Iterable<unknown>) => {
       const results: unknown[] = [];
-      for (const child of children) results.push(await walk(child));
+      for (const child of children) {
+        results.push(await walk(child));
+        // 原生文件桥虽然包成 Promise，仍是同步 JNI；只 await 会连续耗尽微任务，让页面无法绘制。
+        if (Date.now() - yieldedAt >= 12) {
+          await new Promise<void>(resolve => setTimeout(resolve, 0));
+          yieldedAt = Date.now();
+        }
+      }
       return results;
     },
     map: async (name: string, entries: Array<Entry | null>) => {

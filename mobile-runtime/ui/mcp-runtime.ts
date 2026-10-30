@@ -7,7 +7,7 @@ import { bridgeHttpRaw, bytesFromBase64 } from "./git-tool.js";
 type Loader = (request: { workspacePath: string }) => Promise<{ servers: NativeMcpServerRecord[] }>;
 type Status = ZCodeMcpListResult["statuses"][string];
 type Session = { client: Client; fingerprint: string; tools: ModelToolSpec[]; names: Map<string, string>; timeout: number };
-type Workspace = { sessions: Map<string, Session>; statuses: Record<string, Status>; generation: number; pending: Promise<void> };
+type Workspace = { path: string; abort: AbortController; retired: boolean; sessions: Map<string, Session>; statuses: Record<string, Status>; generation: number; pending: Promise<void> };
 const timeoutDefault = 15_000;
 const safeName = (name: string) => name.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_") || "unknown";
 const status = (transport: Status["transport"], kind: Status["status"], count = 0, error?: string): Status => ({
@@ -24,7 +24,8 @@ function bytesToBase64(bytes: Uint8Array): string {
 /** 原生桥仅支持完整响应；禁止常驻 GET，避免把后台任务永久占住。 */
 export async function mobileMcpFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const bridge = (globalThis as { zcodeGitHttp?: { start?: unknown; poll?: unknown; cancel?: unknown } }).zcodeGitHttp;
-  if (!bridge) return fetch(input, init);
+  // 自定义认证头不会像 Authorization 一样被浏览器自动剥离，必须拒绝跳转到另一服务。
+  if (!bridge) return fetch(input, { ...init, redirect: "error" });
   if (typeof bridge.start !== "function" || typeof bridge.poll !== "function" || typeof bridge.cancel !== "function") {
     throw new Error("移动 MCP 需要可取消的原生 HTTP 后台任务桥");
   }
@@ -81,16 +82,22 @@ export function createMobileMcpRuntime(options: { loadServers: Loader; fetch?: t
     // 身份和路径同时纳入 key，防止身份偶然复用时跨工作区共享连接。
     const key = JSON.stringify([identity?.trim() || path, path, probe ? "probe" : "agent"]);
     let found = workspaces.get(key);
-    if (!found) { found = { sessions: new Map(), statuses: {}, generation: 0, pending: Promise.resolve() }; workspaces.set(key, found); }
+    if (!found) { found = { path, abort: new AbortController(), retired: false, sessions: new Map(), statuses: {}, generation: 0, pending: Promise.resolve() }; workspaces.set(key, found); }
     return found;
   }
-  function invalidate() {
-    for (const ws of workspaces.values()) {
+  function releaseWorkspace(path?: string) {
+    for (const [key, ws] of workspaces) {
+      if (path !== undefined && ws.path !== path) continue;
+      // 先退休并移除所有者，再关闭连接；配置加载/握手中的迟到结果不得重新挂回旧工作区。
+      ws.retired = true;
+      ws.abort.abort();
       ws.generation++;
       for (const session of ws.sessions.values()) void session.client.close().catch(() => {});
       ws.sessions.clear(); ws.statuses = {};
+      workspaces.delete(key);
     }
   }
+  function invalidate() { releaseWorkspace(); }
   async function connect(record: NativeMcpServerRecord, signal?: AbortSignal): Promise<Session> {
     const transport = configuredTransport(record);
     if (transport !== "http" || record.config.oauth) throw new Error(transport === "stdio" ? "移动端尚不支持 MCP stdio 持续进程" : transport === "sse" ? "移动端尚不支持旧版 MCP SSE 传输" : "移动端尚不支持 MCP OAuth 授权");
@@ -130,12 +137,15 @@ export function createMobileMcpRuntime(options: { loadServers: Loader; fetch?: t
     return running;
   }
   async function refreshWorkspace(ws: Workspace, path: string, signal?: AbortSignal, explicit?: NativeMcpServerRecord[]) {
+    if (ws.retired) return ws;
+    signal = signal ? AbortSignal.any([signal, ws.abort.signal]) : ws.abort.signal;
     const generation = ws.generation;
     const records = effectiveRecords(explicit ?? (await options.loadServers({ workspacePath: path })).servers);
+    if (ws.retired) return ws;
     const active = new Set(records.map(r => r.name));
     for (const [name, old] of ws.sessions) if (!active.has(name)) { ws.sessions.delete(name); void old.client.close().catch(() => {}); }
     for (const record of records) {
-      if (signal?.aborted) break;
+      if (signal?.aborted || ws.retired) break;
       const type = configuredTransport(record);
       const current = ws.sessions.get(record.name);
       if (current && (current.fingerprint !== configFingerprint(record) || record.enabled === false || record.config.enabled === false)) {
@@ -148,7 +158,7 @@ export function createMobileMcpRuntime(options: { loadServers: Loader; fetch?: t
           if (ws.generation !== generation) { void session.client.close().catch(() => {}); continue; }
           ws.sessions.set(record.name, session);
         } catch (error) {
-          if (signal?.aborted) break;
+          if (signal?.aborted || ws.retired) break;
           const message = error instanceof Error && /尚不支持|覆盖了 MCP|名称冲突|分页游标|数量超过|无内嵌凭据/.test(error.message) ? error.message : "MCP 连接或工具发现失败，请检查地址、网络和认证配置";
           ws.statuses[record.name] = status(type, "failed", 0, message); continue;
         }
@@ -208,5 +218,5 @@ export function createMobileMcpRuntime(options: { loadServers: Loader; fetch?: t
     }
     return { statuses };
   }
-  return { wrap, listStatuses, invalidate };
+  return { wrap, listStatuses, invalidate, releaseWorkspace };
 }

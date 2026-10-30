@@ -84,6 +84,35 @@ try {
   assert.equal(unsupported.status, "failed");
   assert.match(unsupported.error, /stdio/);
   runtime.invalidate();
+  records = [{ name: "sample", source: "zcodeagentmcp", scope: "workspace", config: {type:"http",url} }];
+  const releasedEngine = await runtime.wrap(base,"/release","session");
+  runtime.releaseWorkspace("/release");
+  assert.deepEqual((await runtime.listStatuses({workspacePath:"/release",workspaceIdentity:"session",mode:"status"})).statuses,{});
+  assert.equal((await releasedEngine.execute({id:"released",name:"mcp__sample__echo",arguments:'{"message":"stale"}'})).isError,true);
+  let releaseLoad;
+  let loadStarted;
+  const started = new Promise(resolve=>loadStarted=resolve);
+  const delayed = createMobileMcpRuntime({loadServers:async()=>{loadStarted();return new Promise(resolve=>releaseLoad=resolve);}});
+  const pending = delayed.wrap(base,"/retired","session");
+  await started;
+  delayed.releaseWorkspace("/retired");
+  const requestsBefore = listCalls;
+  releaseLoad({servers:records});
+  assert.equal((await pending).tools.length,0,"释放后的延迟配置不能再次建立连接");
+  assert.equal(listCalls,requestsBefore);
+  runtime.invalidate();
+  let redirectedHits = 0;
+  const target = http.createServer((req,res)=>{redirectedHits++;res.end("unexpected");});
+  await new Promise(resolve=>target.listen(0,"127.0.0.1",resolve));
+  const redirector = http.createServer((req,res)=>{res.writeHead(302,{location:`http://127.0.0.1:${target.address().port}/`});res.end();});
+  await new Promise(resolve=>redirector.listen(0,"127.0.0.1",resolve));
+  try {
+    await assert.rejects(mobileMcpFetch(`http://127.0.0.1:${redirector.address().port}/`,{headers:{"X-MCP-Token":"fixture-secret"},redirect:"follow"}));
+    assert.equal(redirectedHits,0,"不能把自定义认证头带往跳转目标");
+  } finally {
+    redirector.closeAllConnections();target.closeAllConnections();
+    await Promise.all([new Promise(resolve=>redirector.close(resolve)),new Promise(resolve=>target.close(resolve))]);
+  }
   let cancelled = false;
   globalThis.zcodeGitHttp = {
     call() { throw new Error("同步桥不应被调用"); },

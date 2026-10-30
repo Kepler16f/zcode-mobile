@@ -66,7 +66,11 @@ globalThis.fetch = async (_url, init) => {
   }
   return new Response(sse({ content: "Done." }), { headers: { "content-type": "text/event-stream" } });
 };
+const releasedWorkspaces = [];
+let releasedAll = 0;
 const agent = createMobileAgentService({
+  releaseWorkspaceTools: path => releasedWorkspaces.push(path),
+  releaseAllTools: () => { releasedAll++; },
   sessionStore: store,
   memoryContext:async()=>memoryEnabled?{root:"/work/profile/memory",content:"MEMORY_INDEX_SENTINEL"}:null,
   capabilities: {
@@ -217,9 +221,12 @@ try {
   assert.equal(restored.session.status, "completed", "中断轮次不得恢复为仍在执行");
   assert.ok(restored.messages.some(m => m.info.finish === "interrupted"), "恢复的助手内容应标记为中断");
   recovered.disposeAll();
+  await agent.disposeWorkspace({workspacePath:"/work/test"});
+  assert.deepEqual(releasedWorkspaces,["/work/test"]);
   console.log("runtime-reliability-smoke: PASS");
 } finally {
   agent.disposeAll();
+  assert.equal(releasedAll,1,"全局释放必须转发到工具连接所有者");
   streamController?.error(new Error("test cleanup"));
   globalThis.fetch = oldFetch;
   unlinkSync(out);

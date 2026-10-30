@@ -248,11 +248,20 @@ export function createMobileSessionStore(
     load(sessionId) {
       const row = db
         .prepare(
-          "SELECT session_id, workspace_path, summary, state, updated_at FROM mobile_sessions WHERE session_id = ?",
+          "SELECT session_id, workspace_path, summary, substr(state, 1, 65536) AS state, length(state) AS state_size, updated_at FROM mobile_sessions WHERE session_id = ?",
         )
         .get(sessionId);
       if (!row) return null;
-      const state = parseState(row["state"]);
+      // 用量迁移已分块，但打开会话曾仍取整个单行，超出 Android CursorWindow 后会假装历史丢失。
+      // SQL 的 length/substr 都按字符计数，不能用 JS UTF-16 长度作为中文/emoji 的分页偏移。
+      const parts = [String(row["state"] ?? "")];
+      for (let start = 65537; start <= Number(row["state_size"]); start += 65536) {
+        const part = db.prepare("SELECT substr(state, ?, 65536) AS part FROM mobile_sessions WHERE session_id = ? AND updated_at = ?")
+          .get(start, sessionId, row["updated_at"]);
+        if (!part) throw new Error("会话在读取期间发生变化，请重试");
+        parts.push(String(part.part ?? ""));
+      }
+      const state = parseState(parts.join(""));
       const summary = parseSummary(row["summary"]);
       if (!state || !summary) {
         say(`会话 ${sessionId} 的持久化记录解析失败，按没有处理（不还原半截状态）`);

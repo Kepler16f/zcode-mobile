@@ -5,7 +5,7 @@
 //   A. taskIndexRepo.queryTaskList 的 excludeTaskIdPrefix 谓词
 //      （substr(task_id,1,?) != ?）到底走索引还是全表扫；
 //      带/不带这个谓词，列表查询与 COUNT 查询各差多少。
-//   B. session-store.save() 现在写**两份**（mobile_sessions + mobile_session_usage），
+//   B. session-store.save() 只写主表，收轮显式写 usage 投影，
 //      每次落盘的额外成本（agent.ts 的 checkpoint 每 5 秒一次，这条是它的放大器）。
 //   C. listUsageStates() 读用量投影要发多少条 SQL —— 端侧每条都是一次 JNI 往返。
 //
@@ -197,7 +197,7 @@ check(
   `totalWith=${totalWith} totalWithout=${totalWithout}`,
 );
 
-// ══ B. session-store.save() 现在的双写 ══════════════════════════════════════
+// ══ B. session-store.save() 的单写回归 ══════════════════════════════════════
 // agent.ts 的 persistSession → store.save()；0.9.0 的 scheduleCheckpoint 让它每 5 秒跑一次。
 const storeOut = path.join(here, `.tmp-startup-path-store.mjs`);
 await esbuild.build({
@@ -279,9 +279,9 @@ out.storeSave = {
   statementsPerSave: { prepare: sqlCount.prepare / 5, run: sqlCount.run / 5 },
 };
 check(
-  "B1 一次落盘确实发了两条 INSERT（主表 + usage 投影表）",
-  sqlCount.run / 5 === 2,
-  `每落盘 prepare=${sqlCount.prepare / 5} run=${sqlCount.run / 5}（0.9.0 之前只有 1 条）`,
+  "B1 每次检查点只发一条 INSERT（主表），不双写统计投影",
+  sqlCount.run / 5 === 1,
+  `每落盘 prepare=${sqlCount.prepare / 5} run=${sqlCount.run / 5}（预期单条）`,
 );
 
 // 单独量「只写主表」的代价：拿 store 建好的那份库（同一引擎、同一张表）比一条手写 INSERT。
@@ -297,11 +297,11 @@ for (let i = 0; i < 5; i++) {
 singleTimes.sort((a, b) => a - b);
 const singleMedian = singleTimes[2];
 out.storeSave.singleWriteMedianMs = Number(singleMedian.toFixed(2));
-out.storeSave.doubleWriteOverheadMs = Number((saveMedian - singleMedian).toFixed(2));
+out.storeSave.storeOverheadMs = Number((saveMedian - singleMedian).toFixed(2));
 check(
-  "B2 双写让单次落盘成本不超过 3 倍（agent.ts 每 5 秒落一次盘）",
+  "B2 单写落盘与基准同量级（agent.ts 每 5 秒落一次盘）",
   saveMedian <= singleMedian * 3 + 2,
-  `双写 ${saveMedian.toFixed(2)}ms vs 单写 ${singleMedian.toFixed(2)}ms（${ROWS} 行 / ${stateJsonBytes} 字节）`,
+  `store ${saveMedian.toFixed(2)}ms vs 单写 ${singleMedian.toFixed(2)}ms（${ROWS} 行 / ${stateJsonBytes} 字节）`,
 );
 
 // ══ C. listUsageStates() 的语句条数（端侧每条 = 一次 JNI 往返）════════════════

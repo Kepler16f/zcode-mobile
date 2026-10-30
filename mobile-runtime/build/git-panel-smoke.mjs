@@ -134,6 +134,19 @@ try {
   const budget = await preview(Array.from({ length: 1400 }, (_, i) => `old ${i}\n`).join(""), Array.from({ length: 1400 }, (_, i) => `new ${i}\n`).join(""));
   assert.equal(budget.diff.availability, "truncated");
   assert.equal((await preview("", "\n".repeat(50_001))).diff.availability, "truncated");
+  let scans = 0;
+  let ticks = 0;
+  const instrumented = { ...git, walk: async args => { scans++; return git.walk(args); } };
+  const measured = createMobileGitService({load: async () => ({git:instrumented,fs,dir,isRepository:true})});
+  for(let i=0;i<120;i++) fs.writeFileSync(`${dir}/heartbeat-${i}.txt`, "test");
+  const timer = setInterval(()=>ticks++,0);
+  try {
+    const result = await measured.refresh({workspacePath:dir});
+    assert.equal(scans,1,"一次刷新只遍历一次工作树");
+    assert.equal(result.summary.isDirty,true);
+    assert.ok(result.unstagedChanges.length >= 120);
+    assert.ok(ticks > 0,"长目录扫描必须给主事件循环让出时间");
+  } finally { clearInterval(timer); }
   console.log("git-panel-smoke: PASS");
 } finally {
   fs.unlinkSync(out);

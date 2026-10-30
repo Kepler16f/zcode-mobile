@@ -245,6 +245,9 @@ export interface MobileAgentServiceOptions {
    * instanceof 只有同源才成立）。
    */
   toolEngine?: ToolEngineFactory | null;
+  /** 连接仍由组合根的工具运行时拥有，Agent 只转发生命周期。 */
+  releaseWorkspaceTools?: (workspacePath: string) => void;
+  releaseAllTools?: () => void;
   /**
    * 钩子运行时工厂（默认 = hooks-mobile.createMobileHookRuntime，走出货的 core bundle 路径）。
    * 自检注入用：Node 里那条 `../mobile/dist/zcode-core.mobile.js` 解析不到，注入的工厂
@@ -4632,6 +4635,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
      * resyncConversationV4 报 fault.subscription.notOwned，而桌面上那条订阅 id 仍然有效。
      */
     async disposeWorkspace(params: { workspacePath: string }): Promise<void> {
+      options.releaseWorkspaceTools?.(params.workspacePath);
       for (const session of sessions.values()) {
         if (session.workspacePath === params.workspacePath) {
           session.run?.abort.abort();
@@ -4643,6 +4647,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
 
     disposeAll(): void {
+      options.releaseAllTools?.();
       if (typeof document !== "undefined") document.removeEventListener("visibilitychange", checkpointOnBackground);
       if (flushTimer) clearTimeout(flushTimer);
       flushTimer = null;

@@ -10,6 +10,7 @@ mobile-runtime/build/dist/
 mobile-runtime/build/.tmp-*
 android-app/app/build/
 android-app/.gradle/
+android-app/.kotlin/
 android-app/build/
 android-app/keystore/
 android-app/local.properties

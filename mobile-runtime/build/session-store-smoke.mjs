@@ -223,6 +223,35 @@ check("迁移长历史时界面计时器仍可运行", migrationTicks > 20, Stri
 const again = await largeStore.listUsageStates();
 check("迁移后的投影保留真实轮次用量", JSON.stringify(again[0].state.turnUsage) === JSON.stringify(facts[0].state.turnUsage));
 
+// 模拟 Android CursorWindow 单行限制，不能用 sql.js 能容纳整行来误判真机恢复正常。
+const probe = DatabaseSync("/work/.zcode/cursor-probe.sqlite");
+const proto = Object.getPrototypeOf(probe);
+const prepare = proto.prepare;
+let largestString = 0;
+proto.prepare = function(sql) {
+  const stmt = prepare.call(this,sql);
+  for (const method of ["get","all"]) {
+    const original = stmt[method].bind(stmt);
+    stmt[method] = (...args) => {
+      const result = original(...args);
+      const rows = method === "all" ? result : [result];
+      for (const row of rows) for (const value of Object.values(row ?? {})) {
+        if (typeof value !== "string") continue;
+        largestString = Math.max(largestString, value.length);
+        if (value.length > 256 * 1024) throw new Error("CursorWindow row too big");
+      }
+      return result;
+    };
+  }
+  return stmt;
+};
+try {
+  const restored = largeStore.load("legacy-0");
+  check("多MB会话恢复不超过CursorWindow限制且中文emoji完整", restored?.state.rows[0].text === "大段历史😀".repeat(400000));
+} catch(e) { check("多MB会话恢复不超过CursorWindow限制且中文emoji完整", false, String(e)); }
+finally { proto.prepare = prepare; probe.close(); }
+check("恢复每次读取字段有界", largestString <= 256 * 1024, String(largestString));
+
 // 读用量让出主线程时保存新会话：不能混拼正文或覆盖新投影。
 const racingStore = createMobileSessionStore({dbPath:"/work/.zcode/smoke-racing.sqlite"});
 const oldEntry = makeEntry("racing");

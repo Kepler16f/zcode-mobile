@@ -56,3 +56,9 @@ APK内entry.js、zcode-ui.css、diffs.worker.js及core bundle均与已测试文�
 - 架构检查：0 violations，baseline 0，new 0。
 - 源码 freshness 检查发现当前 main 落后 origin/main 3 个提交；本轮保留已有移植工作树，没有自动合并上游版本更新。此项未记为通过。
 - Android 真机未连接；上述交互验证使用 Chromium 和真实移动构建产物，原生桥由测试夹具替代的场景已单独标明。
+
+## 0.9.1 安装包交付
+
+用户确认版本 0.9.1；assembleDebug 成功，versionCode 9001。下载副本与构建产物 SHA256 一致：`008f362719186683d9f68462872e3e3decb6334a77af591b3122ed0601047dd2`。
+APK 14,652,014 B，签名证书 SHA256 `3780e70fcf38bd759a502463dbdbd6b91140d0d43904ded2e9c7b65bf01e5dfe`，与 0.9.0 一致。复制验证后清理旧版 aZCode 包 1 个。包内 UI/core/CSS 与已测产物一致，59 个 KaTeX 字体齐全，未包含 assets/www。
+代码提交 `bc8642c` 已推送并核对 origin/main。期间系统长暂停使 Gradle 墙钟耗时包含数小时暂停，不能用作正常构建耗时。
