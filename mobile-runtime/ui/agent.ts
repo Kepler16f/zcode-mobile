@@ -106,7 +106,7 @@ import { AGENT_TOOL, SKILL_TOOL, discoverMobileCapabilities, executeMobileSkill,
 import * as vfs from "../compat/vfs.mjs";
 import { parseDsmlCalls } from "./dsml.js";
 import { markJankPhase } from "./jank-witness.js";
-import type { MobileSessionStore, PersistedSession, PersistedTurnUsage } from "./session-store.js";
+import type { MobileSessionStore, PersistedSession, PersistedSessionState, PersistedTurnUsage } from "./session-store.js";
 import { localWorkspacePath } from "../compat/workspace-aliases.mjs";
 import { createMobilePluginFace } from "./plugins-mobile.js";
 import { createMobileAttachments } from "./attachments.js";
@@ -1238,10 +1238,57 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
             : {}),
           phase: session.control.phase,
           lastError: session.control.lastError,
+          // 子会话的模型 transcript 一并落盘：续接子代理要靠它，进程重启后才有得续。
+          ...(subagentTranscriptOf(session.sessionId)
+            ? { subagentTranscript: subagentTranscriptOf(session.sessionId)! }
+            : {}),
         },
       });
     } catch (e) {
       say(`会话 ${session.sessionId} 落盘失败（重启后将看不到这一轮）：${String((e as Error)?.message ?? e)}`);
+    }
+  }
+
+  /**
+   * 子会话当前持有的 transcript（落盘用）。
+   * 附件不落盘：会话库不是附件仓库，base64 图片会把库撑成几倍。
+   */
+  function subagentTranscriptOf(sessionId: string): PersistedSessionState["subagentTranscript"] | undefined {
+    const run = subagentRuns.get(sessionId);
+    if (!run) return undefined;
+    return {
+      agentType: run.agentType,
+      messages: run.messages.map((message) => ({
+        role: message.role,
+        content: message.content,
+        ...(message.toolCalls ? { toolCalls: message.toolCalls } : {}),
+        ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+      })),
+    };
+  }
+
+  /**
+   * 从持久化里取上一次子代理的 transcript（进程重启后续接用）。
+   * 没有就返回 null：调用方据此如实报错，不新开一个假装是续接的子代理。
+   */
+  function persistedSubagentResume(agentId: string): { agentId: string; agentType: string; messages: ModelTurnMessage[] } | null {
+    if (!store) return null;
+    try {
+      const persisted = store.load(agentId);
+      const transcript = persisted?.state.subagentTranscript;
+      if (!transcript || !Array.isArray(transcript.messages) || !transcript.messages.length) return null;
+      return {
+        agentId,
+        agentType: transcript.agentType,
+        messages: transcript.messages.map((message) => ({
+          role: message.role,
+          content: message.content,
+          ...(message.toolCalls ? { toolCalls: message.toolCalls as ModelToolCall[] } : {}),
+          ...(message.toolCallId ? { toolCallId: message.toolCallId } : {}),
+        })),
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -3354,8 +3401,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
               persistUsageProjection(childSession);
               persistSession(session);
             };
-            // 续接：模型给的是上一次子代理的 agentId。找不到记录就让 runMobileSubagent
-            // 报具体原因（记录只在本次进程内有效），不新开一个假装是续接。
+            // 续接：模型给的是上一次子代理的 agentId。先看本次进程内的记录，
+            // 没有就从持久化里取（子会话的 transcript 一并落盘，重启后仍可续接）。
             const resumeId = (() => {
               try {
                 const parsed = JSON.parse(call.arguments || "{}") as { resume?: unknown };
@@ -3364,9 +3411,12 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                 return "";
               }
             })();
+            const resumeRecord = resumeId
+              ? (subagentRuns.get(resumeId) ?? persistedSubagentResume(resumeId) ?? undefined)
+              : undefined;
             outcome = await runMobileSubagent({
               rawArguments: call.arguments, agents: capabilities.agents, skills: capabilities.skills,
-              ...(resumeId && subagentRuns.has(resumeId) ? { resume: subagentRuns.get(resumeId)! } : {}),
+              ...(resumeRecord ? { resume: resumeRecord } : {}),
               workspacePath: session.workspacePath, mode: executionModeOf(session), parentTarget: target, modelTargets: targets,
               availableTools: [...engine!.tools, SKILL_TOOL], signal,
               onStarted: info => {
@@ -3375,7 +3425,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                 if (info.resumed) {
                   // 续接：同一个子会话开新一轮，上一轮的行与边界都留着；
                   // 父会话另起一行指向它（两轮各自可追溯）。
-                  const existing = sessions.get(info.id);
+                  // 进程重启后内存里没有这个子会话，从库里还原（它连同 transcript 一起落过盘）。
+                  const existing = sessions.get(info.id) ?? restoreSession(info.id, session.workspacePath);
                   if (!existing) throw new Error("要续接的子代理会话已不在本次运行中。");
                   if (existing.workspacePath !== session.workspacePath) {
                     throw new Error("要续接的子代理属于另一个工作区，不能在这里继续。");

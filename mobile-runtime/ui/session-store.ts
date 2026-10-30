@@ -60,6 +60,20 @@ export interface PersistedSessionState {
   contextSummaryCoveredThroughRowId?: number;
   phase: SessionControl["phase"];
   lastError: SessionControl["lastError"];
+  /**
+   * 子代理的模型 transcript（只有子会话有）。续接子代理要靠它——没有这一段，
+   * 进程重启后子代理只记得「上次让我做什么」，不记得「上次做到哪」。
+   * 附件（base64 图片）不落盘：会话库不是附件仓库，带进去会把库撑成几倍。
+   */
+  subagentTranscript?: {
+    agentType: string;
+    messages: Array<{
+      role: "system" | "user" | "assistant" | "tool";
+      content: string;
+      toolCalls?: unknown[];
+      toolCallId?: string;
+    }>;
+  };
 }
 
 export interface PersistedSession {
@@ -140,6 +154,10 @@ function parseState(raw: unknown): PersistedSessionState | null {
         : {}),
       phase: parsed.phase as SessionControl["phase"],
       lastError: (parsed.lastError ?? null) as SessionControl["lastError"],
+      ...(parsed.subagentTranscript && typeof parsed.subagentTranscript === "object"
+        && Array.isArray((parsed.subagentTranscript as { messages?: unknown }).messages)
+        ? { subagentTranscript: parsed.subagentTranscript as PersistedSessionState["subagentTranscript"] }
+        : {}),
     };
   } catch {
     return null;

@@ -104,7 +104,7 @@ globalThis.fetch = async (_url, init) => {
   return new Response(sse({ content: step.text }), { headers: { "content-type": "text/event-stream" } });
 };
 
-const agent = createMobileAgentService({
+const serviceOptions = {
   sessionStore: store,
   capabilities: {
     skillsService: { list: async () => ({ skills: [], diagnostics: [] }) },
@@ -148,7 +148,8 @@ const agent = createMobileAgentService({
     grantRoot() {},
     revokeRoot() {},
   }),
-});
+};
+const agent = createMobileAgentService(serviceOptions);
 
 const results = [];
 const check = (name, ok, detail = "") => results.push({ name, ok: Boolean(ok), detail });
@@ -261,6 +262,39 @@ try {
     "续接不存在的子代理没有如实报错",
   );
   check("续接不存在的子代理如实报错", JSON.stringify(requests.at(-1)?.messages).includes("不在本次运行中"));
+
+  // ── G. 进程重启后仍可续接（子代理 transcript 落盘） ──
+  const restarted = createMobileAgentService(serviceOptions);
+  const hello2 = await restarted.helloConversationV4();
+  await restarted.initializeConversationV4({
+    kind: "clientHello",
+    protocolVersion: hello2.protocolVersion,
+    clientId: getV4ClientId(),
+    clientKind: "mobileApp",
+    appVersion: "test",
+  });
+  const send2 = (type, sid, payload) =>
+    restarted.sendConversationCommandV4({ workspacePath: "/work/test", envelope: createCommandEnvelope({ type, sessionId: sid, payload }) });
+  const created2 = await send2("createSession", null, { workspaceId: "test" });
+  const sessionId2 = created2.result.sessionId;
+  const childId = firstLink?.childSessionId;
+  check("上一轮的子代理 id 可用于续接", typeof childId === "string" && childId.length > 0, String(childId));
+  parentPlan = [{ tool: agentTool({ prompt: "after restart", resume: childId }) }];
+  childPlan = [{ text: "CHILD_AFTER_RESTART" }];
+  await send2("sendText", sessionId2, { text: "Resume after restart" });
+  await wait(
+    () => JSON.stringify(requests.at(-1)?.messages ?? []).includes("CHILD_AFTER_RESTART"),
+    "重启后的续接没有跑起来",
+    10000,
+  );
+  check(
+    "重启后可以续接上一次子代理（不再报不在本次运行中）",
+    !JSON.stringify(requests.at(-1)?.messages ?? []).includes("不在本次运行中"),
+    JSON.stringify(requests.at(-1)?.messages ?? []).slice(-300),
+  );
+  const restartedTranscript = JSON.stringify(childRequests.at(-1)?.messages ?? []);
+  check("重启后的续接带着上一次落盘的 transcript", restartedTranscript.includes("CHILD_FIRST_ROUND"), restartedTranscript.slice(0, 220));
+  check("重启后的续接带着上一次的输入", restartedTranscript.includes("first task"), restartedTranscript.slice(0, 220));
 
   const failed = results.filter(r => !r.ok);
   for (const r of results) console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok || !r.detail ? "" : `  → ${r.detail}`}`);
