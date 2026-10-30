@@ -1,9 +1,9 @@
 ---
 doc_id: azcode-flutter-assessment-2026-10-30
 type: assessment-report
-status: draft-pending-owner-decision
+status: superseded-by-owner-decision-2026-10-30
 date: 2026-10-30
-revision: 2
+revision: 3
 tree: D:\Zcode @ de979a9 ("fix(mobile): themed dialogs, clearing pending badge and background survival")
 scope: aZCode 手机端（android-app + mobile-runtime）+ 桌面端（zcode/packages/desktop）
 method: 六路并行只读调研 + 主代理实测复核
@@ -20,6 +20,20 @@ related:
 > 本文档**只记录事实与判断，不含执行授权**——决策状态是「待业主拍板」。
 >
 > ⚠️ **本工作树在评估期间被并发推进过**（见 §6）。所有数字已对 `de979a9` 重新校准，但**引用前请确认 HEAD 未再变动**。
+
+---
+
+## ⚖️ 业主决策记录（2026-10-30）
+
+本评估的**事实部分（F-01…F-15）全部有效**，作为重构的约束输入；但 §0 的"不建议全面 Flutter 重构"结论**已被业主推翻**。业主拍板记录：
+
+1. **决定**：启动 Flutter 全面重构（UI + 端侧运行时）。范围＝评估 §5 否决的"全面 Flutter 化"，由业主明确推翻否决。
+2. **分叉态度**：接受与上游永久分叉，**但要求保留可跟随上游更新的办法**。→ 落法见 `docs/flutter-rewrite-plan.md`：上游耦合收敛为两个"替换件"（内核 JS bundle + 协议 zod schema），协议类型走**代码生成**而非手写双实现，上游同步流程机械化。
+3. **动机**：T-3（桌面+手机+鸿蒙三端收敛一套代码）＋ 业主个人偏好。评估 §5 中"Flutter 化桌面"的 F-12 代价已告知，业主接受并在执行计划中排为后期阶段。
+4. **决策门状态**：roadmap §6 Workstream D 的 D-01 两问已答清（UI 换、接受分叉），D-02/D-03 的"最小原型"阶段被跳过——业主直接授权全面重构，不先做原型验证。
+5. **roadmap A/B/C 工作流的地位**：不删除。过渡期（Flutter UI 未完成前）现有 WebView 应用继续迭代，A/B/C 继续有效；A-03/A-04（shiki 语言集/Office 预览裁剪）随 Flutter UI 完成而自然失效，届时标记 `已否决（被 Flutter 重构取代）`。
+
+执行计划（里程碑/验收判据/同步流程）：**`docs/flutter-rewrite-plan.md`**。
 
 ---
 

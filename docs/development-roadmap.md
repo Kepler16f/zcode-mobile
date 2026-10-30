@@ -16,6 +16,8 @@ related:
 
 # aZCode 手机端开发路线图（agent 可执行版）
 
+> **⚖️ 状态变更（2026-10-30）**：业主已拍板启动 **Flutter 全面重构**，执行计划见 `docs/flutter-rewrite-plan.md`。本路线图 A/B/C 工作流**降级为过渡期质量加固项**——Flutter UI 完成前，现有 WebView 应用仍是交付线，A/B/C 继续有效并照常认领；Workstream D 决策门已按业主授权开启（跳过 D-02 原型，直接全面重构）。评估事实 F-01…F-15 对新架构仍然有效。
+
 > **这份路线图是评估结论的落地部分。** 评估（`docs/flutter-refactor-assessment.md`）的结论是"不建议全面 Flutter 重构"，所以本路线图的主线是**不换语言、把现有架构做扎实**；Flutter 作为一个**条件触发的决策门**挂在 Workstream D 上，不在主线上。
 >
 > **使用方式**：每个 item 有唯一 ID、明确改动点（`file:line`）、**可执行的验收判据**、风险与预估。认领一个 item 时：

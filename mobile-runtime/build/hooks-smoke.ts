@@ -100,7 +100,12 @@ function reset() {
 
 /** Node 版假执行桥：契约 = zcodeExec.exec(JSON) → JSON（与 Android ExecBridge 同形状）。 */
 function installFakeExecBridge() {
-  const bash = process.env.ZCODE_SMOKE_BASH ?? "C:/Program Files/Git/bin/bash.exe";
+  // bash 的位置按平台取：CI 是 ubuntu（本机是 Git for Windows）。
+  // 之前写死 Windows 路径，CI 上找不到 bash，假执行桥每次都失败，
+  // 于是「钩子跑没跑」的判据全部落空 —— 看着像钩子没实现，其实是环境路径不对。
+  const bash = process.env.ZCODE_SMOKE_BASH ?? (process.platform === "win32"
+    ? "C:/Program Files/Git/bin/bash.exe"
+    : "/bin/bash");
   (globalThis as { zcodeExec?: unknown }).zcodeExec = {
     exec(payloadJson: string): string {
       const req = JSON.parse(payloadJson) as {
@@ -154,6 +159,15 @@ function installFakeExecBridge() {
 
 async function main() {
   const results: Array<{ name: string; ok: boolean; detail: string }> = [];
+  // 没有 bash 就没法真跑钩子命令：如实跳过，而不是把"环境缺 shell"报成"钩子没实现"。
+  const bashPath = process.env.ZCODE_SMOKE_BASH ?? (process.platform === "win32"
+    ? "C:/Program Files/Git/bin/bash.exe"
+    : "/bin/bash");
+  if (!existsSync(bashPath)) {
+    process.stdout.write(`SKIP 端侧钩子自检：找不到 bash（${bashPath}），本机无法执行钩子命令
+`);
+    return;
+  }
   const check = (name: string, ok: boolean, detail = "") => results.push({ name, ok, detail });
   reset();
   installFakeExecBridge();
