@@ -119,6 +119,31 @@ export function statSync(p) {
   return mkStat(path, st);
 }
 
+/**
+ * 批量 stat（SAF 形态）。SAF 每次 stat 是一次跨进程往返（约 30–40ms），
+ * 逐个 stat 会把调用方的轮询变成几十秒的卡顿，所以这里如实按顺序逐个取，
+ * 调用方据此决定要不要降级为目录级监视。
+ */
+export function statMany(paths) {
+  return (paths ?? []).map((path) => {
+    const p = norm(path);
+    try {
+      const st = statJSON(p);
+      if (!st || !st.exists) return { path: p, ok: true, exists: false, kind: "missing", mtimeMs: 0, size: 0 };
+      return {
+        path: p,
+        ok: true,
+        exists: true,
+        kind: String(st.kind ?? "file"),
+        mtimeMs: Number(st.mtimeMs ?? 0),
+        size: Number(st.size ?? 0),
+      };
+    } catch (error) {
+      return { path: p, ok: false, exists: false, kind: "missing", mtimeMs: 0, size: 0, message: String(error?.message ?? error) };
+    }
+  });
+}
+
 /** lstat 与 stat 同形（没有链接可区分），这是如实语义不是近似。 */
 export function lstatSync(p) {
   return statSync(p);

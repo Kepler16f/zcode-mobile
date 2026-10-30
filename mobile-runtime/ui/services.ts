@@ -40,6 +40,7 @@ import {
   IUsageStatsService,
   IClientConfigService,
   IClientScenesService,
+  IFileWatcherService,
 } from "@zcode/services";
 import { ZCODE_VERSION, buildRuntimeZCodeEndpointUrls } from "@zcode/shared";
 import { createClientConfigService } from "@zcode/services/deep/client-config/clientConfigService.js";
@@ -87,6 +88,7 @@ import { createMobileConnectivityTester } from "./model-connectivity.js";
 import { createMobileSystemService } from "./system.js";
 import { createMobileUsageStatsService } from "./usage-stats.js";
 import { createMobileMemoryContext } from "./memory-context.js";
+import { createMobileFileWatcherService } from "./file-watcher.js";
 import { desktopCompatibilityVersion } from "./server-compat.js";
 import { createToolEngineFactory } from "./tool-engine.js";
 import { createMobileMcpRuntime } from "./mcp-runtime.js";
@@ -483,6 +485,13 @@ export async function createMobileServices(options: {
         ),
     },
     { name: "skillsService", descriptor: ISkillsService, make: () => skillsService },
+    {
+      // 文件监视（0.9.3）：桌面用 fs.watch，Android 没有 inotify，改用有上限的轮询签名。
+      // 工作区文件树与 Git 面板的自动刷新都走这一面；页面不可见时自动停摆。
+      name: "fileWatcherService",
+      descriptor: IFileWatcherService,
+      make: () => createMobileFileWatcherService({ onDiagnostic: trace }),
+    },
     { name: "subagentsService", descriptor: ISubagentsService, make: () => subagentsService },
     { name: "commandsService", descriptor: ICommandsService, make: () => createCommandsService({ isDesktopRuntime: false }) },
     { name: "memoryService", descriptor: IMemoryService, make: () => createMemoryService() },
@@ -611,7 +620,7 @@ export async function createMobileServices(options: {
     "offPeakTaskService",
     // gitService 已经不在这份名单里了（0.4.11 A3）：注册了诚实降级面（isGitAvailable:false），
     // UI 的 Git 面板走"Git 不可用"分支而不是报错。gitCheckpointService 仍在（依赖真 git）。
-    "gitCheckpointService", "fileWatcherService", "botsService", "feedbackService",
+    "gitCheckpointService", "botsService", "feedbackService",
     "skillSyncService", "pluginSyncService",
     // windowControllerService 已经不在这份名单里了：listTaskList 与那两个 topic 的实时帧都是真的
     // （侧栏那一行从这里读、重拉从这里触发）。

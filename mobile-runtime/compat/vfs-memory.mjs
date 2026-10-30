@@ -151,6 +151,26 @@ export function statSync(p) {
   return mkStat(n);
 }
 
+/** 批量 stat（内存盘形态）：与真盘同名接口同形状，供 vfs 派发层统一调用。 */
+export function statMany(paths) {
+  return (paths ?? []).map((path) => {
+    const p = norm(path);
+    try {
+      const st = statSync(p);
+      return {
+        path: p,
+        ok: true,
+        exists: true,
+        kind: st.isDirectory() ? "dir" : st.isSymbolicLink() ? "link" : "file",
+        mtimeMs: Number(st.mtimeMs ?? 0),
+        size: Number(st.size ?? 0),
+      };
+    } catch (error) {
+      return { path: p, ok: false, exists: false, kind: "missing", mtimeMs: 0, size: 0, message: String(error?.message ?? error) };
+    }
+  });
+}
+
 function follow(path) {
   let cur = nodes.get(path);
   let hops = 0;

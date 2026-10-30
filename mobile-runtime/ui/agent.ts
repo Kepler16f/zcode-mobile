@@ -460,6 +460,7 @@ function buildAvailability(
   switchModel: boolean,
   hasQueuedItems: boolean,
   compactReady: boolean,
+  fork: { allowed: true } | { allowed: false; reasonCode: string },
 ) {
   const closed = { allowed: false as const, reasonCode: "mobile.p0.notImplemented" };
   const busy = { allowed: false as const, reasonCode: "mobile.p0.busy" };
@@ -467,7 +468,9 @@ function buildAvailability(
   const queueReady = { allowed: true } as const;
   const queueEmpty = { allowed: false as const, reasonCode: "mobile.queue.empty" };
   return {
-    fork: gate,
+    // 分叉（0.9.2 已接）：桌面端只要求目标是"已完成的最后一段助手回复"，
+    // 父轮在跑不影响（分叉是会话内复制，不停父轮、不回滚工作区）。
+    fork,
     // compact（0.7.4 已接）：空闲且没在压缩才允许；对话进行中置 busy（runCompact 另有单飞闸）。
     compact: compactReady ? queueReady : busy,
     switchModelConfig: running
@@ -511,6 +514,18 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   const pendingDeltas = new Map<string, ConversationDelta[]>();
   const checkpointTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * 后台子代理登记册：父会话 id → 子会话 id → 取消闸。
+   * 唯一所有者是 Agent 服务（子会话、subagent 行、落盘都在这里）；
+   * 技能/子代理设置服务不持有运行状态，用户停止/工作区释放靠它收口。
+   */
+  const backgroundChildren = new Map<string, Map<string, AbortController>>();
+  /**
+   * 可续接的子代理运行记录：agentId → 上一次的 transcript。
+   * 唯一所有者是 Agent 服务；进程结束即失效（端侧没有把子代理 transcript 落盘的形状，
+   * 所以「重启后继续上次的子代理」明确不支持，续接请求会带具体原因报错）。
+   */
+  const subagentRuns = new Map<string, { agentId: string; agentType: string; messages: ModelTurnMessage[] }>();
   // 切后台时 timer 可能被冻结；尽力先保存当前内存事实，再交给系统回收。
   const checkpointOnBackground = () => {
     if (typeof document === "undefined" || document.visibilityState !== "hidden") return;
@@ -807,12 +822,20 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   }
 
   function availabilityOf(session: MobileSession): ConversationSnapshot["availability"] {
+    // 分叉可用性：至少有一条"已完成且是本轮最后一段"的助手回复才是稳定边界；
+    // 压缩进行中历史正在被摘要替换，此刻任何边界都不稳定（协议 guard.compactOperationLock）。
+    const fork = session.compactRun
+      ? { allowed: false as const, reasonCode: "mobile.fork.busy" }
+      : session.rows.some((row) => row.kind === "assistantText" && row.actions?.canFork === true)
+        ? { allowed: true as const }
+        : { allowed: false as const, reasonCode: "mobile.fork.unavailable" };
     return buildAvailability(
       // compact 动作的开关随"有没有在跑别的活"：压缩进行中不能再开第二次（runCompact 里也有单飞闸）。
       session.run !== null || session.compactRun !== undefined,
       Boolean(options.modelTargets),
       session.queue.items.length > 0,
       session.run === null && session.compactRun === undefined,
+      fork,
     );
   }
 
@@ -2089,6 +2112,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         ...assistant,
         state,
         ...(outcome.kind === "success" ? { model: outcome.model } : {}),
+        // 分叉入口由 row.actions.canFork 驱动（UI 只认这一格）：只有"已完成且有正文"的
+        // 这一轮最后一段助手回复才是稳定边界，桌面端同一口径（resolveStableForkCandidate）。
+        ...(state === "complete" && assistant.text.length > 0
+          ? { actions: { ...(assistant.actions ?? {}), canFork: true } }
+          : {}),
       });
     }
 
@@ -2277,16 +2305,26 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     return `${call.name}:${typeof path === "string" ? path : call.arguments.slice(0, 200)}`;
   }
 
+  /** 两个取消闸合成一个：任一 abort 即 abort。都没有时返回 undefined（没有闸）。 */
+  function combineAbortSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
+    if (!a) return b;
+    if (!b) return a;
+    return AbortSignal.any([a, b]);
+  }
+
   function requestToolApproval(
     session: MobileSession,
     interactionId: string,
     toolCallId: string,
     call: { name: string; arguments: string },
+    extraSignal?: AbortSignal,
   ): Promise<"allow" | "deny" | "abort"> {
     if (executionModeOf(session) === "yolo") return Promise.resolve("allow");
     // 命中"始终允许"记忆：不再弹窗，直接放行（弹窗消失、composer 不进 pending 态）。
     if (alwaysApproved.get(session)?.has(alwaysKey(call))) return Promise.resolve("allow");
-    const signal = session.run?.abort.signal;
+    // 后台子代理的父轮可能已经收口（session.run 为 null）：那时只有子代理自己的取消闸
+    // 能收掉这张弹窗，否则就成了一张「无人应答的永久挂起」。
+    const signal = combineAbortSignals(session.run?.abort.signal, extraSignal);
     const payload = {
       kind: "permission" as const,
       toolCallId,
@@ -2419,11 +2457,12 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     call: { name: string; arguments: string },
     deniedPath: string,
     scope: string,
+    extraSignal?: AbortSignal,
   ): Promise<"allow_once" | "allow_always" | "deny" | "abort"> {
     if (executionModeOf(session) === "yolo") return Promise.resolve("allow_always");
     const alwaysKey = `Path:${scope}`;
     if (alwaysApproved.get(session)?.has(alwaysKey)) return Promise.resolve("allow_always");
-    const signal = session.run?.abort.signal;
+    const signal = combineAbortSignals(session.run?.abort.signal, extraSignal);
     const payload = {
       kind: "permission" as const,
       toolCallId,
@@ -2783,6 +2822,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     ];
     // 子代理使用同一轮的 Hook、审批和文件端口；不能直接把 engine.execute 暴露给子模型。
     const executeChildTool: ExecuteSubagentTool = async (call, child) => {
+      // 子代理的取消闸：前台时就是父轮本轮的信号；后台时是「父轮信号 + 后台自己的闸」
+      // 合成的那一个。闸换掉了，模式/授权/审批的入口没换——后台子代理的写操作同样要过闸。
+      const childSignal = child.signal ?? signal;
       const timeline = sessions.get(child.agentId) ?? session;
       const childTurn = timeline === session ? handles.turnId : timeline.rows[0]!.turnId;
       const rowId = takeRowId(timeline);
@@ -2799,10 +2841,10 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       if (!engine || !child.allowedToolNames.includes(call.name)) return fail("子代理无权使用此工具。");
       let allowedByHook = false;
       const extra: string[] = [];
-      if (hookRuntime?.enabled && !signal.aborted) {
+      if (hookRuntime?.enabled && !childSignal.aborted) {
         try {
           const pre = await hookRuntime.run("PreToolUse", { ...hookInputBase(), toolName: call.name,
-            toolInput: safeParseToolInput(call.arguments), toolCallId }, { matchValues: [call.name], signal });
+            toolInput: safeParseToolInput(call.arguments), toolCallId }, { matchValues: [call.name], signal: childSignal });
           extra.push(...(pre.additionalContexts ?? []));
           if (pre.updatedInput !== undefined) call.arguments = JSON.stringify(pre.updatedInput);
           if (pre.permissionBehavior === "deny") return fail(String(pre.hookPermissionDecisionReason ?? pre.stopReason ?? "Hook 拒绝此调用。"));
@@ -2817,10 +2859,10 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       const needsApproval = mobileNeedsToolApproval(childMode, call.name, engine.approvalRequired(call.name));
       if (needsApproval && !allowedByHook) {
         let decision: { behavior?: "allow" | "deny"; message?: string } | null = null;
-        if (hookRuntime?.enabled && !signal.aborted) {
+        if (hookRuntime?.enabled && !childSignal.aborted) {
           try {
             const permission = await hookRuntime.run("PermissionRequest", { ...hookInputBase(), toolName: call.name,
-              toolInput: safeParseToolInput(call.arguments), toolCallId }, { matchValues: [call.name], signal });
+              toolInput: safeParseToolInput(call.arguments), toolCallId }, { matchValues: [call.name], signal: childSignal });
             extra.push(...(permission.additionalContexts ?? []));
             decision = permission.permissionRequestResult ?? (permission.permissionBehavior === "deny"
               ? { behavior: "deny", message: permission.hookPermissionDecisionReason ?? permission.stopReason }
@@ -2829,29 +2871,29 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         }
         if (decision?.behavior === "deny") return fail(String(decision.message ?? "Hook 拒绝此调用。"));
         if (decision?.behavior !== "allow") {
-          const approval = await requestToolApproval(session, `pi-${child.agentId}-${rowId}`, toolCallId, call);
+          const approval = await requestToolApproval(session, `pi-${child.agentId}-${rowId}`, toolCallId, call, childSignal);
           if (approval !== "allow") return fail(approval === "abort" ? "操作已取消。" : "用户拒绝了此操作。");
         }
       }
-      if (signal.aborted) return fail("操作已取消。");
+      if (childSignal.aborted) return fail("操作已取消。");
       persistSession(timeline);
-      let result = call.name === "Skill" && capabilities ? executeMobileSkill(capabilities.skills, call.arguments) : await engine.execute(call, signal);
+      let result = call.name === "Skill" && capabilities ? executeMobileSkill(capabilities.skills, call.arguments) : await engine.execute(call, childSignal);
       const denied = result.isError ? deniedPathOf(result) : null;
-      if (denied && !signal.aborted) {
+      if (denied && !childSignal.aborted) {
         const scope = grantScopeOf(denied);
-        const approved = executionModeOf(session) === "yolo" ? "allow_always" : await requestPathApproval(session, `pi-${child.agentId}-${rowId}-fs`, toolCallId, call, denied, scope);
+        const approved = executionModeOf(session) === "yolo" ? "allow_always" : await requestPathApproval(session, `pi-${child.agentId}-${rowId}-fs`, toolCallId, call, denied, scope, childSignal);
         if (approved === "allow_once" || approved === "allow_always") {
           engine.grantRoot(scope);
-          try { result = await engine.execute(call, signal); } finally { if (approved === "allow_once") engine.revokeRoot(scope); }
+          try { result = await engine.execute(call, childSignal); } finally { if (approved === "allow_once") engine.revokeRoot(scope); }
         } else return fail(approved === "abort" ? "操作已取消。" : "用户拒绝了对该路径的访问。");
       }
-      if (hookRuntime?.enabled && !signal.aborted) {
+      if (hookRuntime?.enabled && !childSignal.aborted) {
         try {
           const post = await hookRuntime.run(result.isError ? "PostToolUseFailure" : "PostToolUse", {
             ...hookInputBase(), toolName: call.name, toolInput: safeParseToolInput(call.arguments), toolCallId,
-            ...(result.isError ? { error: { message: result.errorMessage ?? result.content }, isInterrupt: signal.aborted }
+            ...(result.isError ? { error: { message: result.errorMessage ?? result.content }, isInterrupt: childSignal.aborted }
               : { toolResponse: { text: capToolContent(result.content) } }),
-          }, { matchValues: [call.name], signal });
+          }, { matchValues: [call.name], signal: childSignal });
           extra.push(...(post.additionalContexts ?? []));
         } catch (error) { say(`子代理 PostToolUse 异常：${String((error as Error)?.message ?? error)}`); }
       }
@@ -3290,14 +3332,58 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
             let childTextRow: Extract<ConversationRow, { kind: "assistantText" }> | undefined;
             // 子代理复用主会话增量合帧；整行重发会重复序列化不断增长的长文本。
             let childLink: Extract<ConversationRow, { kind: "subagent" }> | undefined;
+            /**
+             * 子代理收口：前台在工具调用返回后立刻收；后台在 promise 完成时收。
+             * 两条路径共用这一段，父会话那行 subagent 的状态与子会话的落盘口径完全一致。
+             */
+            let backgroundStarted = false;
+            const settleChild = (result: ToolRunResult, aborted: boolean): void => {
+              if (!childSession || !childLink) return;
+              if (childTextRow) upsertRow(childSession, { ...childTextRow, state: "interrupted" });
+              const phase = aborted ? "completedInterrupted" : result.isError ? "failed" : "completedSuccess";
+              const header = childSession.rows.find(row => row.rowId === childHeaderId);
+              if (header?.kind === "turnHeader") upsertRow(childSession, { ...header, state: phase, endedAt: now() });
+              if (result.isError) {
+                const id = takeRowId(childSession);
+                appendRow(childSession, { rowId: id, turnId: childTurnId, createdAt: now(), createdAtSeq: childSession.seq,
+                  kind: "assistantText", text: result.errorMessage ?? result.content, state: "complete" });
+              }
+              updateState(childSession, { control: settledControl(phase === "failed" ? "error" : phase, null), usage: usageState(childSession) });
+              upsertRow(session, { ...childLink, status: aborted ? "cancelled" : result.isError ? "failed" : "success", endedAt: now() });
+              persistSession(childSession);
+              persistUsageProjection(childSession);
+              persistSession(session);
+            };
+            // 续接：模型给的是上一次子代理的 agentId。找不到记录就让 runMobileSubagent
+            // 报具体原因（记录只在本次进程内有效），不新开一个假装是续接。
+            const resumeId = (() => {
+              try {
+                const parsed = JSON.parse(call.arguments || "{}") as { resume?: unknown };
+                return typeof parsed.resume === "string" ? parsed.resume.trim() : "";
+              } catch {
+                return "";
+              }
+            })();
             outcome = await runMobileSubagent({
               rawArguments: call.arguments, agents: capabilities.agents, skills: capabilities.skills,
+              ...(resumeId && subagentRuns.has(resumeId) ? { resume: subagentRuns.get(resumeId)! } : {}),
               workspacePath: session.workspacePath, mode: executionModeOf(session), parentTarget: target, modelTargets: targets,
               availableTools: [...engine!.tools, SKILL_TOOL], signal,
               onStarted: info => {
-                childSession = createSession(info.id, { ...session.config, model: info.target.model }, session.workspacePath);
                 childTurnId = newId("child-turn");
                 childStartedAt = now();
+                if (info.resumed) {
+                  // 续接：同一个子会话开新一轮，上一轮的行与边界都留着；
+                  // 父会话另起一行指向它（两轮各自可追溯）。
+                  const existing = sessions.get(info.id);
+                  if (!existing) throw new Error("要续接的子代理会话已不在本次运行中。");
+                  if (existing.workspacePath !== session.workspacePath) {
+                    throw new Error("要续接的子代理属于另一个工作区，不能在这里继续。");
+                  }
+                  childSession = existing;
+                } else {
+                  childSession = createSession(info.id, { ...session.config, model: info.target.model }, session.workspacePath);
+                }
                 childHeaderId = takeRowId(childSession);
                 appendRow(childSession, { rowId: childHeaderId, turnId: childTurnId, createdAt: childStartedAt,
                   createdAtSeq: childSession.seq, kind: "turnHeader", origin: "userInput", executionKind: "agent",
@@ -3314,6 +3400,10 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                 appendRow(session, childLink);
                 persistSession(childSession);
                 persistSession(session);
+              },
+              // 续接要靠上一次 transcript：这里把它存下来（同一份数组，继续跑时原地增长）。
+              onTranscript: resume => {
+                subagentRuns.set(resume.agentId, resume);
               },
               onAssistant: text => {
                 if (!childSession) return;
@@ -3345,6 +3435,20 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                   providerId: childSession.config.provider });
               },
               executeTool: executeChildTool,
+              onBackground: handle => {
+                backgroundStarted = true;
+                // 后台子代理：登记到父会话名下，用户停止/工作区释放/全局释放都能收掉它。
+                const bucket = backgroundChildren.get(session.sessionId) ?? new Map<string, AbortController>();
+                bucket.set(handle.id, handle.controller);
+                backgroundChildren.set(session.sessionId, bucket);
+                say(`子代理已在后台启动：${handle.agentType}`);
+                handle.done.then(result => {
+                  bucket.delete(handle.id);
+                  if (!bucket.size) backgroundChildren.delete(session.sessionId);
+                  // 取消闸 abort 时算「被取消」，不是「失败」：状态必须如实。
+                  settleChild(result, handle.signal.aborted || result.errorCode === "mobile.subagentCancelled");
+                });
+              },
               loadAgentsMd: async workspace => {
                 const path = `${workspace.replace(/\/+$/, "")}/AGENTS.md`;
                 if (!vfs.existsSync(path)) return "";
@@ -3353,21 +3457,10 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
                 return read.content;
               },
             });
-            if (childSession && childLink) {
-              if (childTextRow) upsertRow(childSession, { ...childTextRow, state: "interrupted" });
-              const phase = signal.aborted ? "completedInterrupted" : outcome.isError ? "failed" : "completedSuccess";
-              const header = childSession.rows.find(row => row.rowId === childHeaderId);
-              if (header?.kind === "turnHeader") upsertRow(childSession, { ...header, state: phase, endedAt: now() });
-              if (outcome.isError) {
-                const id = takeRowId(childSession);
-                appendRow(childSession, { rowId: id, turnId: childTurnId, createdAt: now(), createdAtSeq: childSession.seq,
-                  kind: "assistantText", text: outcome.errorMessage ?? outcome.content, state: "complete" });
-              }
-              updateState(childSession, { control: settledControl(phase === "failed" ? "error" : phase, null), usage: usageState(childSession) });
-              upsertRow(session, { ...childLink, status: signal.aborted ? "cancelled" : outcome.isError ? "failed" : "success", endedAt: now() });
-              persistSession(childSession);
-              persistUsageProjection(childSession);
-              persistSession(session);
+            // 前台：工具调用返回即已结束；后台：收口在 onBackground 的 promise 里。
+            // 两者的差别只是「什么时候」，收口口径只有这一份。
+            if (childSession && childLink && !backgroundStarted) {
+              settleChild(outcome, signal.aborted);
             }
           } else {
             outcome = await engine!.execute(call, signal);
@@ -3701,6 +3794,155 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   // ── 命令 ──
   function commandKey(envelope: Pick<CommandEnvelope, "commandId" | "sessionId">): string {
     return `${envelope.sessionId ?? "-"}\0${envelope.commandId}`;
+  }
+
+  // ── 会话分叉（forkAssistant，0.9.2）──
+  //
+  // 桌面端的稳定边界裁决在 CLI（product-projection.resolveStableForkCandidate +
+  // session store 的 authoritative 顺序），端侧没有那一层 provider messageId，
+  // 因此这里用协议里同一套 guard 值复核"目标行是不是稳定边界"：
+  //   ① 压缩进行中      → guard.compactOperationLock（历史正在被摘要替换）
+  //   ② 不是助手回复行  → guard.forkAssistantOnly
+  //   ③ 未完成 / 不是本轮最后一段 / 缺 canFork → guard.forkTargetNotStable
+  //   ④ 边界标识缺失    → guard.forkTargetAmbiguous
+  type ForkResolution =
+    | { ok: true; row: Extract<ConversationRow, { kind: "assistantText" }> }
+    | { ok: false; reasonCode: string; message: string };
+
+  function resolveForkTarget(session: MobileSession, target: unknown): ForkResolution {
+    const rowId = Number((target as { rowId?: unknown } | undefined)?.rowId);
+    const entityId = String((target as { entityId?: unknown } | undefined)?.entityId ?? "");
+    if (!Number.isInteger(rowId) || rowId < 0 || !entityId) {
+      return { ok: false, reasonCode: "proto.commandPayloadInvalid", message: "分叉目标不完整。" };
+    }
+    if (session.compactRun) {
+      return {
+        ok: false,
+        reasonCode: "guard.compactOperationLock",
+        message: "上下文压缩进行中，暂时不能分叉。",
+      };
+    }
+    const row = session.rows.find((item) => item.rowId === rowId);
+    if (!row || row.kind !== "assistantText") {
+      return {
+        ok: false,
+        reasonCode: "guard.forkAssistantOnly",
+        message: "只能从助手回复分叉。",
+      };
+    }
+    // entityId 对不上 = UI 拿着旧行号在点：目标已经漂移，不能当稳定边界。
+    if (row.entityId !== entityId) {
+      return {
+        ok: false,
+        reasonCode: "guard.forkTargetNotStable",
+        message: "这条回复已不是当前的分叉点，请重新选择。",
+      };
+    }
+    const header = session.rows.find(
+      (item) => item.kind === "turnHeader" && item.turnId === row.turnId,
+    );
+    const latestAssistant = [...session.rows]
+      .reverse()
+      .find((item) => item.kind === "assistantText" && item.turnId === row.turnId);
+    if (
+      row.state !== "complete" ||
+      row.actions?.canFork !== true ||
+      header?.kind !== "turnHeader" ||
+      header.state !== "completedSuccess" ||
+      latestAssistant?.rowId !== row.rowId
+    ) {
+      return {
+        ok: false,
+        reasonCode: "guard.forkTargetNotStable",
+        message: "这条回复还不能作为分叉点（未完成，或不是本轮最后一段回复）。",
+      };
+    }
+    if (!row.entityId) {
+      return {
+        ok: false,
+        reasonCode: "guard.forkTargetAmbiguous",
+        message: "这条回复缺少稳定的边界标识，无法分叉。",
+      };
+    }
+    return { ok: true, row };
+  }
+
+  /**
+   * 分叉：把父会话截至边界行的历史复制成**独立子会话**。
+   *
+   * 为什么是复制而不是共享：桌面端的 fork 是 conversation-only copy，父会话照常跑、
+   * 文件不动；子会话拿到自己的行号序列（协议：rowId 只在一个 log epoch 内有意义，
+   * 重建 / fork / rewind 会重新编号），之后两边各走各的。
+   */
+  function forkSession(
+    parent: MobileSession,
+    boundary: Extract<ConversationRow, { kind: "assistantText" }>,
+  ): MobileSession {
+    const child = createSession(newId("fork"), { ...parent.config }, parent.workspacePath);
+    const sourceRows = parent.rows.filter((row) => row.rowId <= boundary.rowId);
+    const copied = sourceRows.map((row, index) => {
+      const rowId = index + 2; // 1 号位留给 forkNotice
+      return {
+        ...row,
+        rowId,
+        // entityId 跟随新行号（端侧约定：内容行的 entityId = String(rowId)）；
+        // turnHeader 例外——它的 entityId 是 turnId，本就唯一且被协议当锚点用。
+        entityId: row.kind === "turnHeader" ? row.entityId : String(rowId),
+        createdAtSeq: index + 1,
+      } as ConversationRow;
+    });
+    child.rows = [
+      {
+        rowId: 1,
+        turnId: newId("fork"),
+        entityId: "1",
+        createdAt: now(),
+        createdAtSeq: 0,
+        kind: "timelineMarker",
+        lane: "turnTailBoundary",
+        marker: {
+          type: "forkNotice",
+          parentSessionId: parent.sessionId,
+          parentRowId: boundary.rowId,
+        },
+      } as ConversationRow,
+      ...copied,
+    ];
+    child.nextRowId = child.rows.length + 1;
+    // 子会话没有真的发过帧，但行已存在：水位必须盖过所有行，否则恢复/续订会算出空洞。
+    child.seq = child.rows.length;
+    child.cumulative = { ...parent.cumulative };
+    if (parent.contextWindow !== undefined) child.contextWindow = parent.contextWindow;
+    if (parent.lastPromptTokens !== undefined) child.lastPromptTokens = parent.lastPromptTokens;
+    if (parent.contextUsedTokens !== undefined) child.contextUsedTokens = parent.contextUsedTokens;
+    // 压缩水位跟着行号一起搬：摘要覆盖的是"边界之前的早期行"，复制后要换成新的行号，
+    // 否则子会话会把已摘要的行又逐字送一遍模型。
+    const coveredThrough = parent.contextSummaryCoveredThroughRowId;
+    if (parent.contextSummary && coveredThrough !== undefined) {
+      let mapped = 0;
+      sourceRows.forEach((row, index) => {
+        if (row.rowId <= coveredThrough) mapped = index + 2;
+      });
+      child.contextSummary = parent.contextSummary;
+      child.contextSummaryCoveredThroughRowId = mapped;
+    }
+    persistSession(child);
+    publishSessionIndex(child);
+    // 父会话留一条 forkCreated：两端都能看出分叉关系（协议：forkCreated 出现在 parent）。
+    const markerRowId = takeRowId(parent);
+    upsertRow(parent, {
+      rowId: markerRowId,
+      turnId: newId("fork"),
+      entityId: String(markerRowId),
+      createdAt: now(),
+      createdAtSeq: parent.seq,
+      kind: "timelineMarker",
+      lane: "turnTailBoundary",
+      marker: { type: "forkCreated", childSessionId: child.sessionId, atRowId: boundary.rowId },
+    } as ConversationRow);
+    persistSession(parent);
+    say(`会话分叉：${parent.sessionId} → ${child.sessionId}（边界行 ${boundary.rowId}）`);
+    return child;
   }
 
   function ackFor(
@@ -4101,6 +4343,13 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
             session.compactRun.abort.abort();
             return ackFor(envelope, session, "accepted");
           }
+          // 父轮已经收口、后台子代理还在跑：停止键必须收掉它。
+          // 回 noop 会让用户以为「什么都没在跑」，而后台子代理其实还在烧额度。
+          const idleBackground = backgroundChildren.get(session.sessionId);
+          if (idleBackground?.size) {
+            for (const controller of idleBackground.values()) controller.abort();
+            return ackFor(envelope, session, "accepted");
+          }
           return ackFor(envelope, session, "noop", { reasonCode: "mobile.stop.idle" });
         }
         const expected = payload.expectedForegroundExecutionId as string | undefined;
@@ -4108,7 +4357,30 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           return ackFor(envelope, session, "rejected", { reasonCode: "stale.stopTarget" });
         }
         run.abort.abort();
+        // 本轮被停 → 后台子代理跟着停（它的取消闸里本就含父轮信号）；
+        // 这里显式再收一次，登记册立刻清干净。
+        const runningBackground = backgroundChildren.get(session.sessionId);
+        if (runningBackground?.size) {
+          for (const controller of runningBackground.values()) controller.abort();
+        }
         return ackFor(envelope, session, "accepted");
+      }
+      case "forkAssistant": {
+        // 分叉：会话内复制，父会话不动。幂等靠命令回执缓存——同一 commandId 重复发
+        // 必须回到同一个子会话，不复制出第二份历史（桌面端同一语义）。
+        const resolution = resolveForkTarget(session, payload.target);
+        if (!resolution.ok) {
+          return ackFor(envelope, session, "rejected", {
+            reasonCode: resolution.reasonCode,
+            message: resolution.message,
+          });
+        }
+        const child = forkSession(session, resolution.row);
+        const ack = ackFor(envelope, session, "accepted", {
+          result: { type: "forkAssistant", sessionId: child.sessionId },
+        });
+        commandResults.set(commandKey(envelope), ack);
+        return ack;
       }
       case "switchModelConfig": {
         const provider = String(payload.provider ?? "");
@@ -4641,6 +4913,12 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
           session.run?.abort.abort();
           // 0.7.4：压缩流同样要随 workspace 收场（marker 在 runCompact 的 catch 里如实收 cancelled）。
           session.compactRun?.abort.abort();
+          // 后台子代理也是这个工作区在跑的工作：工作区走了，它不能还在烧额度。
+          const background = backgroundChildren.get(session.sessionId);
+          if (background?.size) {
+            for (const controller of background.values()) controller.abort();
+            backgroundChildren.delete(session.sessionId);
+          }
         }
       }
     },
@@ -4659,6 +4937,12 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       }
       for (const timer of checkpointTimers.values()) clearTimeout(timer);
       checkpointTimers.clear();
+      // 全局释放：所有后台子代理一起收掉，不能留下还在跑的孤儿任务。
+      for (const bucket of backgroundChildren.values()) {
+        for (const controller of bucket.values()) controller.abort();
+      }
+      backgroundChildren.clear();
+      subagentRuns.clear();
       subscriptions.clear();
       indexSubs.clear();
       configSubs.clear();

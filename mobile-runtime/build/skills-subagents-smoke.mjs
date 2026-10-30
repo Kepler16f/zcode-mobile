@@ -81,7 +81,30 @@ try {
   assert.equal(override.isError, false);
   assert.equal(requests.at(-1).url, "https://child.invalid/v1/chat/completions");
   assert.equal(requests.at(-1).body.model, "child");
-  assert.equal((await api.runMobileSubagent({ ...options, rawArguments: '{"prompt":"x","run_in_background":true}' })).isError, true);
+  // 后台执行（0.9.2）：不再拒绝，立即返回「已启动」；真正的后台生命周期由
+  // subagent-background-smoke 覆盖，这里只钉住工具面的形状。
+  let backgroundHandle = null;
+  const background = await api.runMobileSubagent({
+    ...options,
+    rawArguments: '{"prompt":"x","run_in_background":true}',
+    onBackground: handle => { backgroundHandle = handle; handle.controller.abort(); },
+  });
+  assert.equal(background.isError, false);
+  assert.match(background.content, /"status":"running"/);
+  await backgroundHandle.done;
+  // 跨轮续接：没有对应记录时明确拒绝（端侧没有上一次子代理 transcript 的持久化形状）。
+  assert.equal((await api.runMobileSubagent({ ...options, rawArguments: '{"prompt":"x","resume":"abc"}' })).isError, true);
+  // profile 自己声明 background：默认后台运行（调用方显式 false 可覆盖）。
+  let backgroundProfileHandle = null;
+  const backgroundProfile = await api.runMobileSubagent({
+    ...options,
+    agents: [{ ...profile, background: true }],
+    rawArguments: '{"prompt":"x"}',
+    onBackground: handle => { backgroundProfileHandle = handle; handle.controller.abort(); },
+  });
+  assert.equal(backgroundProfile.isError, false);
+  assert.match(backgroundProfile.content, /"status":"running"/);
+  await backgroundProfileHandle.done;
   assert.equal((await api.runMobileSubagent({ ...options, agents: [{ ...profile, tools: ["Bash(git status)"] }] })).isError, true);
   assert.equal((await api.runMobileSubagent({ ...options, agents: [{ ...profile, mcpServers: [{ name: "x" }] }] })).isError, true);
   const aborted = new AbortController(); aborted.abort();

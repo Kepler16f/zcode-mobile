@@ -147,6 +147,142 @@ try {
     assert.ok(result.unstagedChanges.length >= 120);
     assert.ok(ticks > 0,"长目录扫描必须给主事件循环让出时间");
   } finally { clearInterval(timer); }
+
+  // ══ 面板新增能力（0.9.2 桌面对齐）：丢弃改动 / 分支比较 / 提交信息 / 推送 / 指定起点 ══
+  const panelDir = fs.mkdtempSync(path.join(root, "tmp/git-panel-parity-")).replaceAll("\\", "/");
+  const panel = createMobileGitService({ load: async workspacePath => ({ git, fs, dir: workspacePath, isRepository: fs.existsSync(`${workspacePath}/.git`) }) });
+  const author = { name: "Test", email: "test@example.invalid" };
+  await git.init({ fs, dir: panelDir, defaultBranch: "main" });
+  await git.setConfig({ fs, dir: panelDir, path: "user.name", value: "Test" });
+  await git.setConfig({ fs, dir: panelDir, path: "user.email", value: "test@example.invalid" });
+  fs.writeFileSync(`${panelDir}/a.txt`, "one\n");
+  await git.add({ fs, dir: panelDir, filepath: "a.txt" });
+  const baseCommit = await git.commit({ fs, dir: panelDir, message: "base", author });
+
+  // A. 丢弃未暂存改动：工作树回到索引内容
+  fs.writeFileSync(`${panelDir}/a.txt`, "one\ntwo\n");
+  await panel.discardPaths({ workspacePath: panelDir, paths: ["a.txt"], staged: false });
+  assert.equal(fs.readFileSync(`${panelDir}/a.txt`, "utf8"), "one\n", "未暂存改动应恢复到索引内容");
+
+  // B. 丢弃暂存改动：索引与工作树一起回到 HEAD；本次新加的文件从工作树消失
+  fs.writeFileSync(`${panelDir}/a.txt`, "one\nstaged\n");
+  await git.add({ fs, dir: panelDir, filepath: "a.txt" });
+  fs.writeFileSync(`${panelDir}/a.txt`, "one\nstaged\nworktree\n");
+  fs.writeFileSync(`${panelDir}/new.txt`, "brand new\n");
+  await git.add({ fs, dir: panelDir, filepath: "new.txt" });
+  await panel.discardPaths({ workspacePath: panelDir, paths: ["a.txt", "new.txt"], staged: true });
+  assert.equal(fs.readFileSync(`${panelDir}/a.txt`, "utf8"), "one\n", "丢弃暂存改动后工作树应回到 HEAD");
+  assert.equal(fs.existsSync(`${panelDir}/new.txt`), false, "本次新加的文件应随暂存改动一起被丢弃");
+  assert.equal((await panel.getChanges({ workspacePath: panelDir, sourceId: "staged" })).length, 0, "丢弃后不应还有暂存改动");
+
+  // C. 未跟踪文件没有索引内容可恢复：明确报错，不静默删用户文件
+  fs.writeFileSync(`${panelDir}/untracked.txt`, "loose\n");
+  await assert.rejects(panel.discardPaths({ workspacePath: panelDir, paths: ["untracked.txt"], staged: false }), /未跟踪/);
+  assert.equal(fs.existsSync(`${panelDir}/untracked.txt`), true, "未跟踪文件不能被丢弃操作删掉");
+  fs.unlinkSync(`${panelDir}/untracked.txt`);
+
+  // D. 分支比较：三点语义（共同祖先 → HEAD），远端独有的提交不算成本地改动
+  assert.equal((await panel.getBranchComparison({ workspacePath: panelDir })).baseRef, null, "没有上游时不应编造比较基准");
+  await git.branch({ fs, dir: panelDir, ref: "remote-only" });
+  await git.checkout({ fs, dir: panelDir, ref: "remote-only" });
+  fs.writeFileSync(`${panelDir}/remote.txt`, "remote\n");
+  await git.add({ fs, dir: panelDir, filepath: "remote.txt" });
+  const remoteOnly = await git.commit({ fs, dir: panelDir, message: "remote only", author });
+  await git.checkout({ fs, dir: panelDir, ref: "main" });
+  fs.writeFileSync(`${panelDir}/local.txt`, "local\n");
+  await git.add({ fs, dir: panelDir, filepath: "local.txt" });
+  const localOnly = await git.commit({ fs, dir: panelDir, message: "local only", author });
+  await git.writeRef({ fs, dir: panelDir, ref: "refs/remotes/origin/main", value: remoteOnly });
+  await git.setConfig({ fs, dir: panelDir, path: "branch.main.remote", value: "origin" });
+  await git.setConfig({ fs, dir: panelDir, path: "branch.main.merge", value: "refs/heads/main" });
+  const comparison = await panel.getBranchComparison({ workspacePath: panelDir });
+  assert.equal(comparison.baseRef, "origin/main");
+  assert.equal(comparison.headRef, "main");
+  assert.equal(comparison.comparisonLabel, "main -> origin/main");
+  assert.deepEqual(comparison.changes.map(change => change.repoRelativePath), ["local.txt"], "只应报告共同祖先之后的本地改动");
+  assert.equal(comparison.changes[0].kind, "added");
+  assert.equal(comparison.changes[0].section, "branch");
+  assert.equal(comparison.changes[0].added, 1);
+  assert.ok(localOnly && baseCommit);
+
+  // E. 本地生成提交信息：只依据真实改动，不联网
+  fs.writeFileSync(`${panelDir}/local.txt`, "local\nchanged\n");
+  const generated = await panel.generateCommitMessage({ workspacePath: panelDir });
+  assert.match(generated.message, /local\.txt/, "提交信息应包含真实改动文件");
+  assert.equal(generated.providerId, "mobile-local-git", "本地生成必须如实标注来源");
+  fs.writeFileSync(`${panelDir}/ignored-by-session.txt`, "noise\n");
+  const scoped = await panel.generateCommitMessage({ workspacePath: panelDir, currentSessionFilePaths: [`${panelDir}/local.txt`] });
+  assert.match(scoped.message, /local\.txt/);
+  assert.doesNotMatch(scoped.message, /ignored-by-session/, "只应描述本次会话碰过的文件");
+  fs.unlinkSync(`${panelDir}/ignored-by-session.txt`);
+  await git.add({ fs, dir: panelDir, filepath: "local.txt" });
+  await git.commit({ fs, dir: panelDir, message: "clean", author });
+  await assert.rejects(panel.generateCommitMessage({ workspacePath: panelDir }), /没有可用/);
+
+  // F. 推送：远端选择、建立上游、失败语义
+  await assert.rejects(panel.push({ workspacePath: panelDir }), /远端|没有配置/);
+  const httpModule = await import("node:http");
+  const pkt = text => {
+    const body = Buffer.from(text, "utf8");
+    // pkt-line 的长度前缀固定 4 位十六进制，且**含这 4 个字节本身**（内容 N 字节 → N+4）。
+    return Buffer.concat([Buffer.from((body.length + 4).toString(16).padStart(4, "0"), "ascii"), body]);
+  };
+  const flush = Buffer.from("0000", "ascii");
+  let pushBody = "";
+  const server = httpModule.createServer((req, res) => {
+    if (req.method === "GET") {
+      // 远端广告：只有一个旧提交 → 客户端会真的发起推送
+      // 内容类型必须与请求的服务名一致，否则对端会把它当「哑 HTTP」并报 SmartHttpError。
+      res.writeHead(200, { "content-type": "application/x-git-receive-pack-advertisement" });
+      res.end(Buffer.concat([pkt("# service=git-receive-pack\n"), flush, pkt(`${baseCommit} refs/heads/main\x00report-status\n`), flush]));
+      return;
+    }
+    req.on("data", chunk => { pushBody += chunk; });
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/x-git-receive-pack-result" });
+      // 响应走 side-band：外层是带 0x01（数据通道）前缀的包，**包体本身又是一条 pkt-line**。
+      // 只加前缀不嵌套 pkt-line 的话，对端会把文本当长度前缀解析（NaN）并空转。
+      const band = text => {
+        const inner = pkt(text);
+        const payload = Buffer.concat([Buffer.from([1]), inner]);
+        return Buffer.concat([
+          Buffer.from((payload.length + 4).toString(16).padStart(4, "0"), "ascii"),
+          payload,
+        ]);
+      };
+      res.end(Buffer.concat([band("unpack ok\n"), band("ok refs/heads/main\n"), flush]));
+    });
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await git.addRemote({ fs, dir: panelDir, remote: "origin", url: `http://127.0.0.1:${server.address().port}/repo.git` });
+    // 先清掉之前为比较而写的上游配置，验证「原先没有上游 → 推送后建立上游」
+    await git.setConfig({ fs, dir: panelDir, path: "branch.main.remote", value: "" });
+    await git.setConfig({ fs, dir: panelDir, path: "branch.main.merge", value: "" });
+    const pushed = await panel.push({ workspacePath: panelDir });
+    assert.equal(pushed.branchName, "main");
+    assert.equal(pushed.remoteName, "origin");
+    assert.equal(pushed.setUpstream, true, "原先没有上游时应建立上游");
+    assert.equal(pushed.trackingBranchName, "origin/main");
+    assert.ok(pushBody.length > 0, "服务端应收到推送请求体");
+    assert.equal(await git.getConfig({ fs, dir: panelDir, path: "branch.main.remote" }), "origin");
+    assert.equal(await git.getConfig({ fs, dir: panelDir, path: "branch.main.merge" }), "refs/heads/main");
+    // 已有上游时再次推送不再声称建立上游
+    const again = await panel.push({ workspacePath: panelDir });
+    assert.equal(again.setUpstream, false);
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+
+  // G. 指定起点建分支：起点是提交号时分支必须落在那个提交上
+  const feature = await panel.createBranchAndSwitch({ workspacePath: panelDir, branchName: "feature", startPoint: baseCommit });
+  assert.equal(feature.ok, true, JSON.stringify(feature.issues));
+  assert.equal((await panel.getRepositorySummary({ workspacePath: panelDir })).branchName, "feature");
+  assert.equal(await git.resolveRef({ fs, dir: panelDir, ref: "HEAD" }), baseCommit, "新分支应落在指定起点上");
+  const missing = await panel.createBranchAndSwitch({ workspacePath: panelDir, branchName: "bad", startPoint: "no-such-ref" });
+  assert.equal(missing.ok, false);
+  assert.match(missing.issues.map(issue => issue.message).join(" "), /找不到起点/);
   console.log("git-panel-smoke: PASS");
 } finally {
   fs.unlinkSync(out);

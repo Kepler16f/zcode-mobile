@@ -88,6 +88,28 @@ export const readMany = (paths) => {
 };
 export const existsSync = (p) => implFor(p).existsSync(p);
 export const statSync = (p) => implFor(p).statSync(p);
+/**
+ * 批量 stat。派发按路径分组：/mnt 前缀走 SAF 树后端（逐个 stat，代价如实），
+ * 其余走当前引擎（本地盘时是一次原生往返）。
+ */
+export const statMany = (paths) => {
+  const list = (paths ?? []).map((p) => localWorkspacePath(String(p ?? "")));
+  const treeIdx = [];
+  const otherIdx = [];
+  list.forEach((p, i) => (p.startsWith("/mnt/") ? treeIdx : otherIdx).push(i));
+  const out = new Array(list.length);
+  if (treeIdx.length) {
+    tree.statMany(treeIdx.map((i) => list[i])).forEach((item, k) => {
+      out[treeIdx[k]] = item;
+    });
+  }
+  if (otherIdx.length) {
+    impl().statMany(otherIdx.map((i) => list[i])).forEach((item, k) => {
+      out[otherIdx[k]] = item;
+    });
+  }
+  return out;
+};
 export const lstatSync = (p) => implFor(p).lstatSync(p);
 export const readdirSync = (p, opts) => implFor(p).readdirSync(p, opts);
 export const unlinkSync = (p) => {

@@ -110,7 +110,7 @@ export async function loadGit(): Promise<GitModule> {
  *  ACAO、OPTIONS 预检 405），fetch 层直接 "Failed to fetch"——装机"git 工具一直 fail to
  *  fetch"的根因。原生 HttpURLConnection 没有 CORS 概念；GitHttpBridge.kt 缓冲式一发一收。
  *  返回形状与 http/web/index.js 逐字段一致（isomorphic-git 的 HttpClient 契约）。 */
-async function loadGitHttp(signal?: AbortSignal): Promise<unknown> {
+export async function loadGitHttp(signal?: AbortSignal): Promise<unknown> {
   const holder = globalThis as { zcodeGitHttp?: { call(request: string): string } };
   if (!holder.zcodeGitHttp || typeof holder.zcodeGitHttp.call !== "function") {
     const mod: unknown = await import("../node_modules/isomorphic-git/http/web/index.js");
@@ -119,6 +119,55 @@ async function loadGitHttp(signal?: AbortSignal): Promise<unknown> {
     return { request: (req: GitHttpRequest) => client.request({ ...req, signal: signal ?? req.signal }) };
   }
   return { request: (req: GitHttpRequest) => bridgeHttpRequest({ ...req, signal: signal ?? req.signal }) };
+}
+
+/**
+ * 推送当前分支的**唯一实现**：Git 工具的 action=push 与设置页 Git 面板的「推送」共用它。
+ * 传输（原生 HTTP 桥 / 浏览器 fetch）、远端地址解析与凭据应答都归 git-tool 所有——
+ * 面板另写一份就会立刻漂移成两套凭据语义，而 Git 端点的鉴权失败只有一种正确表现。
+ *
+ * 面板那一侧没有凭据输入框，只能用远端地址里已有的内嵌凭据；工具那一侧还能由模型
+ * 传 username/password。两者都通过同一个 input 形状进来，凭据只用于本次请求。
+ */
+export async function pushGitBranch(options: {
+  core: GitModule;
+  fs: unknown;
+  dir: string;
+  branch: string;
+  /** url / username / password / force / remote —— 与 Git 工具的入参同形。 */
+  input?: Record<string, unknown>;
+  signal?: AbortSignal;
+  /**
+   * 推送后是否建立上游关系（等价桌面 `git push --set-upstream`）。
+   * 面板在原先没有上游时置真；Git 工具不传，保持它今天「不写配置」的行为。
+   */
+  establishUpstream?: boolean;
+}): Promise<{ remoteName: string; trackingBranchName: string; setUpstream: boolean }> {
+  const { core, fs, dir, branch, signal } = options;
+  const input = options.input ?? {};
+  if (!branch) throw new Error("当前不在分支上，无法推送。");
+  const requested = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "";
+  const remoteName = requested || "origin";
+  const { url, onAuth } = await networkRemote(core, fs, dir, remoteName, input);
+  const http = await loadGitHttp(signal);
+  const pushResult = (await core.push({
+    fs,
+    http,
+    dir,
+    remote: remoteName,
+    ...(url ? { url } : {}),
+    ref: branch,
+    force: input.force === true,
+    onAuth,
+  })) as { ok?: boolean; refs?: Record<string, string> };
+  // 凭据失败时 isomorphic-git 会抛 UnexpectedServerResponse/401——如实上抛给调用方，
+  // 它能拿着错误原文去向用户要令牌。
+  if (pushResult.ok === false) throw new Error("Git 推送失败：远端拒绝更新。");
+  if (options.establishUpstream) {
+    await core.setConfig({ fs, dir, path: `branch.${branch}.remote`, value: remoteName });
+    await core.setConfig({ fs, dir, path: `branch.${branch}.merge`, value: `refs/heads/${branch}` });
+  }
+  return { remoteName, trackingBranchName: `${remoteName}/${branch}`, setUpstream: Boolean(options.establishUpstream) };
 }
 
 /** 桥传输的入参形状（isomorphic-git 会传 async iterable 的 body）。 */
@@ -630,23 +679,10 @@ const gitActionHandlers: Record<GitActionName, (ctx: GitActionCtx) => Promise<st
       : "（还没有配置远端——用 action=remote + url 添加。）";
   },
   push: async ({ core, fs, dir, input, signal }) => {
-    const http = await loadGitHttp(signal);
     const remoteName = typeof input.remote === "string" && input.remote.trim() ? input.remote.trim() : "origin";
-    const { url, onAuth } = await networkRemote(core, fs, dir, remoteName, input);
     const branch = (await core.currentBranch({ fs, dir, fullname: false })) as string | null;
-    const pushResult = (await core.push({
-      fs,
-      http,
-      dir,
-      remote: remoteName,
-      ...(url ? { url } : {}),
-      ref: branch ?? undefined,
-      force: input.force === true,
-      onAuth,
-    })) as { ok?: boolean; refs?: Record<string, string> };
-    // 凭据失败时 isomorphic-git 会抛 UnexpectedServerResponse/401——如实上抛给模型，
-    // 它能拿着错误原文去向用户要令牌。
-    if (pushResult.ok === false) throw new Error("Git 推送失败：远端拒绝更新。");
+    // 推送走共享实现（与设置页 Git 面板同一个函数）：传输、远端解析与凭据语义只有一份。
+    await pushGitBranch({ core, fs, dir, branch: branch ?? "", input, signal });
     return `已推送 ${branch ?? "?"} → ${remoteName}。`;
   },
   pull: async ({ core, fs, dir, input, signal }) => {

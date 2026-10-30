@@ -6,6 +6,52 @@ export type GitScanContext = { git: GitScanApi; fs: any; dir: string };
 type Entry = { type(): Promise<string>; mode(): Promise<number>; oid(): Promise<string>; content(): Promise<Uint8Array | undefined> };
 export type GitFileState = { file: string; head: MobileGitVersion | null; index: MobileGitVersion | null; work: MobileGitVersion | null; conflicted: boolean };
 
+/** 一棵树里的某个文件条目（只取 blob；子树在比较里按目录展开）。 */
+export type GitTreeEntry = MobileGitVersion;
+
+/**
+ * 比较两棵树（两个 ref）之间的文件差异 —— 分支比较的事实来源。
+ *
+ * 为什么不用 scanGitStates：那条读的是 HEAD/索引/工作树三棵树，服务「工作区现在脏不脏」；
+ * 分支比较要的是「本地分支相对上游多了/少了什么」，基准是**两个提交的树**，与工作区状态无关。
+ * 两者共用 isomorphic-git 的 walk，但口径不同，所以是两条明确命名的读法而不是同一函数加参数。
+ */
+export async function compareTrees(
+  ctx: GitScanContext,
+  baseRef: string,
+  headRef: string,
+): Promise<Array<{ file: string; base: GitTreeEntry | null; head: GitTreeEntry | null }>> {
+  const rows: Array<{ file: string; base: GitTreeEntry | null; head: GitTreeEntry | null }> = [];
+  await ctx.git.walk({
+    fs: ctx.fs, dir: ctx.dir, trees: [ctx.git.TREE({ ref: baseRef }), ctx.git.TREE({ ref: headRef })],
+    // 逐项读取而不是并发展开：整仓库同时分配内存会让手机主线程失去响应。
+    iterate: async (walk: (child: unknown) => Promise<unknown>, children: Iterable<unknown>) => {
+      const results: unknown[] = [];
+      for (const child of children) results.push(await walk(child));
+      return results;
+    },
+    map: async (name: string, entries: Array<Entry | null>) => {
+      if (name.split("/").some(part => part.toLowerCase() === ".git")) return null;
+      if (name === ".") return undefined;
+      const types = await Promise.all(entries.map(entry => entry?.type() ?? null));
+      if (!types.some(type => type && type !== "tree")) return undefined;
+      const version = async (index: number): Promise<GitTreeEntry | null> => {
+        const entry = entries[index];
+        const type = types[index];
+        if (!entry || !type || type === "tree") return null;
+        if (type !== "blob") throw new Error(`Git 无法比较特殊文件：${name}`);
+        return { oid: await entry.oid(), mode: await entry.mode(), type };
+      };
+      const base = await version(0);
+      const head = await version(1);
+      if (base && head && base.oid === head.oid && base.mode === head.mode) return undefined;
+      rows.push({ file: name, base, head });
+      return undefined;
+    },
+  });
+  return rows.sort((a, b) => a.file.localeCompare(b.file));
+}
+
 export function sameGitVersion(a: MobileGitVersion | null, b: MobileGitVersion | null): boolean {
   return a === b || Boolean(a && b && a.oid === b.oid && a.mode === b.mode && a.type === b.type);
 }

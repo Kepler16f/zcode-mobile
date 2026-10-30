@@ -252,6 +252,33 @@ export function readdirSync(p, opts) {
   }));
 }
 
+/**
+ * 批量 stat：一次 JNI 往返取回一批路径的 kind/mtime/size。
+ * 轮询型服务（文件监视）否则要 N 次同步往返，每次都阻塞 WebView 主线程。
+ */
+export function statMany(paths) {
+  const list = (paths ?? []).map((p) => norm(p));
+  if (list.length === 0) return [];
+  const res = callRaw({ op: "statMany", paths: list }, list[0], "stat");
+  const items = Array.isArray(res.items) ? res.items : [];
+  const byPath = new Map();
+  for (const item of items) if (item && typeof item.path === "string") byPath.set(item.path, item);
+  return list.map((path) => {
+    const item = byPath.get(path);
+    if (!item || item.ok !== true) {
+      return { path, ok: false, exists: false, kind: "missing", mtimeMs: 0, size: 0 };
+    }
+    return {
+      path,
+      ok: true,
+      exists: item.exists === true,
+      kind: String(item.kind ?? "file"),
+      mtimeMs: Number(item.mtimeMs ?? 0),
+      size: Number(item.size ?? 0),
+    };
+  });
+}
+
 export function unlinkSync(p) {
   call("unlink", norm(p), {}, "unlink");
 }

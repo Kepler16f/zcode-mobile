@@ -59,6 +59,7 @@ class FsBridge(private val context: Context) {
         return try {
             when (op) {
                 "stat" -> ok(statOf(resolve(req.getString("path"))))
+                "statMany" -> statMany(req.getJSONArray("paths"))
                 "exists" -> ok(JSONObject().put("exists", exists(resolve(req.getString("path")))))
                 "read" -> read(req.getString("path"))
                 "readMany" -> readMany(req.getJSONArray("paths"))
@@ -109,6 +110,26 @@ class FsBridge(private val context: Context) {
     }
 
     // ---- 各操作 ----
+
+    /**
+     * 批量 stat：一次过桥换一批路径的 kind/mtime/size。
+     * 文件监视（0.9.3）是轮询实现，逐个 stat 会变成 N 次同步往返、每次都阻塞 WebView 主线程；
+     * 一次批量把整目录的签名取回来，轮询才有意义。
+     *
+     * 形状与 readMany 一致：外层 ok:true，每项自带 ok，失败项不影响其余项。
+     */
+    private fun statMany(paths: JSONArray): String {
+        val items = JSONArray()
+        for (i in 0 until paths.length()) {
+            val path = paths.optString(i)
+            items.put(try {
+                statOf(resolve(path)).put("ok", true)
+            } catch (e: Exception) {
+                JSONObject().put("path", path).put("ok", false).put("code", codeOf(e)).put("message", "${e.javaClass.simpleName}: ${e.message}")
+            })
+        }
+        return JSONObject().put("ok", true).put("items", items).toString()
+    }
 
     private fun statOf(file: File): JSONObject {
         val out = JSONObject().put("path", virtual(file))
