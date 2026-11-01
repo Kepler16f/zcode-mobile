@@ -20,6 +20,12 @@ import { GIT_ACTIONS, makeGitTool } from "./git-tool.js";
 import { sanitizeToolArguments } from "./tool-sanitize.js";
 import { browserControlEnabled, BROWSER_CONTROL_EVENT } from "./plugins-mobile.js";
 import { makeFetchTool } from "./fetch-tool.js";
+import {
+  resolveSyntheticPipeline,
+  runSyntheticPipeline,
+  syntheticCommandsNote,
+  type SyntheticHost,
+} from "./synthetic-commands.js";
 import { callNativeJob, hasNativeJobs } from "../ports/native-async.mjs";
 
 /** 移动端开哪些工具。
@@ -450,6 +456,11 @@ export function createToolEngineFactory(
           (c as { metadata?: { inputSchema?: Record<string, unknown> } }).metadata?.inputSchema ??
           { type: "object", properties: {} },
       }));
+      // 合成命令层（0.10.x）：Bash 的描述追加端侧 jq/curl/wget/unzip 的语法边界，
+      // 让模型知道这些命令存在、支持什么、什么时候会整条退回 sh。
+      for (const tool of tools) {
+        if (tool.name === BASH_TOOL) tool.description = `${tool.description}\n\n${syntheticCommandsNote()}`;
+      }
       if (tools.length === 0) {
         // 注册面变了（名字全对不上）：宁可不带工具，也不发一份空声明。
         say("工具引擎：注册表为空，退回纯文本对话");
@@ -569,6 +580,58 @@ export function createToolEngineFactory(
                 "也无法安装它们（需要 root 或整套 Termux/proot 环境）。请改用不依赖系统包的方案：" +
                 "纯 JS/静态二进制（放进工作区）、或把依赖说明写进 README 让用户在桌面环境执行。";
               return { content: hint, isError: true, errorCode: "mobile.bashPackageManagerUnavailable", errorMessage: hint };
+            }
+          }
+          // 合成命令层（0.10.x，用户点名"给终端加 jq/unzip/curl/wget，体积几乎不涨"）：
+          // 整条管道的**每一段**都命中合成命令表才本地执行（段间 stdin→stdout 字符串衔接、
+          // 非零退出码断管）；有任何一段不认识（含 echo/cat/cd/export/重定向/; && || $()/反引号/
+          // 变量展开）→ 整条原样退回 sh，绝不做混合执行——半吊子 shell 语义就是行为漂移。
+          // 拦截层任何异常（解析失败/实现抛错）同样退回 sh 跑原文；唯一例外是文件端口的
+          // permission_denied：那不是拦截层故障而是落盘授权闸的正常拒绝，照 Fetch 工具的形状回给
+          // agent 才能触发授权弹窗，退回 sh 只会变成"sh: curl: not found"的假错误。
+          if (call.name === BASH_TOOL) {
+            const command = typeof input.command === "string" ? input.command : "";
+            try {
+              const segments = resolveSyntheticPipeline(command);
+              if (segments) {
+                const execApi = (globalThis as { zcodeExec?: Record<string, unknown> }).zcodeExec;
+                const host: SyntheticHost = {
+                  workspacePath,
+                  checkPathAccess: (p) => fileSystemPort.checkAccess(p),
+                  writeFile: async (p, bytes) => {
+                    await fileSystemPort.writeBinaryFile({ path: p, content: bytes });
+                  },
+                  ...(execApi && typeof execApi.unzip === "function"
+                    ? {
+                        unzipBridge: async (req: { zip: string; dest: string }) =>
+                          JSON.parse(String(execApi.unzip(JSON.stringify(req)))) as {
+                            ok?: boolean;
+                            files?: number;
+                            error?: string;
+                          },
+                      }
+                    : {}),
+                };
+                try {
+                  const r = await runSyntheticPipeline(segments, "", host);
+                  if (r.exitCode !== 0) {
+                    return {
+                      content: r.stdout || `（合成命令退出码 ${r.exitCode}，无输出）`,
+                      isError: true,
+                      errorCode: "mobile.syntheticExit",
+                      errorMessage: (r.stdout || `合成命令退出码 ${r.exitCode}`).slice(0, 500),
+                    };
+                  }
+                  return { content: r.stdout || "（无输出）", isError: false };
+                } catch (e) {
+                  if ((e as { code?: unknown } | null)?.code !== "permission_denied") throw e;
+                  const message = String((e as Error)?.message ?? e);
+                  return { content: message, isError: true, errorCode: "permission_denied", errorMessage: message };
+                }
+              }
+            } catch (e) {
+              // 拦截层自身异常：整条退回 sh，模型看到的与老版本行为逐字一致（只在行上留痕）。
+              say(`合成命令拦截失败，退回 sh 执行原文：${String((e as Error)?.message ?? e).slice(0, 200)}`);
             }
           }
           let stageWrittenBack = false;

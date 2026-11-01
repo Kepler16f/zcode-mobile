@@ -51,6 +51,8 @@ function normalizeAllowedUrl(raw: string): string | null {
 function resolveDownloadPath(workspacePath: string, rawPath: string): string {
   return rawPath.startsWith("/") ? rawPath : `${workspacePath}/${rawPath}`;
 }
+/** 0.10.x 导出给合成命令层（curl -o/-O、unzip 的落盘路径判据与 Fetch 工具同源，别造第二份）。 */
+export { resolveDownloadPath };
 
 /**
  * 造一个 Fetch 工具的注册对象（handler 闭包持有文件端口 + 工作区根）。

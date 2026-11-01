@@ -5,8 +5,11 @@ import android.webkit.JavascriptInterface
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
 
 /**
  * §2.1 的 L1 落地：真机自检已经证明这个 WebView 里 app 能派生 `/system/bin/sh`
@@ -37,6 +40,92 @@ class ExecBridge(private val context: Context) {
     /** 旧版自检继续使用同步入口；应用会优先使用 start/poll/cancel。 */
     @JavascriptInterface
     fun exec(request: String): String = execute(request, null)
+
+    /**
+     * 合成命令层（0.10.x）的解压桥：Bash 里没有 unzip（toybox 不带），而 java.util.zip 在
+     * Android 运行时是现成的——JS 侧的合成 `unzip` 命令经这条桥解包，终端零新增字节。
+     *
+     * 契约与既有桥一致：JSON 进、JSON 出。入参 `{zip, dest}`（路径走 workspaceFile 的同一套
+     * vfs/真实路径映射与 `..` 拦截），回包 `{ok:true, files:N}` 或 `{error}`。
+     * 同步签名（SqliteBridge 同款先例）：JS 等到回包才继续——典型配置包几秒内完成，
+     * 大包的耗时由调用方（合成命令层）自行权衡。
+     *
+     * zip-slip 纪律：压缩包是外部输入，条目名不可信——含 `..` 段、绝对路径、盘符拼写
+     * 的一律拒绝；落点再按 canonicalPath 复核必须在 dest 之内（双保险，防符号链接）。
+     */
+    @JavascriptInterface
+    fun unzip(request: String): String {
+        val json = try { JSONObject(request) } catch (e: Exception) {
+            return JSONObject().put("error", "unzip 入参不是合法 JSON：${e.message}").toString()
+        }
+        val zipPath = json.optString("zip")
+        val destPath = json.optString("dest")
+        if (zipPath.isEmpty()) return JSONObject().put("error", "unzip 缺少 zip 路径").toString()
+        val zipFile: File = try { workspaceFile(zipPath) } catch (e: Exception) {
+            return JSONObject().put("error", "${e.message}").toString()
+        }
+        val destDir: File = try {
+            if (destPath.isEmpty()) workspaceRoot() else workspaceFile(destPath)
+        } catch (e: Exception) {
+            return JSONObject().put("error", "${e.message}").toString()
+        }
+        if (!zipFile.isFile) return JSONObject().put("error", "zip 文件不存在：${zipFile.absolutePath}").toString()
+        if (destDir.exists() && !destDir.isDirectory) {
+            return JSONObject().put("error", "解压目标不是目录：${destDir.absolutePath}").toString()
+        }
+        if (!destDir.isDirectory && !destDir.mkdirs()) {
+            return JSONObject().put("error", "解压目标目录创建失败：${destDir.absolutePath}").toString()
+        }
+        try {
+            ZipFile(zipFile).use { archive ->
+                val destCanonical = destDir.canonicalPath + File.separator
+                var count = 0
+                val entries = archive.entries()
+                while (entries.hasMoreElements()) {
+                    val entry = entries.nextElement() as ZipEntry
+                    val target = safeEntryTarget(destDir, destCanonical, entry.name)
+                        ?: return JSONObject()
+                            .put("error", "拒绝危险条目名（zip-slip）：${entry.name}")
+                            .toString()
+                    if (entry.isDirectory) {
+                        target.mkdirs()
+                        continue
+                    }
+                    target.parentFile?.let { if (!it.isDirectory) it.mkdirs() }
+                    archive.getInputStream(entry).use { input ->
+                        FileOutputStream(target).use { output ->
+                            val buffer = ByteArray(8192)
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                output.write(buffer, 0, read)
+                            }
+                        }
+                    }
+                    count++
+                }
+                return JSONObject().put("ok", true).put("files", count).toString()
+            }
+        } catch (e: Exception) {
+            return JSONObject().put("error", "解压失败：${e.javaClass.simpleName}: ${e.message}").toString()
+        }
+    }
+
+    /**
+     * 条目名 → dest 之内的落点；不安全（`..` 段 / 绝对路径 / 盘符 / 空名 / canonical 越界）返回 null。
+     * 条目名的分隔符先统一成 '/'，Windows 打包器常写 '\'。
+     */
+    private fun safeEntryTarget(destDir: File, destCanonical: String, rawName: String): File? {
+        if (rawName.isEmpty()) return null
+        val name = rawName.replace('\\', '/')
+        if (name.startsWith("/")) return null
+        if (name.split('/').any { it == ".." }) return null
+        if (name.split('/').any { it.isNotEmpty() && it.length >= 2 && it[1] == ':' }) return null
+        val target = File(destDir, name)
+        val canonical = try { target.canonicalPath } catch (_: Exception) { return null }
+        if (canonical != destCanonical.removeSuffix(File.separator) && !canonical.startsWith(destCanonical)) return null
+        return target
+    }
 
     private fun execute(request: String, job: AsyncBridgeJobs.Job?): String {
         val started = System.currentTimeMillis()
