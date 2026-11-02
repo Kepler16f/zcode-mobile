@@ -325,4 +325,8 @@ dependencies {
     // SAF 树（外部工作区）的读写口：TreeBridge 用 DocumentFile 走授权 URI，
     // File API 在 scoped storage 下对这些目录一律 EACCES，见 TreeBridge.kt 头注。
     implementation("androidx.documentfile:documentfile:1.0.1")
+    // 0.11.1 应用内更新/通知：FileProvider（装 APK 的 content:// URI）、NotificationCompat、
+    // ActivityCompat（13+ 运行时权限）现在被**直接**使用。此前它们只作为 androidx.webkit 的
+    // 传递依赖存在——webkit 一旦降版/移除，这三个类就没了，编译期才炸。显式声明钉住。
+    implementation("androidx.core:core:1.13.0")
 }

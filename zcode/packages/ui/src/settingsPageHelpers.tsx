@@ -29,6 +29,8 @@ import { Button } from "@/components/ui/button.js";
 import { SettingsBadge, SettingsGroupCard, SettingsRow } from "@/settings/SettingsPageParts.js";
 import { DataBaseDirControl } from "@/settings/DataBaseDirControl.js";
 import { MobileCompatibilitySettings } from "@/settings/MobileCompatibilitySettings.js";
+import { AppVersionUpdateRow } from "@/settings/appVersionUpdateRow.js";
+import { KeepAliveNotificationRow } from "@/settings/keepAliveNotificationRow.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { useOptionalServices } from "@/hooks/useServices.js";
 import { ProactiveSuggestionsSetting } from "@/settings/ProactiveSuggestionsSetting.js";
@@ -281,6 +283,10 @@ export function GeneralSectionContent({
     <div className="space-y-4">
       <MobileCompatibilitySettings />
       <SettingsGroupCard>
+        {/* 版本号行是「常规」分区的第一项（用户点名"把版本号信息移动到设置里的第一个选项"）。
+            两行都只在端侧原生桥在时渲染，桌面/网页宿主看不到它们。*/}
+        <AppVersionUpdateRow />
+        <KeepAliveNotificationRow />
         <SettingsRow
           label={intl.formatMessage({ id: "settings.locale" })}
           description={intl.formatMessage({ id: "settings.localeDescription" })}

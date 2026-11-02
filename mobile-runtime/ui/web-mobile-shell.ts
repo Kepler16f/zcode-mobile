@@ -155,76 +155,16 @@ function coveredBySettingsLayer(): boolean {
 }
 
 /**
- * 版本号落地（0.7.3，用户点名"应用内增加能看版本号的地方"）。
- * 原生 DeviceProbe.deviceInfo() 早就回 appVersion/appVersionCode（装机报告靠它区分版本），
- * 但屏幕上没有任何一处显示它——用户想确认自己装的是哪一版只能翻报告。这里把同一份读数
- * 钉在侧栏设置钮上方的一行小字上（宽屏并排/竖屏抽屉两种形态都在 #sidebar 内可见）。
- * 幂等 + 挂 body 子树观察里重建：设置页/插件市场这类整页导航会把侧栏连根换掉，chip 跟着没了，
- * 下一次 settle/sync 再补。桌面开发宿主没有 zcodeDevice 桥 → 不显示（不编一个假版本号）。
+ * 版本号的去处（0.11.x，用户点名"把 azcode 版本号信息换个地方显示，移动到设置里的第一个选项"）。
+ * 原来这里把 DeviceProbe.deviceInfo() 的读数钉在侧栏设置钮上方的一行小字上（0.7.3 加的
+ * ensureVersionChip），现在那一处已经删干净：版本号改由上游设置页承担——
+ * packages/ui/src/settings/appVersionUpdateRow.tsx（设置 → 常规的第一项，点版本号检查更新）。
+ * 那边能点、能查更新、能下载安装，比一行只读小字有用；留着两处只会让人分不清哪个是真的。
+ * 本文件只管侧栏形态，不再管版本号的显示位置。
  */
-const VERSION_CHIP_ID = "zcode-version-chip";
-let cachedDeviceVersion: { bridge: object; label: string } | null = null;
-function readAppVersion(): string | null {
-  const bridge = (globalThis as { zcodeDevice?: { deviceInfo?(): string } }).zcodeDevice;
-  if (!bridge || typeof bridge.deviceInfo !== "function") return null;
-  // 版本在进程生命周期内不会变化。避免每次全页 DOM 更新都同步调用原生桥，
-  // 该桥线程被其他操作占用时，反复读版本也会把页面输入一起堵住。
-  if (cachedDeviceVersion?.bridge === bridge) return cachedDeviceVersion.label;
-  try {
-    const info = JSON.parse(String(bridge.deviceInfo())) as {
-      appVersion?: unknown;
-      appVersionCode?: unknown;
-    };
-    const v = typeof info.appVersion === "string" ? info.appVersion.trim() : "";
-    if (!v) return null;
-    const code = typeof info.appVersionCode === "number" ? info.appVersionCode : null;
-    const label = code ? `aZCode ${v} (${code})` : `aZCode ${v}`;
-    cachedDeviceVersion = { bridge, label };
-    return label;
-  } catch {
-    return null;
-  }
-}
-function ensureVersionChip(): void {
-  const d = doc();
-  const panel = sidebar();
-  if (!d || !panel) return;
-  const version = readAppVersion();
-  const existing = d.getElementById(VERSION_CHIP_ID);
-  if (!version) {
-    existing?.remove();
-    return;
-  }
-  // 钉在设置按钮所在的 footer 里（TaskList.tsx 的 footer div）；找不到 footer 就退到 panel 末尾。
-  const settingsBtn = panel.querySelector<HTMLElement>('[data-testid="task-settings-button"]');
-  const host = settingsBtn?.parentElement ?? panel;
-  if (existing && existing.parentElement === host && existing.textContent === version) return;
-  existing?.remove();
-  const chip = d.createElement("div");
-  chip.id = VERSION_CHIP_ID;
-  chip.textContent = version;
-  chip.setAttribute("role", "note");
-  chip.style.cssText = [
-    "padding:2px 8px 6px",
-    "font-size:11px",
-    "line-height:1.4",
-    "opacity:.55",
-    "text-align:center",
-    "pointer-events:none",
-    "user-select:none",
-  ].join(";");
-  if (settingsBtn?.parentElement && host.contains(settingsBtn)) {
-    host.insertBefore(chip, settingsBtn);
-  } else {
-    host.appendChild(chip);
-  }
-}
 
 function sync(): void {
   const panel = sidebar();
-  // 版本号 chip（0.7.3）：sync 是唯一被抽屉投影、旗子切换、整页导航返回都走到的入口，
-  // 挂这里最稳（幂等：文本没变就早退）。放在 panel 判空之后，没侧栏谈不上 chip。
-  if (panel) ensureVersionChip();
   if (!panel) {
     // 0.6.0（用户报"侧边栏进设置整个画面变暗，点一下才恢复"）：进设置页这类整页导航会把
     // #sidebar 连根卸掉——旧代码在这里直接 return，遮罩还挂在屏上（opacity 1、吃点击），

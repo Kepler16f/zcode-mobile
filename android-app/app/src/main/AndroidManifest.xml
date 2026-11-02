@@ -12,6 +12,20 @@
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
 
+    <!-- 应用内更新（0.11.1，用户点名"点版本号能检查更新"）：
+         - POST_NOTIFICATIONS：Android 13+ 的通知运行时权限（保活通知、下载进度、出错提醒）；
+           13 以下这条是安装期权限，系统自动给。
+         - REQUEST_INSTALL_PACKAGES：Android 8+ 装 APK 必须要"允许此来源安装应用"，
+           声明它系统设置里才会出现本 app 的开关（没授权时 installApk 回
+           need_install_permission，前端引导去系统设置）。
+         - FOREGROUND_SERVICE / FOREGROUND_SERVICE_DATA_SYNC：后台下载 APK 的前台服务
+           （通知栏进度、下载完点通知直接装）与常驻通知的前台服务。targetSdk 34 要求
+           foregroundServiceType="dataSync" 必须配 FOREGROUND_SERVICE_DATA_SYNC。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
     <application
         android:allowBackup="false"
         android:extractNativeLibs="true"
@@ -59,5 +73,36 @@
             android:name=".BrowserActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density|smallestScreenSize"
             android:exported="false" />
+
+        <!-- FileProvider（0.11.1 应用内更新）：把应用私有目录里的安装包以 content:// 交给
+             系统安装器。Android 7+ 不允许把 file:// 交给别的应用（FileUriExposed），
+             所以"下载 APK 再安装"必须走这一条。authorities 用 ${applicationId} 占位，
+             与 UpdateBridge 里 "${packageName}.fileprovider" 保持一致。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+            <!-- 安装包只从 files/updates/ 出去（见 res/xml/file_paths.xml 的路径顺序）。 -->
+            <grant-uri-permission android:pathPattern="/updates/.*" />
+        </provider>
+
+        <!-- 后台下载 APK 的前台服务（0.11.1）：通知栏出下载进度，下载完点通知直接安装。
+             foregroundServiceType="dataSync" 是 targetSdk 34 的硬要求（必须配
+             FOREGROUND_SERVICE_DATA_SYNC 权限，已在上面声明）。 -->
+        <service
+            android:name=".UpdateDownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 常驻通知（通知保活，0.11.1）：渠道 zcode_keepalive（IMPORTANCE_MIN），
+             ongoing=true，用户划不掉。同样是 dataSync 类型前台服务。 -->
+        <service
+            android:name=".KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>

@@ -39,6 +39,12 @@ class MainActivity : Activity() {
     private val workspaceBridge by lazy { WorkspaceBridge(this, treeBridge) { if (::webView.isInitialized) webView else null } }
     // 系统栏主题 + 沉浸 insets（0.3.7）：webViewProvider 用 lambda，注册发生在 webView 建好之后。
     private val uiChrome by lazy { UIChromeBridge(this) { if (::webView.isInitialized) webView else null } }
+    // 应用内更新（0.11.1）：查 GitHub Release、下载 APK、装 APK。原生侧只管能力，
+    // 弹窗与文案由 UI 侧接（挂名 zcodeUpdate）。
+    private val updateBridge by lazy { UpdateBridge(applicationContext) }
+    // 通知面（0.11.1）：POST_NOTIFICATIONS 权限、常驻通知（保活）、出错提醒。
+    // 第二个参数是 Activity 的取用口：运行时权限只能由 Activity 发（挂名 zcodeNotify）。
+    private val notificationBridge by lazy { NotificationBridge(applicationContext) { this } }
 
     // ES module 在 file:// 下会被 CORS 拒绝，因此用 https://appassets 虚拟域加载 assets。
     // lazy：onCreate 与 onRenderProcessGone 的重建路径共用同一份 handler。
@@ -273,6 +279,12 @@ class MainActivity : Activity() {
             // （那个时机既晚、又可能不触发，缺桥会直接变成「原生模型桥不可用」）。
             addJavascriptInterface(modelHttpBridge!!, "zcodeModelHttp")
             modelBridgeAttached = true
+            // 应用内更新（0.11.1）：原生能力桥——查版本、下载 APK、装 APK。
+            // 桌面 harness 没有这两个桥，UI 侧必须能优雅降级（桥不存在时不能崩）。
+            addJavascriptInterface(updateBridge, "zcodeUpdate")
+            // 通知面（0.11.1）：权限、常驻通知、出错提醒。与 JS 侧
+            // mobile-runtime/ui/app-notify.ts 的四个方法逐字对齐。
+            addJavascriptInterface(notificationBridge, "zcodeNotify")
             loadUrl(UI_PAGE)
         }
 
@@ -428,6 +440,21 @@ class MainActivity : Activity() {
         if (fileChooser.handleResult(requestCode, resultCode, data)) return
         // 工作区目录选择同理：接不住的那一半是"选完文件夹回来，UI 里没有任何反应"。
         if (workspaceBridge.handleResult(requestCode, resultCode, data)) return
+    }
+
+    /**
+     * 运行时权限结果（0.11.1 通知面）。
+     *
+     * POST_NOTIFICATIONS 是 Activity 发的（NotificationBridge.requestPermission），
+     * 结果必须从这儿转回桥里——不接这一段，JS 侧永远等不到"用户授权了没"的答案。
+     */
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        notificationBridge.handlePermissionResult(requestCode, permissions, grantResults)
     }
 
     override fun onResume() {

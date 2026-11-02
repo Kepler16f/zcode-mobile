@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 的可共享路径（0.11.1 应用内更新）。
+
+  只映射应用私有目录：安装包下载在 files/updates/，系统安装器要经 FileProvider
+  才读得到（Android 7+ 禁止把 file:// 交给别的应用，会抛 FileUriExposed）。
+
+  顺序有意义：FileProvider 取**第一条**匹配的条目，所以 updates/ 排在前面，
+  files/updates/xxx.apk 拿到的 URI 路径恒为 /updates/xxx.apk，
+  与清单里 <grant-uri-permission android:pathPattern="/updates/.*" /> 对得上。
+-->
+<paths>
+    <files-path name="updates" path="updates/" />
+    <files-path name="files" path="." />
+    <cache-path name="cache" path="." />
+</paths>

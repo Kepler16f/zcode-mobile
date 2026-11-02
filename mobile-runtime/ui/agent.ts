@@ -124,6 +124,12 @@ import {
   type MobileHookLifecycleEvent,
   type MobileHookRuntime,
 } from "./hooks-mobile.js";
+import {
+  notifyIfPermitted,
+  setKeepAliveIfPermitted,
+  summarizeForNotification,
+  TURN_ERROR_NOTIFICATION_ID,
+} from "./app-notify.js";
 
 /** 与上游 continuous profile 同一个值（core.ts:38）：30 ms 内的增量并成一帧。 */
 const FLUSH_WINDOW_MS = 30;
@@ -2077,6 +2083,11 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
 
     if (params.config) session.config = { ...session.config, ...params.config };
     session.run = { abort: new AbortController(), executionId, turnId };
+    // 通知保活（0.8.x，用户点名"有了通知权限以后你可以给出通知保活"）：这一轮开始跑，
+    // 进程就该被系统当成"有事在做"留着——安卓后台回收是常态，轮子跑一半被杀了最亏。
+    // 具体开关逻辑在 app-notify.ts 里（用户开关 + 通知权限两道闸），这边只管喊"开/关"。
+    // 没有桥 / 没权限 / 用户没开开关时它自己静默返回 false，绝不影响这一轮。
+    setKeepAliveIfPermitted(true);
 
     const header: TurnHeaderRow = {
       rowId: headerRowId,
@@ -2209,6 +2220,24 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     });
     if (outcome.kind === "failed") {
       say(`轮次失败（${session.sessionId}）：${outcome.code} —— ${outcome.message}`);
+    }
+    // ── 通知面（0.8.x，用户点名"给出通知保活，出错也发通知提醒用户"）──
+    // 两件事，都包在 try/catch 里：通知是锦上添花，它坏了绝不能把这一轮搞挂。
+    try {
+      // 保活收口：这一轮结束了 → 撤掉前台服务与常驻通知（会话空闲就别占着通知栏）。
+      setKeepAliveIfPermitted(false);
+      // 出错提醒：这一轮以失败收场时给用户一条通知——屏幕上的气泡用户可能正忙别的看不见，
+      // 通知栏里那一条才追得上。只在 kind==="failed" 时发：成功轮不该有提醒
+      //（上一轮留下的旧 lastError 还挂在会话上，不代表这一轮出错）。
+      if (outcome.kind === "failed") {
+        const summary =
+          summarizeForNotification(session.control.lastError?.message ?? outcome.message) ||
+          summarizeForNotification(outcome.code);
+        notifyIfPermitted(TURN_ERROR_NOTIFICATION_ID, "ZCode", summary);
+      }
+    } catch {
+      // 通知面整体失败：记一句诊断就放过，这一轮的终态照常往下走。
+      say(`通知发送失败（已忽略）：${session.sessionId}`);
     }
     // 收口之后必须再投一次：同步器要靠"非终态 → 终态"这次迁移写 status 并广播
     // （zcodeTaskIndexSyncer.ts:678-685 applyTerminalTransition），只发开头那一帧的话，
