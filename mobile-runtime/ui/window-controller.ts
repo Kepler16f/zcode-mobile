@@ -28,6 +28,9 @@ import {
   sidebarSnapshot,
   sidebarWatched,
 } from "./sidebar-diagnostics.js";
+// 启动体验（见 agent.ts yieldToInput 头注）：listTaskList 是启动窗口里最先到的复合重活
+// （watchScope 首扫 + task-index 查询 + 摘要投影），入口先让积压的点击/触摸派发一次。
+import { yieldToInput } from "./agent.js";
 import {
   CONTROLLER_TASKS_INDEX_TOPIC,
   CONTROLLER_WORKSPACES_TOPIC,
@@ -390,6 +393,9 @@ export function createMobileWindowControllerService(options: {
     async listTaskList(
       params: ZCodeTaskListQuery,
     ): Promise<WindowHostControllerTaskListResult> {
+      // 启动窗口里这条是第一批到达的读口（watchScope 首扫 + sqlite 查询 + 摘要投影）；
+      // 先让积压的输入派发一次（见 agent.ts yieldToInput 头注），点击不再排队等整串跑完。
+      await yieldToInput();
       for (const scope of params.workspaceScopes) watchScope(scope);
       const result = await options.taskIndexRepo.queryTaskList({
         ...params,

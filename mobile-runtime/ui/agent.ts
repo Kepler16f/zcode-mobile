@@ -398,6 +398,30 @@ function now(): number {
   return Date.now();
 }
 
+/**
+ * 让路输入的一个宏任务口（启动体验修复，用户报"刚启动能进设置但每个选项点不动"）。
+ *
+ * 机制：端侧 UI 与服务同处一个 JS 线程，启动窗口里订阅/列表/恢复这类复合 RPC 一条接一条
+ * 地在主线程上跑；期间到达的点击/触摸要等这一整串跑完才被派发——界面已经渲染出来了，
+ * 点哪里都没反应，直到串尾才"自己恢复"，恢复时长与启动耗时同源（装机实测与长任务风暴
+ * 逐一对上）。在复合重活的入口排队一个 MessageChannel 宏任务，浏览器会先派发积压的
+ * 输入事件再继续下一段——这是调度原语，不是定时器：不猜测任何时长，就绪由
+ * "输入已派发"这个事实事件驱动。
+ */
+const inputYieldChannel =
+  typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+export function yieldToInput(): Promise<void> {
+  if (!inputYieldChannel) return Promise.resolve();
+  return new Promise((resolve) => {
+    const port = inputYieldChannel.port1;
+    port.onmessage = () => {
+      port.onmessage = null;
+      resolve();
+    };
+    inputYieldChannel.port2.postMessage(null);
+  });
+}
+
 function draftControl(): SessionControl {
   return {
     phase: "draft",
@@ -4606,6 +4630,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     kind: "sessions-index" | "workspace-config",
     params: { workspacePath: string; workspaceIdentity?: string },
   ): { ack: { subscriptionId: string; mode: "snapshot"; logEpoch: string } } {
+    // 注意：这条是同步实现，水合/首帧都在调用方的宏任务里。调用面（下面两个 async 方法）
+    // 先 yieldToInput 让积压输入派发，再进来跑重活。
     const state = workspaceTopicOf(params);
     const isIndex = kind === "sessions-index";
     const sub: WorkspaceTopicSubscription = {
@@ -4699,6 +4725,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       ack: { subscriptionId: string; mode: "snapshot" | "resume"; logEpoch: string };
     }> {
       requireHandshake();
+      // 启动窗口里这条订阅带着"读库还原 + 全量快照 + 首帧编码"一整串同步活，
+      // 前面先让积压的输入派发一次（见 yieldToInput），点击不再排队等整串跑完。
+      await yieldToInput();
       // 订阅是"点开侧栏那一行"的第一个落点：内存里没有就先去库里找（重启后回看历史），
       // 找不到才给 missing 占位。时间线画的是 buildSnapshot 里还原回来的 rows。
       const session = sessionOrRestore(params.sessionId, params.workspacePath);
@@ -4913,6 +4942,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       base?: { logEpoch: string; seq: number };
       visibility?: "foreground" | "background";
     }): Promise<{ ack: { subscriptionId: string; mode: "snapshot"; logEpoch: string } }> {
+      // 启动窗口的复合重活（水合历史 + 首帧快照）前先让积压输入派发一次（见 yieldToInput）。
+      await yieldToInput();
       return subscribeWorkspaceTopic("sessions-index", params);
     },
 
@@ -4944,6 +4975,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       base?: { logEpoch: string; seq: number };
       visibility?: "foreground" | "background";
     }): Promise<{ ack: { subscriptionId: string; mode: "snapshot"; logEpoch: string } }> {
+      // 同 subscribeSessionsIndexV4：启动窗口的重活前先让积压输入派发一次。
+      await yieldToInput();
       return subscribeWorkspaceTopic("workspace-config", params);
     },
 

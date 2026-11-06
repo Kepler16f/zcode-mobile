@@ -164,6 +164,33 @@ function hideBooting() {
 }
 
 /**
+ * 启动屏的交棒点（启动体验修复，用户报"刚启动能进设置但每个选项点不动"）。
+ *
+ * 此前 hideBooting() 在 root.render() 调用后立刻执行，而 React 18 的首次提交是
+ * 异步调度的：真机上从"启动屏撤掉"到"第一帧真正画出来"之间是一段既没有可见启动态、
+ * 又没有任何可点目标的空窗，用户的第一次点击就落在这里（点哪都没反应），而主线程
+ * 正忙的启动窗口会把这种"点了没反应"一直延续到挂载风暴结束。
+ *
+ * 现在改成事件驱动交棒：监听 #root 的首次提交（childList 出现节点）→ 下一帧撤启动屏。
+ * 不猜时长（没有定时器兜路）："正在启动…"一直显示到真的有 UI 画出来为止；提交前
+ * 点不出东西，屏幕上是诚实的启动态。提交后（例如启动失败或错误边界兜底）撤屏路径
+ * 与之前一致。React 一直没提交（模块求值就崩了）时 ui.html 的全局错误处理会把原因
+ * 写进仍在屏上的 #booting——比旧路径"启动屏已撤、错误没地方写"更能回收现场。
+ */
+function armSplashHandoff() {
+  const host = document.getElementById("root");
+  if (!host) return;
+  const settle = () => {
+    mo.disconnect();
+    requestAnimationFrame(() => hideBooting());
+  };
+  const mo = new MutationObserver(settle);
+  mo.observe(host, { childList: true });
+  // 热重载/二次 boot 时 #root 可能已经有子树：直接走同一出口。
+  if (host.childElementCount) settle();
+}
+
+/**
  * 把启动走到哪一步写在屏幕上。
  * 端上出问题时唯一能回收到的就是这块文字（没有 devtools），而"白屏"本身不说明死在哪一行。
  */
@@ -262,6 +289,9 @@ export async function bootMobileUi(overrides: { agentModelTargets?: ModelTargetR
     return;
   }
 
+  // 启动屏交棒改为事件驱动（见 armSplashHandoff）：先挂好观察器再 render，
+  // 首帧提交后的下一帧才撤"正在启动…"——不再在第一帧画出来之前就撤屏留空窗。
+  armSplashHandoff();
   root.render(
     <AppErrorBoundary>
       <ZCodeIntlProvider settingService={services.settingService} broadcastService={services.broadcastService}>
@@ -291,7 +321,6 @@ export async function bootMobileUi(overrides: { agentModelTargets?: ModelTargetR
       </ZCodeIntlProvider>
     </AppErrorBoundary>,
   );
-  hideBooting();
 }
 
 // 出货包：加载即启动。本机的浏览器验证会把这句旗子立起来，自己带一个 mock 模型落点再进来——
