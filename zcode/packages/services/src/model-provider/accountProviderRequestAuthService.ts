@@ -71,8 +71,19 @@ class AccountProviderRequestAuthService implements AccountRequestAuthResolver {
     if (!access) throw new AccountRequestCredentialUnavailableError(providerId);
 
     if (access.planKind === "start-plan") {
+      // 0.11.2（对齐已装桌面 3.16.3 的 wxe 语义）：zai 的 start-plan 授权先是
+      // `Bearer (JWT || apiKey)`——JWT（zcodejwttoken）缺失/为空时**回退到套餐 apiKey**
+      // （loadIndividualPlanApiKey 换发链），而不是直接抛凭据不可用。实测（2026-11-06，
+      // 桌面真实凭据复放）：balance 端点对裸 JWT/无凭据/坏凭据一律同形 401 空体，
+      // 旧代码"JWT 缺失即抛"会让整个套餐查询失败；兜底链是 3.16.3 的既定行为。
       const tokenSet = await this.#options.loadOAuthTokenSet(resolveOAuthProviderId(access.family));
-      return { apiKey: requireApiKey(tokenSet?.zcodeJwtToken, providerId) };
+      const jwt = tokenSet?.zcodeJwtToken?.trim() ?? "";
+      if (jwt) return { apiKey: jwt };
+      const fallbackApiKey = await this.#options.loadIndividualPlanApiKey(
+        providerId,
+        access.family,
+      );
+      return { apiKey: requireApiKey(fallbackApiKey, providerId) };
     }
 
     if (access.planKind === "individual-coding-plan") {

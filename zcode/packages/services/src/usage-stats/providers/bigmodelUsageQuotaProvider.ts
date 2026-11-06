@@ -400,12 +400,47 @@ export class BigModelUsageQuotaProvider {
         status: error instanceof ApiError ? error.status : null,
         url: buildZaiStartPlanBalanceUrl(),
       });
+      // 0.11.2（对齐已装桌面 3.16.3 的 classifyAvailabilityError）：balance 的 401/403
+      // 不再把整个快照 throw 掉——那会让套餐入口从"该 provider 认证失败"放大成全局
+      // "套餐查询失败"（装机主诉）。分类成 auth_failed 快照（authenticated:true，
+      // unavailableReason 带语义），调用方据此提示重新登录；429/5xx 等瞬态仍 throw
+      // 保留退避语义。业务 code!==0 同理收敛为 business_error 快照。
+      const status = error instanceof ApiError ? error.status : null;
+      if (status === 401 || status === 403) {
+        return {
+          generatedAt,
+          authenticated: true,
+          // 枚举只有四值（usage-stats.ts:69）；401/403 归入 "unavailable"，
+          // 具体状态码留在上方 warn 日志（agentLog 可查）与入口 UI 的原因透出。
+          unavailableReason: "unavailable",
+          context: { scope: "personal" },
+          provider: resolved.provider,
+          remaining: null,
+          subscription: null,
+          quota: null,
+        };
+      }
       // 保留 HTTP 429 等错误信息，让调用方退避并保留已确认的权益。
       throw error;
     }
 
     if (balancePayload.code !== 0) {
-      throw new Error(balancePayload.msg || `Start Plan balance failed: ${balancePayload.code}`);
+      log.warn(undefined, "billing/balance 业务失败", {
+        code: balancePayload.code,
+        msg: balancePayload.msg ?? null,
+        providerId,
+        url: buildZaiStartPlanBalanceUrl(),
+      });
+      return {
+        generatedAt,
+        authenticated: true,
+        unavailableReason: "unavailable",
+        context: { scope: "personal" },
+        provider: resolved.provider,
+        remaining: null,
+        subscription: null,
+        quota: null,
+      };
     }
 
     const currentPlan = pickCurrentZaiStartPlan(balancePayload.data?.plans);
