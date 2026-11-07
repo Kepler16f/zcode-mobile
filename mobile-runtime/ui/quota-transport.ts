@@ -60,6 +60,30 @@ function appVersion(): string {
   }
 }
 
+/**
+ * 官方客户端身份（0.11.4，实测定性）：zcode-plan 端点按"官方客户端身份"校验——
+ * `x-platform: android-arm64`、`x-os-category: android`、自报版本号（0.11.x）这类
+ * 不存在于 ZCode 发行版的值就是强拒绝信号（3001 parameter error）。参考实现
+ * （HarmonyOS 移植层 ohos-identity.cjs，官方 AppImage 原样跑、Start Plan 可用）
+ * 的归一口径：x-platform→linux-arm64、x-os-category→linux、x-os-version→Linux
+ * 内核串、x-zcode-app-version/user-agent→**官方发行版本号**。用户可经
+ * desktopCompatibilityVersion（localStorage）覆盖，缺省跟当前官方发行版。
+ */
+const OFFICIAL_COMPAT_VERSION = "3.17.2";
+const OFFICIAL_LINUX_KERNEL = "6.8.0-45-generic";
+
+function officialVersion(): string {
+  try {
+    const override = globalThis.localStorage
+      ?.getItem("zcode-mobile.desktopCompatibilityVersion")
+      ?.trim();
+    if (override && /^\d+\.\d+\.\d+/.test(override)) return override;
+  } catch {
+    /* localStorage 不可用走缺省 */
+  }
+  return OFFICIAL_COMPAT_VERSION;
+}
+
 function locale(): string {
   try {
     return Intl.DateTimeFormat().resolvedOptions().locale || "unknown";
@@ -82,22 +106,25 @@ function isContextHost(url: URL): boolean {
 }
 
 /**
- * ZCode 上下文头组（0.11.3）：zcode-plan/套餐端点的必验参数（缺失即 3001 parameter
- * error）。只对 z.ai / bigmodel.cn 域名注入；调用方显式给过的键不覆盖。
+ * ZCode 上下文头组（0.11.3 注入 / 0.11.4 值归一）：zcode-plan/套餐端点的必验参数
+ * （缺失即 3001 parameter error；值不像官方客户端同样被拒——实测
+ * `x-platform: android-arm64`/自报 0.11.x → 3001，`linux-arm64`/官方版本号 → code=0）。
+ * 只对 z.ai / bigmodel.cn 域名注入；调用方显式给过的键不覆盖。
  */
 export function zcodeContextHeaders(url: URL): Record<string, string> {
   if (!isContextHost(url)) return {};
-  const version = appVersion();
+  const version = officialVersion();
   return {
     "User-Agent": `ZCode/${version}`,
     "HTTP-Referer": `${url.protocol}//${url.host}`,
     "X-Title": "Z Code@android",
     "X-ZCode-App-Version": version,
-    "X-Platform": "android-arm64",
+    "X-Platform": "linux-arm64",
     "X-Release-Channel": "stable",
     "X-Client-Language": locale(),
     "X-Client-Timezone": timezone(),
-    "X-Os-Category": "android",
+    "X-Os-Category": "linux",
+    "X-Os-Version": OFFICIAL_LINUX_KERNEL,
     "X-Device-Mid": deviceMid(),
     "x-request-id": randomUUID(),
   };
@@ -125,6 +152,12 @@ export function createQuotaApiClient(): MobileApiClient {
         : rest.signal;
       const url = rewritePlatformForServer(input);
       const parsed = url instanceof URL ? url : new URL(url, globalThis.location?.href ?? "https://zcode.z.ai");
+      // 0.11.4：zcode-plan 端点的 app_version 同口径归一——上游用 ZCODE_VERSION
+      // （仓库构建=0.0.0-dev）填参，服务端 3001 parameter error。与上下文头同一
+      // 官方版本来源（desktopCompatibilityVersion 覆盖优先，缺省当前官方发行版）。
+      if (isContextHost(parsed) && parsed.searchParams.has("app_version")) {
+        parsed.searchParams.set("app_version", officialVersion());
+      }
       const contextHeaders = mergeContextHeaders(parsed, Object.fromEntries(new Headers(rest.headers).entries()));
       const bridge = (globalThis as { zcodeGitHttp?: Bridge }).zcodeGitHttp;
       const shell = globalThis as { zcodeFs?: unknown; zcodeSqlite?: unknown; zcodeDevice?: unknown };

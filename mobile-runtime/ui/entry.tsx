@@ -180,12 +180,49 @@ function hideBooting() {
 function armSplashHandoff() {
   const host = document.getElementById("root");
   if (!host) return;
-  const settle = () => {
-    mo.disconnect();
-    requestAnimationFrame(() => hideBooting());
+  // 0.11.4（用户点名"宁可开屏动画长一点，也不要点进去用不了"）：交臂条件从
+  // "首帧已画"升级为"主线程有余量"——首帧后仍有一段启动风暴（RPC 级联/服务装配/
+  // React 效应级联）占满主线程，期间点击全部排队，用户看到的是"能进设置但点不动"。
+  // 现在等**连续两帧都轻**（帧耗时 < 100ms）才撤启动屏；requestIdleCallback 让出或
+  // 8s 硬顶兜底（防挂死）；boot 失败路径照旧立即撤屏让错误可见。
+  let mo: MutationObserver | null = null;
+  let settled = false;
+  const settleNow = () => {
+    if (settled) return;
+    settled = true;
+    mo?.disconnect();
+    globalThis.clearTimeout(cap);
+    hideBooting();
   };
-  const mo = new MutationObserver(settle);
-  mo.observe(host, { childList: true });
+  const cap = globalThis.setTimeout(() => settleNow(), 8000);
+  const lightFrame = () =>
+    new Promise<boolean>((resolve) => {
+      const t0 = performance.now();
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve(performance.now() - t0 < 100)));
+    });
+  const idleOrTimeout = new Promise<void>((resolve) => {
+    const ric = (globalThis as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => void })
+      .requestIdleCallback;
+    if (typeof ric === "function") ric(() => resolve(), { timeout: 6000 });
+    else globalThis.setTimeout(resolve, 600);
+  });
+  const waitInteractive = async () => {
+    for (;;) {
+      if (await lightFrame()) break;
+      // 轻帧迟迟不来时由 idle/超时放行（8s 硬顶是最后的兜底线）。
+      const raced = await Promise.race([idleOrTimeout.then(() => true), lightFrame()]);
+      if (raced) break;
+    }
+    settleNow();
+  };
+  const settle = () => {
+    mo?.disconnect();
+    mo = null;
+    void waitInteractive();
+  };
+  const observer: MutationObserver = new MutationObserver(settle);
+  mo = observer;
+  observer.observe(host, { childList: true });
   // 热重载/二次 boot 时 #root 可能已经有子树：直接走同一出口。
   if (host.childElementCount) settle();
 }

@@ -27,7 +27,7 @@
 //     A4 sessions-index 订阅同样让路（tap 先于 listSummaries）。
 //   浏览器侧（真 dist-ui 产物 + 真 Chromium）：
 //     B1 加载初期启动屏在屏且未离场（可见等待态，不是死黑屏）；
-//     B2 工作区壳层挂载后启动屏 ≤1.5s 内交臂离场（事件驱动，不是固定延时）；
+//     B2 工作区壳层挂载后启动屏在主线程有余量时才交臂（≤8s 硬顶；0.11.4 起"可交互才交臂"）；
 //     B3 进设置后设置项不被任何层覆盖（elementFromPoint 命中按钮本体）；
 //     B4 真触摸点分区导航 ≤2.5s 内生效（就绪后立即生效）。
 import assert from "node:assert/strict";
@@ -255,11 +255,13 @@ for (let i = 0; i < 150; i++) {
   }
   await page.waitForTimeout(120);
 }
-// B2：首次提交那一刻启动屏还在（事件驱动交臂，不在提交前抢跑），且随后 ≤1.5s 内离场。
+// B2：首次提交那一刻启动屏还在（事件驱动交臂，不在提交前抢跑）；交臂时机＝主线程
+// 有余量（连续轻帧/idle）或 8s 硬顶——0.11.4 起交臂条件从"首帧已画"升级为"可交互"，
+// 用户点名"宁可开屏动画长一点，也不要点进去用不了"。
 const shellGoneAt = Date.now();
 let handoffOk = false;
 let handoffDetail = "";
-for (let i = 0; i < 15; i++) {
+for (let i = 0; i < 95; i++) {
   const st = await page.evaluate(() => {
     const el = document.getElementById("booting");
     return { present: Boolean(el), leaving: el?.classList.contains("leaving") ?? true };
@@ -270,7 +272,7 @@ for (let i = 0; i < 15; i++) {
 const sample = await page.evaluate(() => globalThis.__splashHandoffSample);
 check("B2a 首次提交时启动屏仍在屏（撤屏挂在提交事件上，不抢跑）",
   Boolean(sample?.present) && sample?.leaving === false, JSON.stringify(sample));
-check("B2b 首帧之后启动屏 ≤1.5s 内交臂离场", handoffOk, handoffDetail);
+check("B2b 启动屏在主线程有余量后才交臂（≤8s 硬顶，宁久勿死）", handoffOk, handoffDetail);
 
 // 开抽屉（真手势）→ 进设置。
 const swipeOpen = async () => {
