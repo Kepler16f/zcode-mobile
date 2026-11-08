@@ -279,6 +279,10 @@ try {
   const sessionId2 = created2.result.sessionId;
   const childId = firstLink?.childSessionId;
   check("上一轮的子代理 id 可用于续接", typeof childId === "string" && childId.length > 0, String(childId));
+  // 断言只看**本轮新增**的工具结果，不能扫整段历史：上文 F 段有一个"续接不存在的子代理"
+  // 的**故意负例**，它把"不在本次运行中"写进了父会话历史；扫全量历史会把这条例意造出的
+  // 错误当成"重启续接失败"——产品行为其实是对的（子代理 transcript 带 CHILD_AFTER_RESTART）。
+  const historyLenBeforeRestartResume = requests.at(-1)?.messages?.length ?? 0;
   parentPlan = [{ tool: agentTool({ prompt: "after restart", resume: childId }) }];
   childPlan = [{ text: "CHILD_AFTER_RESTART" }];
   await send2("sendText", sessionId2, { text: "Resume after restart" });
@@ -287,10 +291,12 @@ try {
     "重启后的续接没有跑起来",
     10000,
   );
+  const messagesAfterRestartResume = requests.at(-1)?.messages ?? [];
+  const newMessagesAfterRestartResume = messagesAfterRestartResume.slice(historyLenBeforeRestartResume);
   check(
-    "重启后可以续接上一次子代理（不再报不在本次运行中）",
-    !JSON.stringify(requests.at(-1)?.messages ?? []).includes("不在本次运行中"),
-    JSON.stringify(requests.at(-1)?.messages ?? []).slice(-300),
+    "重启后可以续接上一次子代理（本轮没有'不在本次运行中'）",
+    !JSON.stringify(newMessagesAfterRestartResume).includes("不在本次运行中"),
+    JSON.stringify(newMessagesAfterRestartResume).slice(-300),
   );
   const restartedTranscript = JSON.stringify(childRequests.at(-1)?.messages ?? []);
   check("重启后的续接带着上一次落盘的 transcript", restartedTranscript.includes("CHILD_FIRST_ROUND"), restartedTranscript.slice(0, 220));
