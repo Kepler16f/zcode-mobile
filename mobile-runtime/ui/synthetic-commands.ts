@@ -54,7 +54,9 @@ function tokenizeShellWords(segment: string): string[] | null {
     hasWord = false;
   };
   while (i < segment.length) {
-    const c = segment[i];
+    // charAt 取界内字符（i < length）：与 segment[i] 逐字等价，但类型是 string，
+    // 不用被 noUncheckedIndexedAccess 逼成 string | undefined（这里没有"可能越界"的语义）。
+    const c = segment.charAt(i);
     if (c === "'") {
       hasWord = true;
       const end = segment.indexOf("'", i + 1);
@@ -178,8 +180,9 @@ export function resolveSyntheticPipeline(command: string): SyntheticSegment[] | 
     const resolved: SyntheticSegment[] = [];
     for (const segment of segments) {
       const words = tokenizeShellWords(segment);
-      if (!words || words.length === 0) return null;
+      if (!words) return null;
       const name = words[0];
+      if (name === undefined) return null; // 空词表（等价原来的 words.length === 0 判断）：退回 sh
       if (!Object.prototype.hasOwnProperty.call(SYNTHETIC_COMMANDS, name)) return null;
       resolved.push({ name, args: words.slice(1) });
     }
@@ -215,18 +218,25 @@ type JqValue = null | boolean | number | string | JqValue[] | { [key: string]: J
 
 class JqError extends Error {}
 
-/** jq 程序记号：punct（.[]|()==!= 等）、ident、string（已解转义）、number。 */
-interface JqToken {
-  t: "punct" | "ident" | "string" | "number";
-  v: string;
-  n?: number;
-}
+/**
+ * jq 程序记号：punct（.[]|()==!= 等）、ident、string（已解转义）、number。
+ *
+ * 为什么用判别联合而不是 `{ t: …; v: string; n?: number }`：那写法把 `n` 挂在所有记号上，
+ * 取数值就必须写 `t.n!`（"断言它一定在"）——正是本仓纪律里说的糊法。判别联合让 `n` 只属于
+ * number 记号且必填，`t.t === "number"` 一分支出 `n: number`（不再是 number | undefined），
+ * 断言自然消失，运行时对象一个字段没多。
+ */
+type JqToken =
+  | { t: "punct"; v: string }
+  | { t: "ident"; v: string }
+  | { t: "string"; v: string }
+  | { t: "number"; v: string; n: number };
 
 function jqTokenize(src: string): JqToken[] {
   const tokens: JqToken[] = [];
   let i = 0;
   while (i < src.length) {
-    const c = src[i];
+    const c = src.charAt(i); // 界内字符（i < length）：与 src[i] 逐字等价，类型是 string
     if (/\s/.test(c)) { i++; continue; }
     if (c === "|" || c === "." || c === "[" || c === "]" || c === "(" || c === ")") {
       tokens.push({ t: "punct", v: c });
@@ -276,7 +286,9 @@ function jqTokenize(src: string): JqToken[] {
       continue;
     }
     if (/[A-Za-z_]/.test(c)) {
-      const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i))!;
+      const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
+      // 上一行已确认 c 是字母/下划线 → 该正则必匹配；这里只是把"必匹配"写成可判定的形式（不用 ! 断言）。
+      if (!m) throw new JqError(`jq 程序含本子集不支持的字符 "${c}"（位置 ${i}）`);
       tokens.push({ t: "ident", v: m[0] });
       i += m[0].length;
       continue;
@@ -315,7 +327,7 @@ function jqParse(program: string): JqNode {
     const t = peek();
     if (!t) throw new JqError("比较式意外结束");
     if (t.t === "string") { pos++; return { kind: "literal", value: t.v }; }
-    if (t.t === "number") { pos++; return { kind: "literal", value: t.n! }; }
+    if (t.t === "number") { pos++; return { kind: "literal", value: t.n }; }
     if (t.t === "ident" && (t.v === "true" || t.v === "false" || t.v === "null")) {
       pos++;
       return { kind: "literal", value: t.v === "true" ? true : t.v === "false" ? false : null };
@@ -327,14 +339,16 @@ function jqParse(program: string): JqNode {
     let node = parsePrimary();
     while (true) {
       const t = peek();
-      if (t && t.t === "punct" && t.v === "." && tokens[pos + 1]?.t === "ident") {
+      const ident = tokens[pos + 1];
+      if (t && t.t === "punct" && t.v === "." && ident && ident.t === "ident") {
         pos += 2;
-        node = { kind: "field", source: node, name: (tokens[pos - 1] as { v: string }).v };
+        node = { kind: "field", source: node, name: ident.v };
         continue;
       }
       if (t && t.t === "punct" && t.v === "[") {
         pos++;
-        if (peek() && peek().t === "punct" && peek().v === "]") {
+        const close = peek();
+        if (close && close.t === "punct" && close.v === "]") {
           pos++;
           node = { kind: "iterate", source: node };
           continue;
@@ -343,7 +357,7 @@ function jqParse(program: string): JqNode {
         if (k && (k.t === "number" || k.t === "string")) {
           pos++;
           eat("]");
-          node = { kind: "index", source: node, key: k.t === "number" ? k.n! : k.v };
+          node = { kind: "index", source: node, key: k.t === "number" ? k.n : k.v };
           continue;
         }
         throw new JqError("jq 子集的 [] 下标只支持数字或字符串字面量");
@@ -379,9 +393,10 @@ function jqParse(program: string): JqNode {
         let cond: JqNode = left;
         const op = peek();
         if (op && op.t === "punct" && (op.v === "==" || op.v === "!=")) {
+          const opText = op.v; // 上面的比较已把它收窄成 "==" | "!="（不用 as 断言）
           pos++;
           const right = parseOperand();
-          cond = { kind: "compare", left, op: op.v as "==" | "!=" , right };
+          cond = { kind: "compare", left, op: opText, right };
         }
         eat(")");
         return { kind: "select", source: { kind: "identity" }, cond };
@@ -393,7 +408,9 @@ function jqParse(program: string): JqNode {
 
   const parsePipe = (): JqNode => {
     let node = parsePostfix();
-    while (peek() && peek().t === "punct" && peek().v === "|") {
+    while (true) {
+      const p = peek();
+      if (!p || p.t !== "punct" || p.v !== "|") break;
       pos++;
       const right = parsePostfix();
       node = { kind: "pipe", left: node, right };
@@ -402,7 +419,9 @@ function jqParse(program: string): JqNode {
   };
 
   const ast = parsePipe();
-  if (pos !== tokens.length) throw new JqError(`jq 程序末尾有多余内容：${tokenText(tokens[pos])}`);
+  // pos 只会落在 [0, tokens.length] 内：pos !== tokens.length 等价于 tokens[pos] 存在。
+  const extra = tokens[pos];
+  if (extra) throw new JqError(`jq 程序末尾有多余内容：${tokenText(extra)}`);
   return ast;
 }
 
@@ -417,13 +436,24 @@ function deepEqual(a: JqValue, b: JqValue): boolean {
   if (typeof a !== typeof b || a === null || b === null) return false;
   if (Array.isArray(a) || Array.isArray(b)) {
     if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    return a.every((x, i) => deepEqual(x as JqValue, b[i]));
+    return a.every((x, i) => {
+      const y = b[i];
+      // 长度已相等 → b[i] 必在界内；界外时旧写法 deepEqual(x, undefined) 同样返回 false。
+      if (y === undefined) return false;
+      return deepEqual(x, y);
+    });
   }
   if (typeof a === "object" && typeof b === "object") {
     const ka = Object.keys(a as object).sort();
     const kb = Object.keys(b as object).sort();
     if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
-    return ka.every((k) => deepEqual((a as Record<string, JqValue>)[k], (b as Record<string, JqValue>)[k]));
+    return ka.every((k) => {
+      const av = (a as Record<string, JqValue>)[k];
+      const bv = (b as Record<string, JqValue>)[k];
+      // 键集已比对相等，取不到值只可能是 undefined：两个都缺 → 相等；只缺一个 → 不相等。
+      if (av === undefined || bv === undefined) return av === bv;
+      return deepEqual(av, bv);
+    });
   }
   return false;
 }
@@ -571,7 +601,8 @@ function runJq(args: string[], stdin: string): SyntheticRunResult {
     const outputs = evalJq(node, input);
     if (flags.exitStatus) {
       if (outputs.length === 0) return { stdout: "", exitCode: 1 };
-      const lastValue = outputs[outputs.length - 1]!;
+      const lastValue = outputs[outputs.length - 1];
+      if (lastValue === undefined) return { stdout: "", exitCode: 1 }; // 不可达：上面已排除空数组
       return { stdout: formatJqOutput(outputs, flags.raw), exitCode: truthy(lastValue) ? 0 : 1 };
     }
     return { stdout: formatJqOutput(outputs, flags.raw), exitCode: 0 };
@@ -597,8 +628,8 @@ function base64OfText(text: string): string {
 
 /** URL 里抠文件名（-O / wget 缺省落盘名）：去 query/hash 后取最后一段。 */
 function urlBasename(url: string): string | null {
-  let path = url.split("#")[0]!;
-  path = path.split("?")[0]!;
+  let path = url.split("#")[0] ?? ""; // split 至少返回一个元素 → [0] 必在
+  path = path.split("?")[0] ?? "";
   const name = path.slice(path.lastIndexOf("/") + 1);
   return name === "" ? null : name;
 }

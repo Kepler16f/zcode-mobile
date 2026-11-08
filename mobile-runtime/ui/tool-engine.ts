@@ -594,17 +594,18 @@ export function createToolEngineFactory(
             try {
               const segments = resolveSyntheticPipeline(command);
               if (segments) {
-                const execApi = (globalThis as { zcodeExec?: Record<string, unknown> }).zcodeExec;
-                const host: SyntheticHost = {
-                  workspacePath,
-                  checkPathAccess: (p) => fileSystemPort.checkAccess(p),
-                  writeFile: async (p, bytes) => {
-                    await fileSystemPort.writeBinaryFile({ path: p, content: bytes });
-                  },
-                  ...(execApi && typeof execApi.unzip === "function"
-                    ? {
-                        unzipBridge: async (req: { zip: string; dest: string }) =>
-                          JSON.parse(String(execApi.unzip(JSON.stringify(req)))) as {
+              const execApi = (globalThis as { zcodeExec?: Record<string, unknown> }).zcodeExec;
+              const unzipFn = execApi?.unzip;
+              const host: SyntheticHost = {
+                workspacePath,
+                checkPathAccess: (p) => fileSystemPort.checkAccess(p),
+                writeFile: async (p, bytes) => {
+                  await fileSystemPort.writeBinaryFile({ path: p, content: bytes });
+                },
+                ...(typeof unzipFn === "function"
+                  ? {
+                      unzipBridge: async (req: { zip: string; dest: string }) =>
+                        JSON.parse(String(unzipFn(JSON.stringify(req)))) as {
                             ok?: boolean;
                             files?: number;
                             error?: string;
