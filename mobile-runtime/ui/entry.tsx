@@ -14,6 +14,7 @@ import "../compat/shims/process.mjs";
 // 这个垫片把它重定向到原生桥的真值（见 system-theme-media.ts 头注）。
 import "./system-theme-media.js";
 import { installInsetsChannel } from "./system-insets.js";
+import { installOfficialIdentityFetch } from "./official-identity-fetch.js";
 import { installImeLift } from "./ime-lift.js";
 import { installComposerTouchFocus } from "./composer-touch-focus.js";
 import { installJankWitness } from "./jank-witness.js";
@@ -250,6 +251,10 @@ export async function bootMobileUi(overrides: { agentModelTargets?: ModelTargetR
   // insets 读数通道（0.3.8：留边改由原生给 WebView setPadding，这里只维护 CSS 变量与自检读数，
   // 见 system-insets.ts 头注）。必须在首帧前挂：读数晚一帧，自检页就可能读到全零的旧值。
   installInsetsChannel();
+  // 全局 fetch 身份归一（0.11.5）：官方域（zcode.z.ai/api.z.ai/bigmodel.cn）的每个请求都带上
+  // 官方客户端身份头组，否则服务端回 3001 parameter error（装机"体验套餐获取失败"）。
+  // 必须在任何上游请求之前装——晚一拍就有一批请求裸奔。
+  installOfficialIdentityFetch();
   // 键盘抬高输入条（0.4.9，装机"输入框没随输入法抬高"）：消费 insets 推送垫 sticky dock。
   installImeLift();
   // 输入区触摸聚焦垫片（0.4.10，装机"点输入框要双击才出输入法"）：挂在 document 捕获上，

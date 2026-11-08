@@ -20,7 +20,7 @@ import { createOAuthService } from "@zcode/services/deep/oauth/oauthService.js";
 import { traceOAuthEvent } from "./oauth-trace.js";
 import { rewritePlatformForServer } from "./server-compat.js";
 import { withPendingOAuthPersistence } from "./oauth-pending.js";
-import { createQuotaApiClient } from "./quota-transport.js";
+import { createQuotaApiClient, officialIdentityHeaders } from "./quota-transport.js";
 
 /** 与 shared/src/api.ts:5 的 ApiClient 同形：request(input, init) -> Response。 */
 export interface MobileApiClient {
@@ -34,6 +34,11 @@ export interface MobileApiClient {
  * 出网前过一道 rewritePlatformForServer：服务端对 `platform=android-*` 直接拒 3001，
  * 体验套餐/套餐列表（client/configs）在真机上因此永远查不到（server-compat.ts 头注有实测记录）。
  * OAuth 那几个请求本来就不带 platform 参数，改写对它们是原样放行。
+ *
+ * 0.11.5：走原生桥的请求转给 quota 客户端（带身份归一头）；**没有桥的 WebView fetch 路径
+ * 也必须带同样的头**——参考实现（HarmonyOS 移植层 ohos-identity.cjs）就是在**全局 fetch**
+ * 上一层做身份归一，官方域的每个请求都受益；只在某一条客户端上注入，等于其余官方请求
+ * （provider runtime 的 client/configs、套餐预览、OAuth 换 Key）继续裸奔 → 服务端 3001。
  */
 export function createFetchApiClient(): MobileApiClient {
   return {
@@ -45,7 +50,9 @@ export function createFetchApiClient(): MobileApiClient {
           ? AbortSignal.any([rest.signal, AbortSignal.timeout(timeoutMs)])
           : AbortSignal.timeout(timeoutMs)
         : rest.signal;
-      return fetch(rewritePlatformForServer(input), { ...rest, signal });
+      const url = rewritePlatformForServer(input);
+      const headers = officialIdentityHeaders(url, Object.fromEntries(new Headers(rest.headers).entries()));
+      return fetch(url, { ...rest, headers, signal });
     },
   };
 }

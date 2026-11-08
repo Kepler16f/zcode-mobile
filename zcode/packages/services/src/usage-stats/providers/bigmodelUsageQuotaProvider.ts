@@ -410,9 +410,11 @@ export class BigModelUsageQuotaProvider {
         return {
           generatedAt,
           authenticated: true,
-          // 枚举只有四值（usage-stats.ts:69）；401/403 归入 "unavailable"，
-          // 具体状态码留在上方 warn 日志（agentLog 可查）与入口 UI 的原因透出。
-          unavailableReason: "unavailable",
+          // 401/403＝**登录态**被拒（令牌过期/被踢），语义上等于"该重新登录"：
+          // 用 not_authenticated 表达，UI 才能给出"重新登录 Z.ai"这个可执行动作。
+          // "unavailable" 留给"查得到但这次不可用"（如服务端临时不可用）。
+          // 枚举只有四值（usage-stats.ts:69），不改协议。
+          unavailableReason: "not_authenticated",
           context: { scope: "personal" },
           provider: resolved.provider,
           remaining: null,

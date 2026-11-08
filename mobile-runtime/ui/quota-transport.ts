@@ -17,7 +17,51 @@ type Bridge = { start(request: string): string; poll(id: string): string; cancel
 type Reply = { statusCode?: number; statusMessage?: string; headers?: Record<string, string>; bodyBase64?: string; error?: string };
 
 const DEVICE_MID_KEY = "zcode-mobile.deviceMid";
-const CONTEXT_HOSTS = [".z.ai", ".bigmodel.cn"];
+/** 官方域：zcode.z.ai（套餐/配置面）、api.z.ai（Z.ai 业务面：客户信息/订阅清单/换 Key）、
+ *  bigmodel.cn / bigmodel.com.cn（BigModel 业务面）。.z.ai 后缀覆盖 api.z.ai 与 zcode.z.ai。 */
+const CONTEXT_HOSTS = [".z.ai", ".bigmodel.cn", ".bigmodel.com.cn"];
+/**
+ * 套餐查询取证（0.11.5）：装机报"体验套餐获取失败"而端侧自检里没有任何读数——
+ * 真机失败时看不到请求打到哪、带了什么头、回了什么，于是只能靠猜（本项目已因此空转数轮）。
+ * 这里把每次套餐请求的**关键事实**写进 localStorage 诊断键，装机报告/自检页可直接读出：
+ * 请求路径与归一后的 URL、是否带上上下文头、HTTP 状态、业务 code/msg、异常消息。
+ */
+const PLAN_DIAG_KEY = "zcode-mobile.plan.diag";
+const PLAN_DIAG_MAX = 40;
+
+export interface PlanDiagEntry {
+  at: number;
+  url: string;
+  method: string;
+  hasAuth: boolean;
+  identityHeaders: boolean;
+  appVersionParam: string | null;
+  status?: number;
+  businessCode?: unknown;
+  businessMsg?: string;
+  error?: string;
+}
+
+function recordPlanDiag(entry: PlanDiagEntry): void {
+  try {
+    const raw = globalThis.localStorage?.getItem(PLAN_DIAG_KEY);
+    const list: PlanDiagEntry[] = raw ? (JSON.parse(raw) as PlanDiagEntry[]) : [];
+    list.push(entry);
+    while (list.length > PLAN_DIAG_MAX) list.shift();
+    globalThis.localStorage?.setItem(PLAN_DIAG_KEY, JSON.stringify(list));
+  } catch {
+    /* 取证失败不影响主流程 */
+  }
+}
+
+export function readPlanDiag(): PlanDiagEntry[] {
+  try {
+    const raw = globalThis.localStorage?.getItem(PLAN_DIAG_KEY);
+    return raw ? (JSON.parse(raw) as PlanDiagEntry[]) : [];
+  } catch {
+    return [];
+  }
+}
 
 function encode(bytes: Uint8Array): string {
   let text = "";
@@ -143,6 +187,39 @@ function mergeContextHeaders(url: URL, headers: Record<string, string>): Record<
   return merged;
 }
 
+/**
+ * 公共出口（0.11.5）：给任意官方域请求补上身份归一头 + app_version 归一。
+ * 参考实现（HarmonyOS 移植层）就是在全局 fetch 上做同一件事——官方域的每个请求都受益。
+ * 非官方域原样放行；调用方显式给的键不被覆盖。
+ *
+ * 形状：{ url, headers }——url 是**归一后的新 URL**（调用方必须用这个 url 发请求，
+ * 否则 app_version 归一不会生效：上游 URL 是字符串/URL 实例，字符串路径必须取返回值）。
+ */
+export function officialIdentityRequest(
+  input: string | URL,
+  headers: Record<string, string> = {},
+): { url: URL; headers: Record<string, string> } {
+  let parsed: URL;
+  try {
+    parsed = input instanceof URL ? new URL(input.href) : new URL(String(input), globalThis.location?.href ?? "https://zcode.z.ai");
+  } catch {
+    return { url: input instanceof URL ? input : new URL("https://zcode.z.ai"), headers };
+  }
+  if (!isContextHost(parsed)) return { url: parsed, headers };
+  if (parsed.searchParams.has("app_version")) {
+    parsed.searchParams.set("app_version", officialVersion());
+  }
+  return { url: parsed, headers: mergeContextHeaders(parsed, headers) };
+}
+
+/** 只取头（URL 归一结果由调用方自行处理时用；**注意** app_version 归一不会体现在返回值里）。 */
+export function officialIdentityHeaders(
+  input: string | URL,
+  headers: Record<string, string> = {},
+): Record<string, string> {
+  return officialIdentityRequest(input, headers).headers;
+}
+
 export function createQuotaApiClient(): MobileApiClient {
   return {
     async request(input, init = {}) {
@@ -158,25 +235,76 @@ export function createQuotaApiClient(): MobileApiClient {
       if (isContextHost(parsed) && parsed.searchParams.has("app_version")) {
         parsed.searchParams.set("app_version", officialVersion());
       }
-      const contextHeaders = mergeContextHeaders(parsed, Object.fromEntries(new Headers(rest.headers).entries()));
+      const callerHeaders = Object.fromEntries(new Headers(rest.headers).entries());
+      const contextHeaders = mergeContextHeaders(parsed, callerHeaders);
+      const diagBase = {
+        url: parsed.toString(),
+        method: String(rest.method ?? "GET"),
+        hasAuth: Object.keys(callerHeaders).some((k) => k.toLowerCase() === "authorization"),
+        identityHeaders: Object.keys(contextHeaders).some((k) => k.toLowerCase() === "x-device-mid"),
+        appVersionParam: parsed.searchParams.get("app_version"),
+      };
       const bridge = (globalThis as { zcodeGitHttp?: Bridge }).zcodeGitHttp;
       const shell = globalThis as { zcodeFs?: unknown; zcodeSqlite?: unknown; zcodeDevice?: unknown };
       if (!hasNativeJobs(bridge)) {
-        if (shell.zcodeFs || shell.zcodeSqlite || shell.zcodeDevice) throw new Error("原生套餐用量网络桥不可用");
-        return fetch(parsed, { ...rest, headers: contextHeaders, signal });
+        if (shell.zcodeFs || shell.zcodeSqlite || shell.zcodeDevice) {
+          const error = "原生套餐用量网络桥不可用";
+          recordPlanDiag({ at: Date.now(), ...diagBase, error });
+          throw new Error(error);
+        }
+        const response = await fetch(parsed, { ...rest, headers: contextHeaders, signal });
+        recordPlanDiag({
+          at: Date.now(),
+          ...diagBase,
+          status: response.status,
+          ...(await readBusinessSummary(response).catch(() => ({}))),
+        });
+        return response;
       }
       const request = new Request(parsed, { ...rest, headers: contextHeaders, signal });
       const body = request.body ? new Uint8Array(await request.arrayBuffer()) : new Uint8Array();
-      const result = await callNativeJob(bridge, {
-        url: request.url, method: request.method, headers: Object.fromEntries(request.headers.entries()),
-        bodyBase64: encode(body), ...(timeoutMs ? { timeoutMs } : {}),
-      }, request.signal) as Reply;
-      if (result.error || typeof result.statusCode !== "number") throw new Error(`套餐用量网络请求失败：${result.error ?? "原生响应缺少状态"}`);
+      let result: Reply;
+      try {
+        result = (await callNativeJob(bridge, {
+          url: request.url, method: request.method, headers: Object.fromEntries(request.headers.entries()),
+          bodyBase64: encode(body), ...(timeoutMs ? { timeoutMs } : {}),
+        }, request.signal)) as Reply;
+      } catch (error) {
+        recordPlanDiag({ at: Date.now(), ...diagBase, error: String((error as Error)?.message ?? error) });
+        throw error;
+      }
+      if (result.error || typeof result.statusCode !== "number") {
+        const error = `套餐用量网络请求失败：${result.error ?? "原生响应缺少状态"}`;
+        recordPlanDiag({ at: Date.now(), ...diagBase, error });
+        throw new Error(error);
+      }
       const binary = atob(result.bodyBase64 ?? "");
       const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
-      return new Response([204, 205, 304].includes(result.statusCode) ? null : bytes, {
+      const response = new Response([204, 205, 304].includes(result.statusCode) ? null : bytes, {
         status: result.statusCode, statusText: result.statusMessage ?? "", headers: result.headers,
       });
+      recordPlanDiag({
+        at: Date.now(),
+        ...diagBase,
+        status: result.statusCode,
+        ...(await readBusinessSummary(response).catch(() => ({}))),
+      });
+      return response;
     },
   };
+}
+
+/** 读业务信封的 code/msg（套餐端点用 {"code":N,"msg":"..."} 形状）；不是 JSON 就跳过。 */
+async function readBusinessSummary(response: Response): Promise<{ businessCode?: unknown; businessMsg?: string }> {
+  try {
+    const clone = response.clone();
+    const body = (await clone.json()) as { code?: unknown; msg?: unknown };
+    if (!body || typeof body !== "object") return {};
+    return {
+      ...(body.code !== undefined ? { businessCode: body.code } : {}),
+      ...(typeof body.msg === "string" ? { businessMsg: body.msg } : {}),
+    };
+  } catch {
+    return {};
+  }
 }

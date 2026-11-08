@@ -907,6 +907,40 @@ export async function runDeviceChecks(rt) {
     };
   });
 
+  // M14（0.11.5）：套餐/额度查询取证。装机报"体验套餐获取失败"时，这一行直接回答
+  // "请求打到哪、带了身份头没、回了什么状态/业务码"——之前端侧没有任何读数，修只能靠猜。
+  // 读法：entries 末尾一条 = 最近一次请求；hasAuth=false ⇒ 没拿到登录凭据；
+  // identityHeaders=false ⇒ 身份头没带上（服务端会回 3001 parameter error）；
+  // businessCode=3001 ⇒ 服务端参数校验失败；status=401 ⇒ 凭据被拒；error 有值 ⇒ 网络/桥层失败。
+  await check("M14：套餐查询取证（最近 5 次请求事实）", () => {
+    let entries = null;
+    try {
+      const raw = globalThis.localStorage?.getItem("zcode-mobile.plan.diag") ?? "null";
+      entries = raw ? JSON.parse(raw) : [];
+    } catch {
+      return { fail: "读数坏了（JSON 解析失败）", raw: globalThis.localStorage?.getItem("zcode-mobile.plan.diag") };
+    }
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return { skipped: true, reason: "本机还没发过套餐查询（打开模型供应商页会触发一次）" };
+    }
+    const last = entries[entries.length - 1];
+    return {
+      count: entries.length,
+      last,
+      recent: entries.slice(-5),
+      note:
+        last.error
+          ? "请求在端侧失败（桥/网络层），看 error"
+          : last.businessCode === 3001
+            ? "服务端参数校验失败（3001）——身份头/app_version 没被服务端认"
+            : last.status === 401
+              ? "服务端拒了凭据（401）——登录态过期或令牌不对"
+              : last.hasAuth === false
+                ? "请求没带 Authorization——端侧没读到登录凭据"
+                : "请求已发出且被受理，看 status/businessCode",
+    };
+  });
+
   // 没有真机也能验原生桥：装一个按 Kotlin 语义实现的假 zcodeSqlite，底下是同一个 SQLite
   // （sql.js 就是真 sqlite3 编译的），所以列亲和性、多语句、BLOB 这些窄化的行为和装到手机上
   // 一致。桌面那套 store 从这里过，就代表桥的协议对，剩下的只是 Kotlin 的 IO。
