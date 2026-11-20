@@ -445,6 +445,7 @@ async function resolveStartPlanAuthorization(
     const zcodeJwtToken = await resolveBigModelStartPlanZcodeJwt({
       credentialService: context.credentialService,
       provider,
+      trustCachedZcodeJwt: true,
     });
     return {
       value: zcodeJwtToken ? `Bearer ${zcodeJwtToken}` : "",
@@ -453,11 +454,25 @@ async function resolveStartPlanAuthorization(
   }
 
   const credentialJwt = await loadZaiProviderConnectionZcodeJwtToken(context);
+  const oauthFallback =
+    credentialJwt ||
+    (await context.credentialService?.load(`oauth:${ZAI_PROVIDER_ID}:access_token`))?.trim() ||
+    "";
   const providerJwt = normalizeApiKeyForHeader(provider.apiKey ?? "");
   return {
-    value: credentialJwt || providerJwt ? `Bearer ${credentialJwt || providerJwt}` : "",
+    value: oauthFallback || providerJwt ? `Bearer ${oauthFallback || providerJwt}` : "",
     missingReason: "coding_plan_not_authenticated",
   };
+}
+
+function hasPositiveStartPlanBalance(payload: ZaiStartPlanBalanceEnvelope): boolean {
+  return Boolean(
+    payload.data?.balances?.some((balance) => {
+      const total = Number(balance.total_units ?? 0);
+      const remaining = Number(balance.remaining_units ?? balance.available_units ?? 0);
+      return (Number.isFinite(total) && total > 0) || (Number.isFinite(remaining) && remaining > 0);
+    }),
+  );
 }
 
 function resolveStartPlanBalanceAvailability(
@@ -466,15 +481,17 @@ function resolveStartPlanBalanceAvailability(
   if (!isSuccessfulBusinessEnvelope(payload)) {
     return { kind: "unavailable", reason: "coding_plan_auth_failed" };
   }
-  if (!hasActiveStartPlan(payload.data?.plans)) {
+  if (!hasActiveStartPlan(payload.data?.plans) && !hasPositiveStartPlanBalance(payload)) {
     return { kind: "unavailable", reason: "coding_plan_not_entitled" };
   }
   const models = resolveZaiStartPlanBalanceModelIds(payload);
-  const serverTime = payload.data?.server_time;
-  const nowSeconds =
-    typeof serverTime === "number" && Number.isFinite(serverTime) && serverTime >= 0
-      ? serverTime
-      : Date.now() / 1000;
+  const toSeconds = (value: number | string | null | undefined): number | undefined => {
+    if (value === null || value === undefined || value === "") return undefined;
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric < 0) return undefined;
+    return numeric > 1e11 ? numeric / 1000 : numeric;
+  };
+  const nowSeconds = toSeconds(payload.data?.server_time) ?? Date.now() / 1000;
   const effectiveTimes = (payload.data?.plans ?? [])
     .filter((plan) => plan.status?.toLowerCase() === "active")
     .flatMap((plan) =>
@@ -482,9 +499,7 @@ function resolveStartPlanBalanceAvailability(
         ? plan.entitlements.map((entry) => entry.effective_at)
         : [plan.starts_at],
     )
-    .map((value) =>
-      value === null || value === undefined || value === "" ? undefined : Number(value),
-    );
+    .map(toSeconds);
   // 只有明确所有权益都在未来才标 pending；缺失时间不伪造日期，模型仍由余额白名单决定。
   if (
     models.length === 0 &&
@@ -528,23 +543,12 @@ function hasActiveStartPlan(plans: ZaiStartPlanPlan[] | undefined): boolean {
   return Boolean(
     plans?.some((plan) => {
       const status = plan.status?.trim().toLowerCase();
-      const planId = plan.plan_id?.trim().toLowerCase();
-      const name = plan.name?.trim().toLowerCase();
-      // billing/balance 的 plans 真实返回的是 `plan_id=zcode-v3-start-plan`
-      // 和 `name=ZCode V3 Start Plan`；只认 `name === "start plan"` 的话，
-      // 已激活的 Start Plan 会被误写成 coding_plan_not_entitled。
-      const identityMatches =
-        !planId && !name ? true : isZaiStartPlanIdentity(planId) || isZaiStartPlanIdentity(name);
-      return status === "active" && identityMatches;
+      // billing/balance 是 Start Plan / 赠送活动专用额度接口（非付费订阅）：
+      // 除 `zcode-v3-start-plan` 外，周末/节假日/信任赠额（如 `ZCODE WEEKEND BUILD`）同样在此下发，
+      // 只要状态仍为 active（过期条目已由 normalizeStartPlanExpiry 过滤），均应视作有效可用权益。
+      return status === "active";
     }),
   );
-}
-
-function isZaiStartPlanIdentity(value: string | null | undefined): boolean {
-  if (!value) {
-    return false;
-  }
-  return value.includes("start-plan") || value.includes("start plan");
 }
 
 function summarizeStartPlans(

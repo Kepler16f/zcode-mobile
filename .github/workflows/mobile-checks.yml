@@ -56,10 +56,24 @@ jobs:
           pnpm --dir zcode typecheck
           pnpm --dir zcode lint
           node zcode/node_modules/typescript/bin/tsc --noEmit -p mobile-runtime/tsconfig.json
+          node mobile-runtime/build/bridge-contract-check.mjs
+          node mobile-runtime/build/specs-verify-check.mjs
       - name: Build mobile bundles
         run: node mobile-runtime/build/build-mobile.mjs
       - name: Runtime regression checks
         run: |
+          node mobile-runtime/build/bundle-guard-smoke.mjs
+          node mobile-runtime/build/ui-assets-smoke.mjs
+          node mobile-runtime/build/audit-shiki-versions.mjs
+          node mobile-runtime/build/bridge-async-smoke.mjs
+          node mobile-runtime/build/native-grep-smoke.mjs
+          node mobile-runtime/build/readmany-order-smoke.mjs
+          node mobile-runtime/build/quota-transport-smoke.mjs
+          node mobile-runtime/build/official-identity-smoke.mjs
+          node mobile-runtime/build/server-compat-smoke.mjs
+          node mobile-runtime/build/start-plan-mobile-smoke.mjs
+          node mobile-runtime/build/start-plan-auth-fallback-smoke.mjs
+          node mobile-runtime/build/start-plan-promo-smoke.mjs
           node mobile-runtime/build/model-native-transport-smoke.mjs
           node mobile-runtime/build/download-git-security-smoke.mjs
           node mobile-runtime/build/native-async-smoke.mjs

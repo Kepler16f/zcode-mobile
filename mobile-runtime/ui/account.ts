@@ -18,8 +18,10 @@
 import type { ICredentialService, ISettingService } from "@zcode/services";
 import {
   BIGMODEL_PROVIDER_ID,
+  ZAI_CN_PROVIDER_ID,
   ZAI_PROVIDER_ID,
   isStartPlanModelProviderId,
+  resolveStartPlanFamilyFromOAuthProvider,
   type ModelProviderFamilyId,
 } from "@zcode/shared";
 
@@ -43,6 +45,7 @@ import type { ProviderRuntimeDependencies } from "@zcode/services/deep/model-pro
 import type { IAccountRequestAuthService } from "@zcode/services/deep/model-provider/accountRequestAuthService.js";
 
 import type { MobileApiClient } from "./oauth.js";
+import { decodeJwtUserId } from "./quota-transport.js";
 
 interface MobileAccountOptions {
   credentialService: ICredentialService;
@@ -58,7 +61,7 @@ function buildAccountRuntime(options: MobileAccountOptions) {
   const { credentialService, settingService, apiClient } = options;
 
   const credentialRepo = new OAuthCredentialRepo(credentialService, {
-    providerIds: [ZAI_PROVIDER_ID, BIGMODEL_PROVIDER_ID],
+    providerIds: [ZAI_PROVIDER_ID, BIGMODEL_PROVIDER_ID, ZAI_CN_PROVIDER_ID],
   });
 
   // 桌面在这里还串了一段"旧版账号连接迁移"（node.ts:1477 的 prepareLegacyAccountConnections）。
@@ -73,9 +76,62 @@ function buildAccountRuntime(options: MobileAccountOptions) {
     };
   };
 
-  const loadAccountIdentity = async (family: "zai" | "bigmodel") =>
-    (await credentialRepo.loadUserProfile(family === "zai" ? ZAI_PROVIDER_ID : BIGMODEL_PROVIDER_ID))
-      ?.id ?? null;
+  /** 同步上游 v3.18.2：当 providerFamilyDomain 为空时，按当前 OAuth 登录渠道确定唯一 Start Plan 家族。 */
+  const loadStartPlanFamily = async (): Promise<"zai" | "bigmodel" | null> => {
+    const activeProvider = (await credentialService.load("oauth:active_provider"))?.trim();
+    const fromActive = resolveStartPlanFamilyFromOAuthProvider(activeProvider);
+    if (fromActive) return fromActive;
+    const zaiProfile = await credentialRepo.loadUserProfile(ZAI_PROVIDER_ID);
+    const zaiTokens = await credentialRepo.loadTokenSet(ZAI_PROVIDER_ID);
+    if (zaiProfile?.id?.trim() || zaiTokens?.accessToken?.trim() || zaiTokens?.zcodeJwtToken?.trim()) {
+      return "zai";
+    }
+    const bmProfile = await credentialRepo.loadUserProfile(BIGMODEL_PROVIDER_ID);
+    const bmTokens = await credentialRepo.loadTokenSet(BIGMODEL_PROVIDER_ID);
+    const cnProfile = await credentialRepo.loadUserProfile(ZAI_CN_PROVIDER_ID);
+    const cnTokens = await credentialRepo.loadTokenSet(ZAI_CN_PROVIDER_ID);
+    if (
+      bmProfile?.id?.trim() ||
+      bmTokens?.accessToken?.trim() ||
+      bmTokens?.zcodeJwtToken?.trim() ||
+      cnProfile?.id?.trim() ||
+      cnTokens?.accessToken?.trim() ||
+      cnTokens?.zcodeJwtToken?.trim()
+    ) {
+      return "bigmodel";
+    }
+    const storedJwt = (await credentialService.load("zcodejwttoken"))?.trim();
+    if (storedJwt) {
+      const settings = await settingService.get();
+      return settings.providerFamilyDomain === "zai" ? "zai" : "bigmodel";
+    }
+    return null;
+  };
+
+  const loadAccountIdentity = async (family: "zai" | "bigmodel") => {
+    const providerIds =
+      family === "zai" ? [ZAI_PROVIDER_ID] : [BIGMODEL_PROVIDER_ID, ZAI_CN_PROVIDER_ID];
+    for (const providerId of providerIds) {
+      const profileId = (await credentialRepo.loadUserProfile(providerId))?.id?.trim();
+      if (profileId) return profileId;
+      const tokenSet = await credentialRepo.loadTokenSet(providerId);
+      if (tokenSet?.zcodeJwtToken?.trim() || tokenSet?.accessToken?.trim()) {
+        return (
+          decodeJwtUserId(tokenSet.zcodeJwtToken) ??
+          decodeJwtUserId(tokenSet.accessToken) ??
+          `oauth:${family}`
+        );
+      }
+    }
+    const preferredFamily = (await loadStartPlanFamily()) ?? "bigmodel";
+    if (family === preferredFamily) {
+      const storedJwt = (await credentialService.load("zcodejwttoken"))?.trim();
+      if (storedJwt) {
+        return decodeJwtUserId(storedJwt) ?? "zcode-jwt";
+      }
+    }
+    return null;
+  };
 
   const remoteApiClient = new AccountProviderApiClient(apiClient as never);
   const apiKeyResolver = new AccountProviderApiKeyResolver(
@@ -115,7 +171,14 @@ function buildAccountRuntime(options: MobileAccountOptions) {
     });
   };
 
-  return { credentialRepo, readSettings, loadAccountIdentity, credentialServiceForPlan, codingPlanApiKey };
+  return {
+    credentialRepo,
+    readSettings,
+    loadAccountIdentity,
+    loadStartPlanFamily,
+    credentialServiceForPlan,
+    codingPlanApiKey,
+  };
 }
 
 export function createMobileAccountSource(options: {
@@ -153,18 +216,32 @@ export function createMobileAccountSource(options: {
     readSettings: runtime.readSettings as never,
     loadCodingPlanApiKey: runtime.codingPlanApiKey as never,
     loadAccountIdentity: runtime.loadAccountIdentity as never,
+    loadStartPlanFamily: runtime.loadStartPlanFamily,
     resolveFamilyAvailability: createCodingPlanFamilyAvailabilityResolver({
       apiClient: apiClient as never,
       credentialService,
     }) as never,
   });
 
+  async function resolveStartPlanJwtToken(family: "zai" | "bigmodel"): Promise<string | null> {
+    const orderedProviders =
+      family === "zai"
+        ? [ZAI_PROVIDER_ID, BIGMODEL_PROVIDER_ID, ZAI_CN_PROVIDER_ID]
+        : [BIGMODEL_PROVIDER_ID, ZAI_CN_PROVIDER_ID, ZAI_PROVIDER_ID];
+    for (const providerId of orderedProviders) {
+      const jwt = (await runtime.credentialRepo.loadTokenSet(providerId))?.zcodeJwtToken?.trim();
+      if (jwt) return jwt;
+    }
+    const storedJwt = (await credentialService.load("zcodejwttoken"))?.trim();
+    return storedJwt || null;
+  }
+
   return {
     accountSource,
     resolveCodingPlanApiKey: async ({ providerId, family, forceRefresh }) => {
-      // Start Plan消费账号ZCode JWT，不签发Coding Plan API key。
+      // Start Plan消费账号ZCode JWT，不签发Coding Plan API key；支持从同账号共享 zcodejwttoken 兜底读取。
       if (isStartPlanModelProviderId(providerId)) {
-        return (await runtime.credentialRepo.loadTokenSet(family === "zai" ? ZAI_PROVIDER_ID : BIGMODEL_PROVIDER_ID))?.zcodeJwtToken ?? null;
+        return resolveStartPlanJwtToken(family);
       }
       const accountIdentity = await runtime.loadAccountIdentity(family);
       // 没有身份 = 这个 family 根本没登录，返回 null 让上层给出"请先登录"，
@@ -190,8 +267,15 @@ export function createMobileAccountRequestAuthService(options: MobileAccountOpti
           access,
           readSettings: runtime.readSettings as never,
           loadAccountIdentity: runtime.loadAccountIdentity as never,
+          loadStartPlanFamily: runtime.loadStartPlanFamily,
         }),
-      loadOAuthTokenSet: (providerId) => runtime.credentialRepo.loadTokenSet(providerId),
+      loadOAuthTokenSet: async (providerId) => {
+        const set = await runtime.credentialRepo.loadTokenSet(providerId);
+        if (set?.zcodeJwtToken?.trim()) return set;
+        const fallbackJwt = (await options.credentialService.load("zcodejwttoken"))?.trim();
+        if (!set && !fallbackJwt) return null;
+        return { ...(set ?? {}), ...(fallbackJwt ? { zcodeJwtToken: fallbackJwt } : {}) };
+      },
       async loadIndividualPlanApiKey(providerId, family) {
         const accountIdentity = await runtime.loadAccountIdentity(family);
         if (!accountIdentity) return null;

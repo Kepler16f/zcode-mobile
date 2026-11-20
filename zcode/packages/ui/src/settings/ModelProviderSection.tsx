@@ -18,6 +18,8 @@ import {
   resolveModelProviderFamilyIdByProviderId,
   resolveModelProviderFamilySpecByProviderId,
   resolveProviderFamilyDomainFromOAuthProvider,
+  resolveStartPlanFamilyFromOAuthProvider,
+  ZAI_CN_PROVIDER_ID,
   ZAI_PROVIDER_ID,
 } from "@zcode/shared";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
@@ -450,6 +452,9 @@ export function ModelProviderSection({
   const effectiveProviderFamilyDomain =
     sharedSettings?.providerFamilyDomain ??
     resolveProviderFamilyDomainFromOAuthProvider(activeOAuthProvider);
+  const startPlanFamilyDomain =
+    sharedSettings?.providerFamilyDomain ??
+    resolveStartPlanFamilyFromOAuthProvider(activeOAuthProvider);
   const { entitlements: codingPlanEntitlements, refresh: refreshCodingPlanEntitlements } =
     useCodingPlanEntitlements({
       providerSettingsView,
@@ -484,18 +489,23 @@ export function ModelProviderSection({
         shouldApply?: () => boolean;
       } = {},
     ) => {
-      const [activeProvider, zaiToken, bigmodelToken] = await Promise.all([
+      const [activeProvider, zaiToken, bigmodelToken, zcodeJwtToken] = await Promise.all([
         credentialService.load("oauth:active_provider"),
         credentialService.load(`oauth:${ZAI_PROVIDER_ID}:access_token`),
         credentialService.load(`oauth:${BIGMODEL_PROVIDER_ID}:access_token`),
+        credentialService.load("zcodejwttoken"),
       ]);
       if (options.shouldApply && !options.shouldApply()) {
         return null;
       }
       const normalizedActiveProvider =
-        activeProvider === ZAI_PROVIDER_ID || activeProvider === BIGMODEL_PROVIDER_ID
+        activeProvider === ZAI_PROVIDER_ID ||
+        activeProvider === BIGMODEL_PROVIDER_ID ||
+        activeProvider === ZAI_CN_PROVIDER_ID
           ? activeProvider
           : null;
+      const hasStartPlanJwt = (zcodeJwtToken?.trim().length ?? 0) > 0;
+      const startPlanFamily = resolveStartPlanFamilyFromOAuthProvider(normalizedActiveProvider);
       setActiveOAuthProvider(normalizedActiveProvider);
       setCodingPlanPurchaseTokenAuthenticatedByProviderId({
         [BUILTIN_MODEL_PROVIDER_IDS.zaiIndividualCodingPlan]:
@@ -503,7 +513,7 @@ export function ModelProviderSection({
         [BUILTIN_MODEL_PROVIDER_IDS.zaiTeamCodingPlan]:
           normalizedActiveProvider === ZAI_PROVIDER_ID && (zaiToken?.trim().length ?? 0) > 0,
         [BUILTIN_MODEL_PROVIDER_IDS.zaiStartPlan]:
-          normalizedActiveProvider === ZAI_PROVIDER_ID && (zaiToken?.trim().length ?? 0) > 0,
+          startPlanFamily === "zai" && ((zaiToken?.trim().length ?? 0) > 0 || hasStartPlanJwt),
         [BUILTIN_MODEL_PROVIDER_IDS.bigmodelIndividualCodingPlan]:
           normalizedActiveProvider === BIGMODEL_PROVIDER_ID &&
           (bigmodelToken?.trim().length ?? 0) > 0,
@@ -511,8 +521,8 @@ export function ModelProviderSection({
           normalizedActiveProvider === BIGMODEL_PROVIDER_ID &&
           (bigmodelToken?.trim().length ?? 0) > 0,
         [BUILTIN_MODEL_PROVIDER_IDS.bigmodelStartPlan]:
-          normalizedActiveProvider === BIGMODEL_PROVIDER_ID &&
-          (bigmodelToken?.trim().length ?? 0) > 0,
+          startPlanFamily === "bigmodel" &&
+          ((bigmodelToken?.trim().length ?? 0) > 0 || hasStartPlanJwt),
       });
       if (!normalizedActiveProvider && options.clearUserWhenLoggedOut) {
         // provider Unlink 已等价于 App logout。
@@ -689,6 +699,7 @@ export function ModelProviderSection({
       codingPlanEntitlements,
       subscribedTeamProducts,
       providerFamilyDomain: effectiveProviderFamilyDomain,
+      startPlanFamilyDomain,
       connectionSelections: effectiveConnectionSelections,
       pendingConnectionSelections,
       showPurchasedTeamPlanFallback,

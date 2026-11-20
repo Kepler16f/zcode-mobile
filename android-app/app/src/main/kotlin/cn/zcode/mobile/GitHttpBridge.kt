@@ -34,6 +34,9 @@ class GitHttpBridge {
     fun poll(id: String): String = jobs.poll(id)
 
     @JavascriptInterface
+    fun ack(id: String): Boolean = jobs.ack(id)
+
+    @JavascriptInterface
     fun cancel(id: String): Boolean = jobs.cancel(id)
 
     fun cancelAll() = jobs.cancelAll()

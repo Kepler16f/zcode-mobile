@@ -128,3 +128,13 @@ APK 重压任务也改成**永不失败**：缺 keystore、缺 build-tools、CI 
 的判据全部落空——看着像功能没实现，其实是环境路径不对。两处都改成按平台取 bash
 （win32 用 Git Bash，其余用 /bin/bash），并在真的找不到 shell 时**如实跳过**而不是报失败。
 修完后 CI 首次转绿（run 41017083092，commit 59a10d6）。
+
+## 验证方式
+
+- `node mobile-runtime/build/mobile-090-e2e.mjs`
+- `node mobile-runtime/build/pending-badge-smoke.mjs`
+- `node mobile-runtime/build/pending-badge-e2e.mjs`
+- `node mobile-runtime/build/idle-watchdog-smoke.mjs`
+- `node mobile-runtime/build/saf-writethrough-smoke.mjs`
+- `node mobile-runtime/build/quota-transport-smoke.mjs`
+- `node mobile-runtime/build/start-plan-promo-smoke.mjs`

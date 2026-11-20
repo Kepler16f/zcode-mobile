@@ -17,3 +17,11 @@
 验收覆盖：两个同时打开的工作区、重启恢复、重复命令、两个会话的单次与长期授权、主存储路径别名、`..`、根外绝对路径、目录及文件符号链接、搜索批量读取、删除链接、下载授权与撤销、目录选择权限与不可访问的 SAF 退路。
 
 SAF 镜像无法保证读取完整或防止外部并发写入，Bash 和 Git 暂时拒绝运行于 SAF 工作区；文件工具仍直接操作授权目录。
+
+## 验证方式
+
+- `node mobile-runtime/build/workspace-isolation-smoke.mjs`
+- `node mobile-runtime/build/workspace-realpath-smoke.mjs`
+- `node mobile-runtime/build/stage-grant-smoke.mjs`
+- `node mobile-runtime/build/native-grep-smoke.mjs`
+- `node mobile-runtime/build/readmany-order-smoke.mjs`

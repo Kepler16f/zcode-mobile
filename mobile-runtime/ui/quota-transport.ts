@@ -11,12 +11,13 @@
 // 本地持久化的随机 UUID（首次生成后固定，服务端按它识别设备）。
 import { callNativeJob, hasNativeJobs } from "../ports/native-async.mjs";
 import type { MobileApiClient } from "./oauth.js";
-import { rewritePlatformForServer } from "./server-compat.js";
+import { officialCompatibilityVersion, rewritePlatformForServer } from "./server-compat.js";
 
 type Bridge = { start(request: string): string; poll(id: string): string; cancel(id: string): boolean };
 type Reply = { statusCode?: number; statusMessage?: string; headers?: Record<string, string>; bodyBase64?: string; error?: string };
 
 const DEVICE_MID_KEY = "zcode-mobile.deviceMid";
+const SESSION_ID_KEY = "zcode-mobile.sessionId";
 /** 官方域：zcode.z.ai（套餐/配置面）、api.z.ai（Z.ai 业务面：客户信息/订阅清单/换 Key）、
  *  bigmodel.cn / bigmodel.com.cn（BigModel 业务面）。.z.ai 后缀覆盖 api.z.ai 与 zcode.z.ai。 */
 const CONTEXT_HOSTS = [".z.ai", ".bigmodel.cn", ".bigmodel.com.cn"];
@@ -86,7 +87,7 @@ function randomUUID(): string {
 }
 
 /** 本机设备 Mid：首次生成后固定（localStorage），供 X-Device-Mid 计费头使用。 */
-function deviceMid(): string {
+export function getOrCreateDeviceMid(): string {
   try {
     const existing = globalThis.localStorage?.getItem(DEVICE_MID_KEY);
     if (existing) return existing;
@@ -96,6 +97,40 @@ function deviceMid(): string {
   } catch {
     return randomUUID();
   }
+}
+
+/** 当前会话 UUID：跨官方请求复用同一 session_id 保持会话粘性。 */
+export function getOrCreateSessionId(): string {
+  try {
+    const existing = globalThis.localStorage?.getItem(SESSION_ID_KEY);
+    if (existing) return existing;
+    const sid = randomUUID();
+    globalThis.localStorage?.setItem(SESSION_ID_KEY, sid);
+    return sid;
+  } catch {
+    return randomUUID();
+  }
+}
+
+/** 从 ZCode JWT载荷里提取 user_id / sub（无签名校验，仅用于遥测与页面回传上下文）。 */
+export function decodeJwtUserId(jwt: string | null | undefined): string | null {
+  const token = jwt?.trim().replace(/^Bearer\s+/i, "").trim();
+  if (!token) return null;
+  const parts = token.split(".");
+  if (parts.length < 2 || !parts[1]) return null;
+  try {
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const json = JSON.parse(atob(padded)) as { user_id?: unknown; userId?: unknown; sub?: unknown };
+    const candidate = json.user_id ?? json.userId ?? json.sub;
+    return typeof candidate === "string" && candidate.trim() ? candidate.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isZCodeContextHost(url: URL): boolean {
+  return isContextHost(url);
 }
 
 function appVersion(): string {
@@ -118,19 +153,10 @@ function appVersion(): string {
  * 内核串、x-zcode-app-version/user-agent→**官方发行版本号**。用户可经
  * desktopCompatibilityVersion（localStorage）覆盖，缺省跟当前官方发行版。
  */
-const OFFICIAL_COMPAT_VERSION = "3.17.2";
 const OFFICIAL_LINUX_KERNEL = "6.8.0-45-generic";
 
 function officialVersion(): string {
-  try {
-    const override = globalThis.localStorage
-      ?.getItem("zcode-mobile.desktopCompatibilityVersion")
-      ?.trim();
-    if (override && /^\d+\.\d+\.\d+/.test(override)) return override;
-  } catch {
-    /* localStorage 不可用走缺省 */
-  }
-  return OFFICIAL_COMPAT_VERSION;
+  return officialCompatibilityVersion();
 }
 
 function locale(): string {
@@ -166,15 +192,18 @@ export function zcodeContextHeaders(url: URL): Record<string, string> {
   return {
     "User-Agent": `ZCode/${version}`,
     "HTTP-Referer": `${url.protocol}//${url.host}`,
-    "X-Title": "Z Code@android",
+    "X-Title": "Z Code@electron",
     "X-ZCode-App-Version": version,
     "X-Platform": "linux-arm64",
-    "X-Release-Channel": "stable",
+    "X-Release-Channel": "production",
+    // 官方运行时（CLI/Desktop）模型与活动请求带的两条身份头；zcode-plan 网关按它们识别 ZCode 客户端。
+    "X-ZCode-Agent": "glm",
+    "X-ZCode-Session-Type": "main",
     "X-Client-Language": locale(),
     "X-Client-Timezone": timezone(),
     "X-Os-Category": "linux",
     "X-Os-Version": OFFICIAL_LINUX_KERNEL,
-    "X-Device-Mid": deviceMid(),
+    "X-Device-Mid": getOrCreateDeviceMid(),
     "x-request-id": randomUUID(),
   };
 }
@@ -183,11 +212,16 @@ function mergeContextHeaders(url: URL, headers: Record<string, string>): Record<
   const context = zcodeContextHeaders(url);
   const merged: Record<string, string> = { ...context };
   for (const [key, value] of Object.entries(headers)) {
-    // 调用方显式给的键优先（Authorization 等业务头绝不被上下文头覆盖）。
+    // 调用方显式给的键优先（Authorization 等业务头绝不被上下文头覆盖）；
+    // 但官方域的 X-Platform 若被上游 process 垫片填成 android-*，仍需归一成 linux-*，避免服务端 3001。
     const lower = key.toLowerCase();
+    let normalizedValue = value;
+    if (lower === "x-platform" && (value === "android" || value.startsWith("android-"))) {
+      normalizedValue = /x64|x86_64/i.test(value) ? "linux-x64" : "linux-arm64";
+    }
     const contextKey = Object.keys(context).find((k) => k.toLowerCase() === lower);
     if (contextKey) delete merged[contextKey];
-    merged[key] = value;
+    merged[key] = normalizedValue;
   }
   return merged;
 }

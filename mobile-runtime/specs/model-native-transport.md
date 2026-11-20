@@ -5,3 +5,9 @@
 原生任务是连接和有界字节队列的唯一所有者，JS 通过 start/poll/cancel 获取响应头、增量字节和终态，再转换为 Response 交给现有解析器。必须在连接关闭前交付增量，按字节传递以支持 UTF-8 跨块。停止、超时、解析失败和页面销毁均释放原生连接。桥不可用或协议损坏时明确失败，不返回成功空流。HTTP 错误保留状态码和响应体；不记录凭据，不自动跨源转发请求。
 
 验收：模拟浏览器 fetch 被 CORS 拒绝时原生 MiniMax Anthropic 请求成功；真实分块传递、不完整 UTF-8、401/429 响应、用户取消、连接前取消、网络错误与队列上限。APK 构建前仍须另行询问用户版本号。
+
+## 验证方式
+
+- `node mobile-runtime/build/model-native-transport-smoke.mjs`
+- `node mobile-runtime/build/bridge-async-smoke.mjs`
+- `node mobile-runtime/build/bridge-contract-check.mjs`

@@ -40,8 +40,59 @@ class UpdateBridge(private val context: Context) {
         Thread(runnable, "zcode-update-dl").apply { isDaemon = true }
     }
 
+    private class CheckJob(
+        val cancelled: AtomicBoolean = AtomicBoolean(false),
+        @Volatile var result: String? = null,
+        @Volatile var completedAt: Long = 0L,
+    )
+
+    private val checkJobs = ConcurrentHashMap<String, CheckJob>()
+
     /**
-     * 查 GitHub 最新 Release。
+     * 异步发起版本检查：立即返回 job id，不阻塞 WebView JS 主线程（修复点击检查更新时弹窗卡半透明）。
+     */
+    @JavascriptInterface
+    fun startCheckForUpdate(): String {
+        val now = System.currentTimeMillis()
+        checkJobs.entries.removeAll { (_, job) -> job.completedAt != 0L && now - job.completedAt > CHECK_RETENTION_MS }
+        val id = UUID.randomUUID().toString()
+        val job = CheckJob()
+        checkJobs[id] = job
+        Thread({
+            val res = runCatching { fetchLatestRelease() }
+                .getOrElse { errorJson("${it.javaClass.simpleName}: ${it.message}") }
+            if (!job.cancelled.get()) {
+                job.result = res
+                job.completedAt = System.currentTimeMillis()
+            } else {
+                checkJobs.remove(id, job)
+            }
+        }, "zcode-update-check-async").apply {
+            isDaemon = true
+            start()
+        }
+        return JSONObject().put("ok", true).put("id", id).toString()
+    }
+
+    @JavascriptInterface
+    fun pollCheckForUpdate(id: String): String {
+        val job = checkJobs[id]
+            ?: return JSONObject().put("done", true).put("result", JSONObject(errorJson("检查任务不存在或已结束"))).toString()
+        val res = job.result ?: return JSONObject().put("done", false).toString()
+        checkJobs.remove(id, job)
+        val parsed = runCatching { JSONObject(res) }.getOrElse { JSONObject(errorJson("返回解析失败")) }
+        return JSONObject().put("done", true).put("result", parsed).toString()
+    }
+
+    @JavascriptInterface
+    fun cancelCheckForUpdate(id: String): String {
+        val job = checkJobs.remove(id)
+        job?.cancelled?.set(true)
+        return JSONObject().put("ok", job != null).toString()
+    }
+
+    /**
+     * 查 GitHub 最新 Release（同步兼容入口，保留供脚本/旧调用方使用）。
      *
      * 返回形状（与 UI 侧约定逐字一致）：
      *   无更新：{"ok":true,"hasUpdate":false,"current":"0.11.1","currentCode":11001}
@@ -328,6 +379,9 @@ class UpdateBridge(private val context: Context) {
 
         /** 检查更新的超时（连接与读取各 15s）。 */
         const val CHECK_TIMEOUT_MS = 15_000
+
+        /** 异步检查任务结果保留时间（避免未轮询任务常驻内存）。 */
+        const val CHECK_RETENTION_MS = 5 * 60 * 1000L
 
         /** release body 摘要的最大字符数。 */
         const val NOTES_MAX_CHARS = 300

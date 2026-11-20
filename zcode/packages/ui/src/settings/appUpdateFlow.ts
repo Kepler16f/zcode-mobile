@@ -40,6 +40,8 @@ export type UpdatePhase =
   | "unavailable";
 
 const DOWNLOAD_POLL_INTERVAL_MS = 800;
+const CHECK_POLL_INTERVAL_MS = 120;
+const LEGACY_SYNC_CHECK_DELAY_MS = 180;
 /** 等系统通知授权框的节奏与上限（原生 requestPermission 在 13+ 是异步的）。 */
 const PERMISSION_POLL_INTERVAL_MS = 800;
 const PERMISSION_POLL_MAX_TRIES = 15;
@@ -85,9 +87,27 @@ export function useAppUpdateFlow(): AppUpdateFlow {
   const [retryInstallOnResume, setRetryInstallOnResume] = useState(false);
   /** 检查令牌：关掉浮窗后迟到的回包不能再把浮窗重新拉起来。 */
   const checkTokenRef = useRef(0);
+  const checkTimerRef = useRef<number | null>(null);
+  const checkJobIdRef = useRef<string | null>(null);
+
+  const cancelPendingCheck = useCallback(() => {
+    if (checkTimerRef.current !== null) {
+      window.clearTimeout(checkTimerRef.current);
+      window.clearInterval(checkTimerRef.current);
+      checkTimerRef.current = null;
+    }
+    const activeId = checkJobIdRef.current;
+    checkJobIdRef.current = null;
+    if (activeId && bridge?.cancelCheckForUpdate) {
+      callBridgeJson(() => bridge.cancelCheckForUpdate?.(activeId));
+    }
+  }, [bridge]);
+
+  useEffect(() => cancelPendingCheck, [cancelPendingCheck]);
 
   const runCheck = useCallback(() => {
     if (!bridge) return;
+    cancelPendingCheck();
     setOpen(true);
     setPhase("checking");
     setInfo(null);
@@ -100,24 +120,73 @@ export function useAppUpdateFlow(): AppUpdateFlow {
     setNeedsInstallPermission(false);
     setAwaitingNotifyPermission(false);
     const token = ++checkTokenRef.current;
-    // 推到下一拍再问原生：让"正在检查更新…"这一帧真的画出来（桥是同步的，
-    // 直接问的话这一态根本来不及渲染）。
-    window.setTimeout(() => {
+
+    const applyCheckResult = (res: UpdateCheckResult | null) => {
       if (token !== checkTokenRef.current) return;
-      const res = callBridgeJson<UpdateCheckResult>(() => bridge.checkForUpdate?.());
       if (!res || res.ok === false) {
         setPhase("unavailable");
         return;
       }
       setInfo(res);
       setPhase(res.hasUpdate === true ? "available" : "up-to-date");
-    }, 0);
-  }, [bridge]);
+    };
 
-  const handleOpenChange = useCallback((next: boolean) => {
-    if (!next) checkTokenRef.current += 1;
-    setOpen(next);
-  }, []);
+    // 优先走异步检查通道：不阻塞 WebView 主线程，弹窗淡入动画立即丝滑完成。
+    if (typeof bridge.startCheckForUpdate === "function" && typeof bridge.pollCheckForUpdate === "function") {
+      const started = callBridgeJson<{ ok?: boolean; id?: string }>(() =>
+        bridge.startCheckForUpdate?.(),
+      );
+      const id = started?.ok === true && typeof started.id === "string" ? started.id : null;
+      if (!id) {
+        applyCheckResult(null);
+        return;
+      }
+      checkJobIdRef.current = id;
+      checkTimerRef.current = window.setInterval(() => {
+        if (token !== checkTokenRef.current) {
+          cancelPendingCheck();
+          return;
+        }
+        const poll = callBridgeJson<{ done?: boolean; result?: UpdateCheckResult }>(() =>
+          bridge.pollCheckForUpdate?.(id),
+        );
+        if (!poll) {
+          cancelPendingCheck();
+          applyCheckResult(null);
+          return;
+        }
+        if (poll.done) {
+          checkJobIdRef.current = null;
+          if (checkTimerRef.current !== null) {
+            window.clearInterval(checkTimerRef.current);
+            checkTimerRef.current = null;
+          }
+          applyCheckResult(poll.result ?? null);
+        }
+      }, CHECK_POLL_INTERVAL_MS);
+      return;
+    }
+
+    // 兼容只有同步 checkForUpdate 的旧桥/测试宿主：等弹窗入场动画（duration-100）播完再调同步桥，
+    // 避免把弹窗冻在半透明中间帧。
+    checkTimerRef.current = window.setTimeout(() => {
+      checkTimerRef.current = null;
+      if (token !== checkTokenRef.current) return;
+      const res = callBridgeJson<UpdateCheckResult>(() => bridge.checkForUpdate?.());
+      applyCheckResult(res);
+    }, LEGACY_SYNC_CHECK_DELAY_MS);
+  }, [bridge, cancelPendingCheck]);
+
+  const handleOpenChange = useCallback(
+    (next: boolean) => {
+      if (!next) {
+        checkTokenRef.current += 1;
+        cancelPendingCheck();
+      }
+      setOpen(next);
+    },
+    [cancelPendingCheck],
+  );
 
   // 前台下载进度：每 800ms 问一次原生，拿到 done 就转成"可安装"。
   useEffect(() => {

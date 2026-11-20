@@ -14,7 +14,25 @@ import {copyFile,mkdir} from "node:fs/promises";
 // 配 4.x 的 langs」的真混搭，而且构建期毫无征兆。所以每个 @shikijs/* 都从
 // 声明它的那一方解析（shiki 声明的走 shiki 的基准，transformers 走 diffs 的
 // 基准），再由 assertShikiConsistency 在构建期核对实际版本。
-export function mobileShikiDependency(zcodeRoot) {
+// A-03 移动端精简语言白名单：保留常见编程语言 / 标记 / Shell / 配置文件，其余冷门语法安全空降级。
+export const MOBILE_SHIKI_LANG_WHITELIST = new Set([
+  "bash", "sh", "shell", "shellscript", "shellsession", "console", "zsh",
+  "powershell", "ps", "ps1", "bat", "batch", "cmd",
+  "javascript", "js", "cjs", "mjs", "jsx",
+  "typescript", "ts", "cts", "mts", "tsx",
+  "json", "jsonc", "json5", "yaml", "yml", "toml", "xml", "xsl", "html", "html-derivative",
+  "css", "scss", "less", "postcss", "haml", "markdown", "md", "mdx", "markdown-vue",
+  "python", "py", "kotlin", "kt", "kts", "java", "swift",
+  "c", "cpp", "cpp-macro", "csharp", "cs", "go", "rust", "rs",
+  "ruby", "rb", "php", "sql", "graphql", "gql",
+  "docker", "dockerfile", "makefile", "cmake", "diff",
+  "ini", "properties", "dotenv", "regex", "regexp", "glsl",
+  "vue", "vue-directives", "vue-interpolations", "vue-sfc-style-variable-injection",
+  "svelte", "astro", "proto", "protobuf", "groovy", "lua", "dart", "r", "scala",
+  "nginx", "mermaid", "mmd", "wasm", "log", "latex", "tex", "plaintext", "text", "txt",
+]);
+
+export function mobileShikiDependency(zcodeRoot, { languageWhitelist = MOBILE_SHIKI_LANG_WHITELIST } = {}) {
   const resolver=createRequire(path.join(zcodeRoot,"package.json"));
   const packageFile=resolver.resolve("shiki/package.json");
   const canonical=createRequire(packageFile);
@@ -63,19 +81,31 @@ export function mobileShikiDependency(zcodeRoot) {
   }
   const languageRoot=path.dirname(canonical.resolve("@shikijs/langs"));
 
-  return {version,languageRoot,plugin:{name:"mobile-single-shiki-dependency",setup(build){
+  function resolvePinned(specifier){
+    if(specifier==="shiki"||specifier.startsWith("shiki/"))return canonical.resolve(specifier);
+    const segments=specifier.split("/");
+    const name=specifier.startsWith("@")?segments.slice(0,2).join("/"):segments[0];
+    const pin=pins.get(name);
+    if(!pin)throw new Error(`移动端Shiki依赖统一：${name} 没有已知版本要求，拒绝解析`);
+    // 以被钉住的那份包自身为基准解析子路径：
+    // @shikijs/langs/typescript 必须落在 3.23.0 的 langs 里，不能落到根上的 4.1.0。
+    return createRequire(path.join(pin.dir,"package.json")).resolve(specifier);
+  }
+
+  return {version,languageRoot,languageWhitelist,resolvePinned,plugin:{name:"mobile-single-shiki-dependency",setup(build){
     build.onResolve({filter:/^(?:shiki(?:\/|$)|@shikijs\/)/},args=>{
-      if(args.path==="shiki"||args.path.startsWith("shiki/"))return {path:canonical.resolve(args.path)};
-      // 作用域包名要取到第二个斜杠：@shikijs/langs/typescript 的包名是 @shikijs/langs。
-      const segments=args.path.split("/");
-      const name=args.path.startsWith("@")?segments.slice(0,2).join("/"):segments[0];
-      const pin=pins.get(name);
-      if(!pin)throw new Error(`移动端Shiki依赖统一：${name} 没有已知版本要求，拒绝解析`);
-      // 以被钉住的那份包自身为基准解析子路径：
-      // @shikijs/langs/typescript 必须落在 3.23.0 的 langs 里，不能落到根上的 4.1.0。
-      const scoped=createRequire(path.join(pin.dir,"package.json"));
-      return {path:scoped.resolve(args.path)};
+      if(languageWhitelist&&args.path.startsWith("@shikijs/langs/")){
+        const langId=args.path.slice("@shikijs/langs/".length).replace(/\.mjs$/,"");
+        if(langId!=="index"&&!languageWhitelist.has(langId)){
+          return {path:args.path,namespace:"mobile-shiki-lang-stub"};
+        }
+      }
+      return {path:resolvePinned(args.path)};
     });
+    build.onLoad({filter:/.*/,namespace:"mobile-shiki-lang-stub"},()=>({
+      contents:"export default [];",
+      loader:"js",
+    }));
   }}};
 }
 

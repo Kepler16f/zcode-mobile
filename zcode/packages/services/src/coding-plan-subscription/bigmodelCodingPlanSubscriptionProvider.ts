@@ -48,6 +48,11 @@ import type {
   EnterpriseCodingPlanProjectApiKeyUnavailableReason,
   EnterpriseCodingPlanProjectContext,
   StartPlanPreviewConfig,
+  RequestVerificationConfig,
+  ManualClaimPlanPreview,
+  ManualClaimPlanPreviewSnapshot,
+  ManualClaimPlanClaimRequest,
+  ManualClaimPlanClaimResult,
   ZCodeModelContextBudgetStrategy,
   DynamicWorkflowClientConfig,
 } from "@zcode/shared";
@@ -102,6 +107,12 @@ interface ZCodeClientConfigEnvelope {
   data?: {
     configs?: {
       forceUpdate?: ForceUpdateConfig | null;
+      captcha?:
+        | (Partial<RequestVerificationConfig> & {
+            scene_id?: string;
+            skip_model_request?: boolean;
+          })
+        | null;
       codingPlanStaticProducts?: CodingPlanStaticProductsConfig;
       codingPlanStaticTeamProducts?: CodingPlanStaticTeamProductsConfig;
       startPlanPreview?: StartPlanPreviewConfig | null;
@@ -158,6 +169,17 @@ export class BigModelCodingPlanSubscriptionProvider {
   private clientConfigSnapshot: ZCodeClientConfigEnvelope | null = null;
   private clientConfigSnapshotExpiresAt = 0;
   private clientConfigRequest: Promise<ZCodeClientConfigEnvelope> | null = null;
+  private manualClaimPreviewCache: {
+    token: string;
+    snapshot: ManualClaimPlanPreviewSnapshot;
+    expiresAt: number;
+  } | null = null;
+  private manualClaimPreviewRequest: {
+    token: string;
+    promise: Promise<ManualClaimPlanPreviewSnapshot>;
+  } | null = null;
+  private manualClaimPreviewRateLimitUntil = 0;
+  private marketingTouchSeq = 0;
 
   constructor(options: BigModelCodingPlanSubscriptionProviderOptions) {
     this.apiClient = options.apiClient;
@@ -212,6 +234,372 @@ export class BigModelCodingPlanSubscriptionProvider {
   async getStartPlanPreview(): Promise<StartPlanPreviewConfig | null> {
     const payload = await this.getClientConfigs();
     return unwrapClientConfigStartPlanPreview(payload);
+  }
+
+  async getRequestVerificationConfig(): Promise<RequestVerificationConfig | null> {
+    const payload = await this.getClientConfigs();
+    const raw = payload.data?.configs?.captcha;
+    const rawPrefix = typeof raw?.prefix === "string" ? raw.prefix : "";
+    const rawSceneId =
+      typeof raw?.sceneId === "string"
+        ? raw.sceneId
+        : typeof raw?.scene_id === "string"
+          ? raw.scene_id
+          : "";
+    if (!raw || !rawPrefix || !rawSceneId) {
+      return null;
+    }
+    const prefix = rawPrefix.trim();
+    const sceneId = rawSceneId.trim();
+    if (!prefix || !sceneId) return null;
+    const skipModelRequest =
+      typeof raw.skipModelRequest === "boolean"
+        ? raw.skipModelRequest
+        : typeof raw.skip_model_request === "boolean"
+          ? raw.skip_model_request
+          : undefined;
+    return {
+      enabled: raw.enabled === true,
+      prefix,
+      region: typeof raw.region === "string" && raw.region.trim() ? raw.region.trim() : "cn",
+      sceneId,
+      ...(skipModelRequest === undefined ? {} : { skipModelRequest }),
+    };
+  }
+
+  async getManualClaimPlanPreviews(): Promise<ManualClaimPlanPreviewSnapshot> {
+    const token = await this.loadStartPlanJwtToken();
+    const now = Date.now();
+    if (this.manualClaimPreviewRequest && this.manualClaimPreviewRequest.token === token) {
+      return this.manualClaimPreviewRequest.promise;
+    }
+    if (
+      this.manualClaimPreviewCache &&
+      this.manualClaimPreviewCache.token === token &&
+      this.manualClaimPreviewCache.expiresAt > now
+    ) {
+      return this.manualClaimPreviewCache.snapshot;
+    }
+    if (this.manualClaimPreviewRateLimitUntil > now) {
+      if (this.manualClaimPreviewCache && this.manualClaimPreviewCache.token === token) {
+        return this.manualClaimPreviewCache.snapshot;
+      }
+      throw new Error("manual_claim_preview_rate_limited");
+    }
+
+    const promise = this.fetchManualClaimPlanPreviewsUncached(token)
+      .then((snapshot) => {
+        this.manualClaimPreviewCache = {
+          token,
+          snapshot,
+          expiresAt: Date.now() + 15_000,
+        };
+        return snapshot;
+      })
+      .finally(() => {
+        if (this.manualClaimPreviewRequest?.promise === promise) {
+          this.manualClaimPreviewRequest = null;
+        }
+      });
+    this.manualClaimPreviewRequest = { token, promise };
+    return promise;
+  }
+
+  private async fetchManualClaimPlanPreviewsUncached(
+    token: string,
+  ): Promise<ManualClaimPlanPreviewSnapshot> {
+    const platform = resolveClientPlatformKey();
+    const previewUrl = new URL(
+      buildRuntimeZCodeApiUrl(process.env, "/api/v1/zcode-plan/billing/preview"),
+    );
+    previewUrl.searchParams.set("app_version", ZCODE_VERSION);
+    previewUrl.searchParams.set("platform", platform);
+
+    const authHeaders = token ? { Authorization: `Bearer ${token}` } : undefined;
+    let previewError: unknown = null;
+    let previewRateLimited = false;
+    let serverTime: number | undefined;
+    const byPlanId = new Map<string, ManualClaimPlanPreview>();
+
+    try {
+      const payload = await readCodingPlanApiJson<RemoteEnvelope<ManualClaimPlanPreviewPayload>>(
+        this.apiClient,
+        previewUrl,
+        { method: "GET", headers: authHeaders, timeoutMs: REQUEST_TIMEOUT_MS },
+      );
+      if (payload.code !== undefined && payload.code !== 0) {
+        throw new Error(payload.msg?.trim() || "manual_claim_preview_failed");
+      }
+      // 服务端在无可领取预览计划时可能返回 { code: 0, data: null }；
+      // 正常视作空列表并继续合并 marketing/touch，不再把空数据误报为 manual_claim_preview_missing_data。
+      if (payload.data) {
+        serverTime = readServerTimeMilliseconds(payload.data.server_time);
+        for (const plan of payload.data.plans ?? []) {
+          const mapped = mapManualClaimPreviewPlan(plan);
+          if (!mapped) continue;
+          byPlanId.set(mapped.planId.toLowerCase(), mapped);
+        }
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const status =
+        typeof error === "object" && error !== null && "status" in error
+          ? Number((error as { status?: unknown }).status)
+          : NaN;
+      if (status === 429 || /\b429\b|too many requests|rate limit/i.test(msg)) {
+        previewRateLimited = true;
+        this.manualClaimPreviewRateLimitUntil = Date.now() + 30_000;
+      }
+      previewError = error;
+    }
+
+    // 与官方 v3.18.2 营销投放通道（marketing/touch）合并：节日/周末/信任赠额通过 touch 下发 claim_zcode_plan。
+    if (token) {
+      await this.mergeMarketingTouchClaimOffers(token, byPlanId).catch((error) => {
+        log.warn(undefined, "marketing/touch 拉取可领取活动失败", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+
+    if (previewError && byPlanId.size === 0) {
+      if (this.manualClaimPreviewCache && this.manualClaimPreviewCache.token === token) {
+        return this.manualClaimPreviewCache.snapshot;
+      }
+      if (previewRateLimited) {
+        throw new Error("manual_claim_preview_rate_limited");
+      }
+      throw previewError;
+    }
+
+    const plans = [...byPlanId.values()].sort((a, b) => b.priority - a.priority);
+    return { ...(serverTime === undefined ? {} : { serverTime }), plans };
+  }
+
+  async claimManualPlan(request: ManualClaimPlanClaimRequest): Promise<ManualClaimPlanClaimResult> {
+    const token = await this.loadStartPlanJwtToken();
+    if (!token) {
+      return { success: false, code: 401, message: "" };
+    }
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "X-ZCode-App-Version": ZCODE_VERSION,
+      "X-Platform": resolveClientPlatformKey(),
+    };
+    const verifyParam = request.captchaVerifyParam?.trim();
+    if (verifyParam) {
+      headers["X-Aliyun-Captcha-Verify-Param"] = verifyParam;
+      const verifyRegion = request.captchaVerifyRegion?.trim() || "cn";
+      headers["X-Aliyun-Captcha-Region"] = verifyRegion;
+      headers["X-Aliyun-Captcha-Verify-Region"] = verifyRegion;
+    }
+    const response = await this.apiClient.request(
+      new URL(buildRuntimeZCodeApiUrl(process.env, "/api/v1/zcode-plan/billing/claim")),
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ plan_id: request.planId }),
+        timeoutMs: REQUEST_TIMEOUT_MS,
+      },
+    );
+    const rawBody = await response.text().catch(() => "");
+    let payload: (Omit<RemoteEnvelope<ManualClaimPlanClaimPayload>, "code"> & {
+      code?: number | string;
+    }) | null = null;
+    if (rawBody.trim()) {
+      try {
+        payload = JSON.parse(rawBody) as Omit<
+          RemoteEnvelope<ManualClaimPlanClaimPayload>,
+          "code"
+        > & { code?: number | string };
+      } catch {
+        payload = null;
+      }
+    }
+    const captchaHeader = response.headers.get("captcha")?.trim().toLowerCase() ?? "";
+    const payloadMsg =
+      typeof payload?.data?.message === "string" && payload.data.message.trim()
+        ? payload.data.message.trim()
+        : payload?.msg?.trim() ?? "";
+    if (!payload) {
+      if (
+        response.status === 403 &&
+        (captchaHeader.includes("aliyun") || captchaHeader === "1" || captchaHeader === "true")
+      ) {
+        return { success: false, code: 3007, message: "captcha verification required" };
+      }
+      if (response.status === 401) {
+        return { success: false, code: 401, message: "" };
+      }
+      if (!response.ok) {
+        return {
+          success: false,
+          code: response.status,
+          message: isUnrenderableRemoteErrorMessage(rawBody)
+            ? CODING_PLAN_SYSTEM_BUSY
+            : rawBody.trim() || `HTTP ${response.status}`,
+        };
+      }
+      return { success: false, code: -1, message: "" };
+    }
+    const rawCode = payload.code;
+    let code =
+      typeof rawCode === "number"
+        ? rawCode
+        : typeof rawCode === "string" && /^\d+$/.test(rawCode)
+          ? Number(rawCode)
+          : response.ok
+            ? 0
+            : response.status;
+    if (
+      code !== 0 &&
+      code !== 3007 &&
+      ((response.status === 403 && captchaHeader.length > 0) || /captcha/i.test(payloadMsg))
+    ) {
+      code = 3007;
+    }
+    const serverTime = readServerTimeMilliseconds(payload.data?.server_time);
+    if ((code === 0 || code === 1003) && request.campaignId?.trim()) {
+      void this.confirmMarketingTouchCampaign(token, request.campaignId.trim());
+    }
+    if (!response.ok || code !== 0 || !payload.data?.plan) {
+      const failureEndsAt = payload.data?.plan?.ends_at;
+      return {
+        success: false,
+        code: code === 0 && !response.ok ? response.status : code,
+        message: payloadMsg,
+        ...(serverTime === undefined ? {} : { serverTime }),
+        ...(typeof failureEndsAt === "number" && Number.isFinite(failureEndsAt)
+          ? { failureEndsAt }
+          : {}),
+      };
+    }
+    const plan = payload.data.plan;
+    return {
+      success: true,
+      code,
+      message: payload.msg?.trim() ?? "",
+      ...(serverTime === undefined ? {} : { serverTime }),
+      plan: {
+        userPlanId: plan.user_plan_id?.trim() ?? "",
+        planId: plan.plan_id?.trim() || request.planId,
+        status: plan.status?.trim() ?? "",
+        ...(typeof plan.starts_at === "number" && Number.isFinite(plan.starts_at)
+          ? { startsAt: plan.starts_at }
+          : {}),
+        ...(typeof plan.ends_at === "number" && Number.isFinite(plan.ends_at)
+          ? { endsAt: plan.ends_at }
+          : {}),
+        entitlements: (plan.entitlements ?? []).flatMap((entitlement) => {
+          const entitlementId = entitlement.entitlement_id?.trim() ?? "";
+          if (!entitlementId) return [];
+          return [
+            {
+              entitlementId,
+              showName: entitlement.show_name?.trim() ?? "",
+              ...(typeof entitlement.effective_at === "number" &&
+              Number.isFinite(entitlement.effective_at)
+                ? { effectiveAt: entitlement.effective_at }
+                : {}),
+            },
+          ];
+        }),
+      },
+    };
+  }
+
+  private async loadStartPlanJwtToken(): Promise<string> {
+    const zcodeJwt = (await this.credentialService.load(ZCODE_JWT_TOKEN_KEY))?.trim();
+    if (zcodeJwt) return zcodeJwt;
+    return (await this.credentialService.load(`oauth:${ZAI_PROVIDER_ID}:access_token`))?.trim() ?? "";
+  }
+
+  private async mergeMarketingTouchClaimOffers(
+    token: string,
+    byPlanId: Map<string, ManualClaimPlanPreview>,
+  ): Promise<void> {
+    const touchUrl = new URL(buildRuntimeZCodeApiUrl(process.env, "/api/v1/marketing/touch"));
+    touchUrl.searchParams.set("seq", String(this.marketingTouchSeq++));
+    const clientLanguage = (() => {
+      try {
+        return Intl.DateTimeFormat().resolvedOptions().locale || "zh-CN";
+      } catch {
+        return "zh-CN";
+      }
+    })();
+    const response = await readCodingPlanApiJson<MarketingTouchEnvelope>(
+      this.apiClient,
+      touchUrl,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "X-Client-Language": clientLanguage,
+          "X-ZCode-App-Version": ZCODE_VERSION,
+        },
+        timeoutMs: REQUEST_TIMEOUT_MS,
+      },
+    );
+    if (response.code !== undefined && response.code !== 0) return;
+    for (const delivery of response.data?.deliveries ?? []) {
+      const campaignId = delivery.campaign_id?.trim();
+      const buttons = [
+        ...(delivery.banner?.buttons ?? []),
+        ...(delivery.popup?.buttons ?? []),
+      ];
+      for (const button of buttons) {
+        if (button.action?.type !== "claim_zcode_plan") continue;
+        const planId = button.action.args?.plan_id?.trim();
+        if (!planId) continue;
+        const key = planId.toLowerCase();
+        const existing = byPlanId.get(key);
+        if (existing) {
+          if (!existing.campaignId && campaignId) {
+            byPlanId.set(key, { ...existing, campaignId });
+          }
+          continue;
+        }
+        const label =
+          typeof button.text === "string"
+            ? button.text.trim()
+            : typeof button.text?.content === "string"
+              ? button.text.content.trim()
+              : "";
+        byPlanId.set(key, {
+          planId,
+          name: label || planId,
+          description: "",
+          priority: delivery.priority ?? 0,
+          ...(campaignId ? { campaignId } : {}),
+          entitlements: [],
+        });
+      }
+    }
+  }
+
+  private async confirmMarketingTouchCampaign(token: string, campaignId: string): Promise<void> {
+    try {
+      await readCodingPlanApiJson<RemoteEnvelope<unknown>>(
+        this.apiClient,
+        new URL(buildRuntimeZCodeApiUrl(process.env, "/api/v1/marketing/touch/action")),
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "X-ZCode-App-Version": ZCODE_VERSION,
+          },
+          body: JSON.stringify({ campaign_id: campaignId, action_type: "confirm" }),
+          timeoutMs: REQUEST_TIMEOUT_MS,
+        },
+      );
+    } catch (error) {
+      log.warn(undefined, "marketing/touch confirm 上报失败", {
+        campaignId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -1250,6 +1638,113 @@ function isValidStartPlanPreviewEntitlement(
 
 function resolveClientPlatformKey(): string {
   return `${process.platform}-${process.arch}`;
+}
+
+interface ManualClaimPlanPreviewPlanWire {
+  plan_id?: string | null;
+  name?: string | null;
+  description?: string | null;
+  priority?: number | null;
+  entitlements?: Array<{
+    entitlement_id?: string | null;
+    show_name?: string | null;
+    meter?: string | null;
+    unit_type?: string | null;
+    capabilities?: string[] | null;
+    grant_units?: number | null;
+    period?: string | null;
+    priority?: number | null;
+    effective_at?: number | null;
+  }> | null;
+}
+
+interface ManualClaimPlanPreviewPayload {
+  server_time?: number | null;
+  plans?: ManualClaimPlanPreviewPlanWire[] | null;
+}
+
+interface ManualClaimPlanClaimPayload {
+  server_time?: number | null;
+  message?: string | null;
+  plan?: {
+    user_plan_id?: string | null;
+    plan_id?: string | null;
+    status?: string | null;
+    starts_at?: number | null;
+    ends_at?: number | null;
+    entitlements?: Array<{
+      entitlement_id?: string | null;
+      show_name?: string | null;
+      effective_at?: number | null;
+    }> | null;
+  } | null;
+}
+
+interface MarketingTouchEnvelope {
+  code?: number;
+  data?: {
+    deliveries?: Array<{
+      campaign_id?: string | null;
+      priority?: number | null;
+      banner?: {
+        buttons?: Array<{
+          text?: string | { content?: string | null } | null;
+          action?: { type?: string; args?: { plan_id?: string | null } | null } | null;
+        }> | null;
+      } | null;
+      popup?: {
+        buttons?: Array<{
+          text?: string | { content?: string | null } | null;
+          action?: { type?: string; args?: { plan_id?: string | null } | null } | null;
+        }> | null;
+      } | null;
+    }> | null;
+  } | null;
+}
+
+function readServerTimeMilliseconds(serverTime: unknown): number | undefined {
+  if (typeof serverTime !== "number" || !Number.isFinite(serverTime) || serverTime < 0) {
+    return undefined;
+  }
+  return serverTime > 1e12 ? serverTime : serverTime * 1000;
+}
+
+function mapManualClaimPreviewPlan(
+  plan: ManualClaimPlanPreviewPlanWire,
+): ManualClaimPlanPreview | null {
+  const planId = plan.plan_id?.trim() ?? "";
+  if (!planId) return null;
+  return {
+    planId,
+    name: plan.name?.trim() || planId,
+    description: plan.description?.trim() ?? "",
+    priority: typeof plan.priority === "number" && Number.isFinite(plan.priority) ? plan.priority : 0,
+    entitlements: (plan.entitlements ?? []).flatMap((entitlement) => {
+      const entitlementId = entitlement.entitlement_id?.trim() ?? "";
+      if (!entitlementId) return [];
+      return [
+        {
+          entitlementId,
+          showName: entitlement.show_name?.trim() ?? "",
+          meter: entitlement.meter?.trim() ?? "",
+          unitType: entitlement.unit_type?.trim() ?? "",
+          capabilities: entitlement.capabilities ?? [],
+          grantUnits:
+            typeof entitlement.grant_units === "number" && Number.isFinite(entitlement.grant_units)
+              ? entitlement.grant_units
+              : 0,
+          period: entitlement.period?.trim() ?? "",
+          priority:
+            typeof entitlement.priority === "number" && Number.isFinite(entitlement.priority)
+              ? entitlement.priority
+              : 0,
+          ...(typeof entitlement.effective_at === "number" && Number.isFinite(entitlement.effective_at)
+            ? { effectiveAt: entitlement.effective_at }
+            : {}),
+        },
+      ];
+    }),
+  };
 }
 
 function normalizeRemoteErrorMessage(

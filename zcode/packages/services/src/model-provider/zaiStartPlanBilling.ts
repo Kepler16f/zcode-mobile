@@ -93,9 +93,11 @@ export async function fetchZaiStartPlanBalanceEnvelope(
   const url = buildZaiStartPlanBalanceUrl();
   const startedAt = Date.now();
   let responseTime: number | undefined;
+  let rateLimited = false;
   const observedApi: ApiClient = {
     request: async (input, init) => {
       const response = await apiClient.request(input, init);
+      if (response.status === 429) rateLimited = true;
       const date = Date.parse(response.headers.get("date") ?? "");
       if (Number.isFinite(date)) responseTime = date / 1000;
       return response;
@@ -110,14 +112,15 @@ export async function fetchZaiStartPlanBalanceEnvelope(
   })
     .then((payload) => normalizeStartPlanExpiry(payload, responseTime))
     .finally(() => {
-      // 账号校验先完成，用量查询随后到达：保留同一响应至发起后 1 秒。
-      // 失败同样保留，避免 429 之后立刻重复请求；旧请求不得删除失效后创建的新记录。
+      // 账号校验先完成，用量查询随后到达：保留同一响应至发起后 1 秒；
+      // 遇 429 延长退避窗口至 5 秒，避免立刻重复打爆限流。
       const evict = () => {
         if (requests?.get(requestKey) !== request) return;
         requests.delete(requestKey);
         if (requests.size === 0) inflightBalanceRequests.delete(apiClient);
       };
-      const remainingMs = 1000 - (Date.now() - startedAt);
+      const holdMs = rateLimited ? 5_000 : 1_000;
+      const remainingMs = holdMs - (Date.now() - startedAt);
       if (remainingMs > 0) setTimeout(evict, remainingMs);
       else evict();
     });
@@ -154,23 +157,25 @@ export function resolveZaiStartPlanBalanceModelIds(payload: ZaiStartPlanBalanceE
   return modelIds;
 }
 
+function toUnixSeconds(value: number | string | null | undefined): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return numeric > 1e11 ? numeric / 1000 : numeric;
+}
+
 /** HTTP Date 与本次响应配对，避免旧 JSON 时间让过期 active 记录继续提供权益。 */
 function normalizeStartPlanExpiry(
   payload: ZaiStartPlanBalanceEnvelope,
   responseTime?: number,
 ): ZaiStartPlanBalanceEnvelope {
   if (!payload.data) return payload;
-  const serverTime = payload.data.server_time;
-  const now =
-    responseTime ??
-    (typeof serverTime === "number" && Number.isFinite(serverTime) && serverTime >= 0
-      ? serverTime
-      : Date.now() / 1000);
+  const serverTime = toUnixSeconds(payload.data.server_time);
+  const now = responseTime ?? serverTime ?? Date.now() / 1000;
   const plans = (payload.data.plans ?? []).map((plan) => {
-    const end = Number(plan.ends_at);
+    const end = toUnixSeconds(plan.ends_at);
     return plan.status?.trim().toLowerCase() === "active" &&
-      Number.isFinite(end) &&
-      end > 0 &&
+      end !== null &&
       end <= now
       ? { ...plan, status: "expired" }
       : plan;
@@ -179,7 +184,7 @@ function normalizeStartPlanExpiry(
     const owners = plans.filter((plan) =>
       balance.user_plan_id && plan.user_plan_id
         ? plan.user_plan_id === balance.user_plan_id
-        : plan.plan_id === balance.plan_id,
+        : plan.plan_id?.trim().toLowerCase() === balance.plan_id?.trim().toLowerCase(),
     );
     // 无归属桶继续由既有诊断处理，不能误删同商品另一个有效实例的余额。
     return !owners.length || owners.some((plan) => plan.status?.trim().toLowerCase() !== "expired");

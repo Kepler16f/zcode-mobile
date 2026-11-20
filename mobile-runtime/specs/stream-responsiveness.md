@@ -7,3 +7,10 @@
 - Browser 的加载与读取必须通过原生 start/poll/cancel 后台任务；不能因 handler 声明为 async 就直接调用同步 JavaInterface。取消信号传入任务并中断等待线程。
 - 子代理文本合帧更新；流式检查点每5秒保存，收轮与切后台仍立即保存。完整会话同步存储依然可能在极长历史下产生停顿。
 - 版本信息按原生桥实例缓存，避免 DOM 变化反复读取设备信息；诊断 phase 写入节流，后台暂停心跳避免误报。
+
+## 验证方式
+
+- `node mobile-runtime/build/model-native-transport-smoke.mjs`
+- `node mobile-runtime/build/bridge-async-smoke.mjs`
+- `node mobile-runtime/build/version-cache-smoke.mjs`
+- `node mobile-runtime/build/jank-witness-smoke.mjs`

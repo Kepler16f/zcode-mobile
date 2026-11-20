@@ -118,6 +118,72 @@ export interface ForceUpdateConfig {
   minimalVersion: string;
 }
 
+export interface RequestVerificationConfig {
+  enabled: boolean;
+  prefix: string;
+  region: string;
+  sceneId: string;
+  skipModelRequest?: boolean;
+}
+
+export interface RequestVerificationProof {
+  captchaVerifyParam?: string;
+  captchaVerifyRegion?: string;
+}
+
+export interface ManualClaimPlanEntitlement {
+  entitlementId: string;
+  showName: string;
+  meter: string;
+  unitType: string;
+  capabilities: string[];
+  grantUnits: number;
+  period: string;
+  priority: number;
+  effectiveAt?: number;
+}
+
+export interface ManualClaimPlanPreview {
+  planId: string;
+  name: string;
+  description: string;
+  priority: number;
+  campaignId?: string;
+  entitlements: ManualClaimPlanEntitlement[];
+}
+
+export interface ManualClaimPlanPreviewSnapshot {
+  serverTime?: number;
+  plans: ManualClaimPlanPreview[];
+}
+
+export interface ManualClaimPlanClaimRequest extends RequestVerificationProof {
+  planId: string;
+  campaignId?: string;
+}
+
+export interface ManualClaimPlanClaimedEntitlement {
+  entitlementId: string;
+  showName: string;
+  effectiveAt?: number;
+}
+
+export interface ManualClaimPlanClaimResult {
+  success: boolean;
+  code: number;
+  message: string;
+  serverTime?: number;
+  failureEndsAt?: number;
+  plan?: {
+    userPlanId: string;
+    planId: string;
+    status: string;
+    startsAt?: number;
+    endsAt?: number;
+    entitlements: ManualClaimPlanClaimedEntitlement[];
+  };
+}
+
 /**
  * 闲时任务客户端配置：client/configs 只下发入口曝光开关；模型展示来自 Built-in
  * offpeak Provider。准入/低峰判断仍以服务端为准（3006 兜底）。

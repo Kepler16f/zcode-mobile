@@ -11,6 +11,9 @@ export const BIGMODEL_PROVIDER_ID = "bigmodel" as const;
 /** 内置 ZAI provider id */
 export const ZAI_PROVIDER_ID = "zai" as const;
 
+/** 内置中国区 ZCode OAuth provider id（与上游 v3.18.2 对齐） */
+export const ZAI_CN_PROVIDER_ID = "zai_cn" as const;
+
 /** 凭据解密失败错误前缀 */
 export const CREDENTIAL_DECRYPT_ERROR_PREFIX = "凭据解密失败：" as const;
 
@@ -56,6 +59,7 @@ function readCredentialErrorMessage(error: unknown): string {
 export type OAuthProviderId =
   | typeof BIGMODEL_PROVIDER_ID
   | typeof ZAI_PROVIDER_ID
+  | typeof ZAI_CN_PROVIDER_ID
   | (string & { readonly __oauthProviderBrand?: never });
 
 /** Provider 展示元信息 */

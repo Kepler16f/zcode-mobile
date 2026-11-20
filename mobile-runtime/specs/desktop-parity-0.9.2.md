@@ -93,3 +93,12 @@ workspace、交互终端 PTY）按用户要求本阶段不做，也不假装已�
 - 界面回归（真实产物 + 真实 mock 网关）：mobile-090-e2e 通过（脚本错误 0，最长主线程任务 249 ms）；
   fork-ui-e2e 通过（分叉按钮出现、点击后切到子会话并渲染派生来源标记）。
 - 仓库与移动类型检查通过；Lint 70 warnings / 0 errors；架构检查 0 violations。
+
+## 验证方式
+
+- `node mobile-runtime/build/fork-assistant-smoke.mjs`
+- `node mobile-runtime/build/subagent-background-smoke.mjs`
+- `node mobile-runtime/build/file-watcher-smoke.mjs`
+- `node mobile-runtime/build/git-panel-smoke.mjs`
+- `node mobile-runtime/build/mobile-090-e2e.mjs`
+- `node mobile-runtime/build/fork-ui-e2e.mjs`

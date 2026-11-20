@@ -25,3 +25,10 @@
 - 触摸：遗留锁恢复、按钮实际可点、真实审批保留、关闭菜单释放锁。
 
 未连接Android真机，尚不能确认用户设备的静置冻结已全部消除。以上触摸锁是可复现并有恢复验证的故障类型，不能据此认定所有卡死均为同一原因。旧版本供应商未回传、应用也未保存的历史token无法准确反推。
+
+## 验证方式
+
+- `node mobile-runtime/build/usage-stats-smoke.mjs`
+- `node mobile-runtime/build/session-store-smoke.mjs`
+- `node mobile-runtime/build/chat-smoke.mjs`
+- `node mobile-runtime/build/startup-settings-smoke.mjs`

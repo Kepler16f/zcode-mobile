@@ -13,7 +13,11 @@ export async function resolveBigModelStartPlanZcodeJwt(params: {
   trustCachedZcodeJwt?: boolean;
 }): Promise<string> {
   const activeProvider = (await params.credentialService?.load(ACTIVE_PROVIDER_KEY))?.trim() || "";
-  if (params.trustCachedZcodeJwt === true || activeProvider === BIGMODEL_PROVIDER_ID) {
+  if (
+    params.trustCachedZcodeJwt === true ||
+    !activeProvider ||
+    activeProvider === BIGMODEL_PROVIDER_ID
+  ) {
     const credentialJwt = (await params.credentialService?.load(ZCODE_JWT_TOKEN_KEY))?.trim() || "";
     if (credentialJwt) {
       return credentialJwt;

@@ -5,3 +5,9 @@
 - 下载保留原始二进制字节。跟随系统主题时原生读取失败应使用稳定的默认值，后续失败沿用上次结果。
 - 将远端历史附着到当前目录时，保留工作树文件；使用远端默认分支的提交建立本地分支并设置 HEAD，不得覆盖已有仓库的远端配置。
 - 验收覆盖路径越界、授权重试、符号链接、二进制内容、主题桥首次异常、非空目录附着远端默认分支及已有仓库保护。
+
+## 验证方式
+
+- `node mobile-runtime/build/download-git-security-smoke.mjs`
+- `node mobile-runtime/build/git-http-smoke.mjs`
+- `node mobile-runtime/build/dark-mode-evidence.mjs`

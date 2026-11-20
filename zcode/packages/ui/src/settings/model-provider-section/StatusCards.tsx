@@ -44,6 +44,7 @@ import { CodingPlanStatusActions, CodingPlanUpgradeAction } from "./CodingPlanSt
 import type { CodingPlanLoginOptions } from "./codingPlanPricingCards.js";
 import type { PurchaseAudience } from "./codingPlanEnterpriseTiers.js";
 import { StartPlanCard } from "./StartPlanCard.js";
+import { StartPlanManualClaimCard } from "./StartPlanManualClaimCard.js";
 import { StartPlanQuotaStatusCard } from "./StartPlanQuotaStatusCard.js";
 import { resolveStartPlanQuotaCardEntries } from "./StartPlanBalanceCard.js";
 import { useStartPlanPreview } from "./useStartPlanPreview.js";
@@ -639,6 +640,20 @@ export function CodingPlanStatusPanel({
   return (
     <div className="space-y-3">
       {planCards}
+
+      {isStartPlanProvider ? (
+        <StartPlanManualClaimCard
+          providerId={providerId}
+          isDisconnected={isDisconnected}
+          subscriptionDetails={subscriptionDetails}
+          quotaLimits={quotaLimits}
+          onClaimCompleted={onQuotaResetEntitlementRefresh}
+          onOpenOfficialPage={
+            purchaseUrl && onOpenPurchase ? () => onOpenPurchase(purchaseUrl) : undefined
+          }
+          onLogin={onLogin ? () => void onLogin() : undefined}
+        />
+      ) : null}
 
       {startPlanCardVisible && !startPlanPreview.loading && startPlanPreview.preview ? (
         <StartPlanCard preview={startPlanPreview.preview} />

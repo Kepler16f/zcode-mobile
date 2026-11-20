@@ -285,6 +285,16 @@ class MainActivity : Activity() {
             // 通知面（0.11.1）：权限、常驻通知、出错提醒。与 JS 侧
             // mobile-runtime/ui/app-notify.ts 的四个方法逐字对齐。
             addJavascriptInterface(notificationBridge, "zcodeNotify")
+            val targetWebView = this
+            val emitter: (String) -> Unit = { script ->
+                runOnUiThread {
+                    if (!isFinishing && !isDestroyed) {
+                        runCatching { targetWebView.evaluateJavascript(script, null) }
+                    }
+                }
+            }
+            jobEmitter = emitter
+            AsyncBridgeJobs.attachEmitter(emitter)
             loadUrl(UI_PAGE)
         }
 
@@ -374,17 +384,25 @@ class MainActivity : Activity() {
     @SuppressLint("NewApi")
     private fun installGestureExclusionBand() {
         val update = {
-            val w = webView.width
-            val h = webView.height
-            if (w > 0 && h > 0) {
-                val band = (resources.displayMetrics.density * 24).toInt().coerceAtMost(w / 3)
-                webView.setSystemGestureExclusionRects(
-                    mutableListOf(
-                        android.graphics.Rect(0, 0, band, h),
-                    ),
-                )
+            if (::webView.isInitialized) {
+                if (uiChrome.inSettings) {
+                    // 设置页内不排除左缘手势：左右边缘全面屏手势均交给系统返回，先退回主页。
+                    webView.setSystemGestureExclusionRects(emptyList())
+                } else {
+                    val w = webView.width
+                    val h = webView.height
+                    if (w > 0 && h > 0) {
+                        val band = (resources.displayMetrics.density * 24).toInt().coerceAtMost(w / 3)
+                        webView.setSystemGestureExclusionRects(
+                            mutableListOf(
+                                android.graphics.Rect(0, 0, band, h),
+                            ),
+                        )
+                    }
+                }
             }
         }
+        uiChrome.onNavStateChanged = update
         webView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
             // 旋转/分屏会改 WebView 尺寸；exclusion rects 是视图坐标，必须跟着重画。
             if (v === webView) update()
@@ -427,10 +445,16 @@ class MainActivity : Activity() {
         deliverOAuthLink(intent)
     }
 
+    private var jobEmitter: ((String) -> Unit)? = null
+
     override fun onDestroy() {
         // 这里**不**取消正在跑的命令与模型请求：Activity 重建（系统回收、渲染进程自愈）
         // 不等于进程结束，取消会让"切后台/锁屏后工作流被掐断"。任务是进程级的（NativeBridges），
         // 进程真退出时线程自然结束。
+        jobEmitter?.let {
+            AsyncBridgeJobs.detachEmitter(it)
+            jobEmitter = null
+        }
         super.onDestroy()
     }
 
@@ -487,10 +511,15 @@ class MainActivity : Activity() {
             uri.path in setOf("/assets/ui/ui.html", "/assets/mobile/selfcheck.html")
 
     override fun onBackPressed() {
-        // 0.4.9 三级返回（用户点名"从边缘滑动触发返回键也是收起"）：
-        // ①竖屏抽屉展开 → 收起抽屉（移动端抽屉标准语义，也是"卡住没法回去"的第三条退路）；
-        // ②WebView 有页面历史 → goBack（SPA 内部导航）；
-        // ③默认（退出应用）。
+        // 四级返回：
+        // ① 设置页打开 → 交给 __zcodeHandleBack（先关设置内弹窗，再点设置返回按钮回到主页）；
+        // ② 竖屏抽屉展开 → 收起抽屉；
+        // ③ WebView 有页面历史 → goBack；
+        // ④ 主页 → moveTaskToBack(true) 退至后台而非销毁 Activity，再次打开无需重载应用和重播启动动画。
+        if (uiChrome.inSettings && ::webView.isInitialized) {
+            webView.evaluateJavascript("window.__zcodeHandleBack&&window.__zcodeHandleBack()", null)
+            return
+        }
         if (uiChrome.drawerOpen && ::webView.isInitialized) {
             webView.evaluateJavascript(
                 "(document.querySelector('[data-testid=\"mobile-side-pane-scrim\"]') || document.querySelector('[data-testid=\"web-sidebar-toggle\"]'))?.click()",
@@ -498,8 +527,14 @@ class MainActivity : Activity() {
             )
             return
         }
-        // WebView.goBack() 返回 Unit，条件要用 canGoBack()。
-        if (webView.canGoBack()) webView.goBack() else @Suppress("DEPRECATION") super.onBackPressed()
+        if (::webView.isInitialized && webView.canGoBack()) {
+            webView.goBack()
+            return
+        }
+        if (!moveTaskToBack(true)) {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
     }
 
     private companion object {

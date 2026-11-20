@@ -18,6 +18,9 @@
 /** 端侧原生桥：应用内更新（window.zcodeUpdate）。 */
 export type AppUpdateBridge = {
   checkForUpdate?(): string;
+  startCheckForUpdate?(): string;
+  pollCheckForUpdate?(id: string): string;
+  cancelCheckForUpdate?(id: string): string;
   startDownload?(url: string, background: boolean): string;
   getDownloadProgress?(jobId: string): string;
   cancelDownload?(jobId: string): string;

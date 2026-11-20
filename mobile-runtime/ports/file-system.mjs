@@ -9,6 +9,34 @@
 // /sdcard/Download 的会话里，文件却写进了私有盘 /work，用户看到的就是"会话没在指定文件夹里干活"。
 // 现在相对段一律落在本工作区根；非 /work 工作区里指向 /work 的绝对路径当场 permission_denied。
 import { localWorkspacePath } from "../compat/workspace-aliases.mjs";
+import { createNativeExecBridge, isNativeExecAvailable } from "./execution-bridge-android.mjs";
+
+const POSIX_ERE_SAFE_ESCAPES = new Set(".\\^$*+?()[]{}/|-".split(""));
+
+function isPosixEreSafe(pattern) {
+  if (typeof pattern !== "string" || pattern.length === 0) return false;
+  if (pattern.includes("(?")) return false;
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] !== "\\") continue;
+    const next = pattern[i + 1];
+    if (!next || !POSIX_ERE_SAFE_ESCAPES.has(next)) return false;
+    i++;
+  }
+  return true;
+}
+
+function parseRelativeSearchPaths(stdout, rootPath) {
+  const prefix = rootPath === "/" ? "" : rootPath.replace(/\/+$/, "");
+  const out = [];
+  for (const raw of String(stdout ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line === "." || line === "..") continue;
+    const rel = line.startsWith("./") ? line.slice(2) : line.replace(/^\/+/, "");
+    if (!rel || rel === "." || rel === "..") continue;
+    out.push(`${prefix}/${rel}`);
+  }
+  return out;
+}
 function normalizePath(p, fallbackRoot = "/work") {
   p = localWorkspacePath(p);
   fallbackRoot = localWorkspacePath(fallbackRoot);
@@ -333,11 +361,86 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
     return { durationMs: ms(t), entries, numEntries: entries.length, path };
   }
 
+  const resolveSearchRunner = (dirPath) => {
+    if (dirPath.startsWith("/mnt/")) return null;
+    if (opts.exec) return opts.exec;
+    if (vfsImpl.engine?.() === "native" && isNativeExecAvailable()) {
+      return createNativeExecBridge();
+    }
+    return null;
+  };
+
+  async function runNativeFind(dirPath) {
+    const runner = resolveSearchRunner(dirPath);
+    if (!runner) return null;
+    try {
+      const res = await runner.exec({
+        file: "find",
+        args: [".", "(", "-type", "f", "-o", "-type", "l", ")"],
+        cwd: dirPath,
+        timeoutMs: 30_000,
+      });
+      if (!res || res.exitCode !== 0 || res.timedOut || res.cancelled) return null;
+      return parseRelativeSearchPaths(res.stdout, dirPath);
+    } catch {
+      return null;
+    }
+  }
+
+  async function runNativeGrepCandidates(dirPath, request) {
+    if (request.multiline || !isPosixEreSafe(request.pattern)) return null;
+    const runner = resolveSearchRunner(dirPath);
+    if (!runner) return null;
+    const args = ["-rlE"];
+    if (request.ignoreCase) args.push("-i");
+    args.push("--", request.pattern, ".");
+    try {
+      const res = await runner.exec({
+        file: "grep",
+        args,
+        cwd: dirPath,
+        timeoutMs: 30_000,
+      });
+      if (!res || res.timedOut || res.cancelled) return null;
+      if (res.exitCode === 1 && !res.stderr) return [];
+      if (res.exitCode !== 0) return null;
+      return parseRelativeSearchPaths(res.stdout, dirPath);
+    } catch {
+      return null;
+    }
+  }
+
+  function filterVerifiedCandidates(candidates, basePath, filterRe) {
+    const verified = [];
+    for (const candidate of candidates) {
+      if (filterRe && !filterRe.test(candidate.slice(basePath.length + 1))) continue;
+      try {
+        checkAccess(candidate);
+        verified.push(candidate);
+      } catch (e) {
+        if (!["permission_denied", "ENOENT"].includes(e?.code)) throw e;
+      }
+    }
+    verified.sort();
+    return verified;
+  }
+
   async function searchFiles(request) {
     const t = t0();
     const path = checkAccess(request.path);
     const re = globToRegExp(String(request.pattern ?? "").replace(/\\/g, "/"));
-    const all = (await walk(vfsImpl, path, [], { n: 0 }, checkAccess)).filter((p) => re.test(p.slice(path.length + 1)));
+    let all = null;
+    try {
+      if (vfsImpl.statSync(path).isDirectory()) {
+        const nativePaths = await runNativeFind(path);
+        if (nativePaths !== null) all = filterVerifiedCandidates(nativePaths, path, re);
+      }
+    } catch {
+      all = null;
+    }
+    if (all === null) {
+      all = (await walk(vfsImpl, path, [], { n: 0 }, checkAccess)).filter((p) => re.test(p.slice(path.length + 1)));
+    }
     const offset = request.offset ?? 0;
     const limit = request.maxResults ?? 2000;
     const files = all.slice(offset, offset + limit);
@@ -356,16 +459,25 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
       throw err("invalid_pattern", `非法正则: ${request.pattern}`, path);
     }
     const globRe = request.glob ? globToRegExp(request.glob) : null;
-    let walked;
+    let files;
     try {
       const st = vfsImpl.statSync(path);
-      walked = st.isDirectory() ? await walk(vfsImpl, path, [], { n: 0 }, checkAccess) : [path];
+      if (st.isDirectory()) {
+        const nativeHits = await runNativeGrepCandidates(path, request);
+        if (nativeHits !== null) {
+          files = filterVerifiedCandidates(nativeHits, path, globRe);
+        } else {
+          const walked = await walk(vfsImpl, path, [], { n: 0 }, checkAccess);
+          files = walked.filter((p) => !globRe || globRe.test(p.slice(path.length + 1)));
+        }
+      } else {
+        files = !globRe || globRe.test(path.slice(path.length + 1)) ? [path] : [];
+      }
     } catch (e) {
       // 权限和 IO 故障不能伪装成搜索目录不存在。
       if (e?.code !== "ENOENT") throw e;
       throw err("not_found", `搜索路径不存在: ${path}`, path);
     }
-    const files = walked.filter((p) => !globRe || globRe.test(p.slice(path.length + 1)));
 
     const entries = [];
     const hitFiles = [];
@@ -441,15 +553,12 @@ const ms = (from) => Math.max(0, Math.round(Number(performance.now()) - from));
       hitFiles.push(file);
     };
 
-    // 一批只过桥一次（R23 / §1.5.9）：真盘上逐文件 readFileSync 是 3063 次同步往返 ≈ 1.2 s，
-    // 而扫描本身只要 ~56 ms。256 个文件一批是量出来的折中——再大就把整棵树读进 JS 堆，
-    // 等于用 R23 换来 R6；实测 256 个平均文本文件约 0.95 MB/批。
-    // 0.4.10：SAF 树上的 readMany 在 Kotlin 侧就是**串行逐文件** openInputStream（TreeBridge.kt
-    // 注释"树上退化为逐文件读"），一条 256 的批 = 一次 8-10 秒的同步桥调用，JS 无从在其中
-    // 让出——装机"整个应用卡死"的主线程死区正是它。树工作区收小到 64（≈2.5s 一段）+ 批间
-    // await yieldToUi()：死区切成可呼吸段，点击/滚动在批间照常分发。私有盘（native）维持 256。
+    // B-02/B-03 优化后：私有盘常见 ERE 搜索已由原生 grep 预筛选出极少数命中文件，
+    // 回退 JS 全量扫描或大量命中时每批放大到 512（减半 readMany JNI 往返，约 1.9 MB/批）；
+    // SAF 树（/mnt/）由于 DocumentsContract 串行 openInputStream，保持 128 + 批间 yieldToUi
+    // 兼顾吞吐量与主线程触摸响应。
     const treeBacked = path.startsWith("/mnt/");
-    const CHUNK = treeBacked ? 64 : 256;
+    const CHUNK = treeBacked ? 128 : 512;
     for (let i = 0; i < files.length; i += CHUNK) {
       if (i > 0) await yieldToUi();
       // 批读也必须逐项检查链接，不能让 readMany 绕过单文件入口的授权闸。

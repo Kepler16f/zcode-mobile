@@ -18,3 +18,7 @@
 ```
 
 集成冒烟由 `mobile-runtime/build/chat-smoke.mjs` 执行，沿用真实 RPC transport、ConversationProjectionStore 和共享 session store，验证父行链接、子 timeline、workspace 边界、重订阅和重启恢复。
+
+## 验证方式
+
+- `node mobile-runtime/build/chat-smoke.mjs`

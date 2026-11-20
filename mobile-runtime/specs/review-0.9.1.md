@@ -6,3 +6,11 @@
 - 启动早期异常必须撤下启动遮罩并展示可重试错误；自检入口默认隐藏。
 
 所有者与时序：`agent 收轮 → session store 保存主记录 → 保存同版本用量投影 → 统计读取按版本校验`。统计迁移只在源版本未变化时发布投影。
+
+## 验证方式
+
+- `node mobile-runtime/build/workspace-realpath-smoke.mjs`
+- `node mobile-runtime/build/services-smoke.mjs`
+- `node mobile-runtime/build/usage-stats-smoke.mjs`
+- `node mobile-runtime/build/startup-path-smoke.mjs`
+- `node mobile-runtime/build/version-cache-smoke.mjs`

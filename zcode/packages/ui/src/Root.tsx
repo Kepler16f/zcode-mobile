@@ -606,9 +606,10 @@ function RootInner({
   const { tryRefresh, clearCredentials } = useTokenRefresh();
   void tryRefresh;
   void clearCredentials;
-  // 启动阻塞是桌面窗口保护期，手机 Web 远控在进入 Root 前已有配对/加载页。
-  // Web 端继续使用该 gate 会在 workspace tab 注入前渲染空 RootShell，露出浏览器白底。
-  const isStartupRenderBlocked = shouldShowRootStartupLoading({
+  // 启动阻塞只应出现在整应用首次冷加载期；主界面渲染过一次之后，
+  // 即使后台刷新账号/配置或切换状态，也不再重新盖回整屏启动加载动画。
+  const hasRenderedMainUiRef = useRef(false);
+  const rawStartupRenderBlocked = shouldShowRootStartupLoading({
     isDesktop,
     welcomeScreenOpen: Boolean(welcomeScreenOpenReason),
     isResolvingStartupAuthState,
@@ -616,6 +617,10 @@ function RootInner({
     isRestoring,
     isBootstrappingInitialWorkspace: isBootstrappingInitialWorkspace || isCreatingFallbackWorkspace,
   });
+  const isStartupRenderBlocked = hasRenderedMainUiRef.current ? false : rawStartupRenderBlocked;
+  if (!isStartupRenderBlocked && !welcomeScreenOpenReason) {
+    hasRenderedMainUiRef.current = true;
+  }
 
   const launchReportedRef = useRef(false);
   useEffect(() => {

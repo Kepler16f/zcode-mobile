@@ -23,3 +23,9 @@
 ## 验收
 
 覆盖跨轮工具结果、流中检查点与重启恢复、工具前后中断、计划模式写入和钩子改写、附件发送及排队、正常只读调用。桌面 continuous 和移动会话现有协议帧序列不得回归。
+
+## 验证方式
+
+- `node mobile-runtime/build/runtime-reliability-smoke.mjs`
+- `node mobile-runtime/build/chat-smoke.mjs`
+- `node mobile-runtime/build/hooks-smoke.mjs`

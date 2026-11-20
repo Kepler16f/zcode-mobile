@@ -13,6 +13,16 @@
 // 不该由这里吞掉或改写。
 
 export const DESKTOP_COMPATIBILITY_VERSION_KEY = "zcode-mobile.desktopCompatibilityVersion";
+/** 对服务端自报的官方发行版本（2026-11 官方主线 3.18.x）。仓库构建是 0.0.0-dev，会被判成"过旧"（forceUpdate 3.5.3）。 */
+export const OFFICIAL_COMPAT_VERSION = "3.18.2";
+/** 用户覆盖优先，缺省为官方发行版本；所有官方域请求（含 client/configs）都应读这个口径。 */
+export function officialCompatibilityVersion(): string {
+  try {
+    const v = globalThis.localStorage?.getItem(DESKTOP_COMPATIBILITY_VERSION_KEY)?.trim();
+    if (v && /^\d+\.\d+\.\d+/.test(v)) return v;
+  } catch { /* localStorage 不可用走缺省 */ }
+  return OFFICIAL_COMPAT_VERSION;
+}
 export function desktopCompatibilityVersion(fallback: string): string {
   try {return globalThis.localStorage?.getItem(DESKTOP_COMPATIBILITY_VERSION_KEY)?.trim() || fallback;} catch {return fallback;}
 }

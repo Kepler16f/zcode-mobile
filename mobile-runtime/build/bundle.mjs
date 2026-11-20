@@ -5,9 +5,11 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { compatPlugin } from "../compat/build-plugin.mjs";
 import { buildToyboxRegistry } from "./gen-toybox-registry.mjs";
+import { readOfficialCompatVersion } from "./official-version.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "../..");
+const officialVersion = readOfficialCompatVersion(root);
 const cliRoot = path.join(root, "zcode/apps/zcode-cli");
 const esbuild = createRequire(path.join(cliRoot, "package.json"))("esbuild");
 
@@ -30,6 +32,9 @@ const result = await esbuild.build({
   logLevel: "warning",
   // typescript 只在动态工作流编译器里用，端侧按需异步加载，不进主 bundle（见 §1.5.1 体积表）。
   external: ["typescript"],
+  define: {
+    __ZCODE_VERSION__: JSON.stringify(officialVersion),
+  },
   // 浏览器没有全局 Buffer，Glob/二进制分支直接用裸标识符。
   inject: [path.join(root, "mobile-runtime/compat/prelude.mjs")],
   plugins: [compatPlugin({ external: ["typescript"], bashRegistryOverride: trimmedRegistry.file })],

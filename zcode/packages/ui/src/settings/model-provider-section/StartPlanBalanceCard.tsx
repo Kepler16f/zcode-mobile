@@ -147,12 +147,25 @@ export function resolveStartPlanQuotaCardEntries({
   plans: UsageEntitlementSubscriptionDetail[];
   limits: UsageQuotaLimit[];
 }): StartPlanQuotaCardEntry[] {
-  return plans.map((plan) => ({
-    plan,
-    // 额度桶只按 plan_id 精确归属。服务端契约保证每个桶都带 plan_id，
-    // 不再对无 plan_id 的桶做单套餐兜底，否则多套餐下会把同一桶复制进每张卡片。
-    limits: limits.filter((limit) => limit.planId?.trim() === plan.productId.trim()),
-  }));
+  const entries = plans.map((plan) => {
+    const planKey = plan.productId.trim().toLowerCase();
+    return {
+      plan,
+      limits: limits.filter(
+        (limit) => limit.planId?.trim().toLowerCase() === planKey && planKey.length > 0,
+      ),
+    };
+  });
+  if (entries.length === 1 && entries[0] && entries[0].limits.length === 0 && limits.length > 0) {
+    // 单活动/兜底套餐场景下，若服务端返回了无 plan_id 或不同大小写/别名的余额桶，
+    // 仍归属到该唯一活动卡，避免已领取余额完全不可见。
+    const unattributed = limits.filter((limit) => !limit.planId?.trim());
+    entries[0] = {
+      ...entries[0],
+      limits: unattributed.length > 0 ? unattributed : [...limits],
+    };
+  }
+  return entries;
 }
 
 function formatStartPlanBalanceExpireTimeLabel({

@@ -35,3 +35,8 @@ Activity 重建后拿到的是同一个桥，同一批任务继续跑完；`onDe
 
 进程真被系统杀掉（低内存）时，JS 状态随之消失：会话从库里还原，该轮标记为"被打断"。
 要跨进程续跑需要把这一轮的执行意图完整落盘并重放，属于独立特性，本次不做。
+
+## 验证方式
+
+- `node mobile-runtime/build/idle-watchdog-smoke.mjs`
+- `node mobile-runtime/build/bridge-async-smoke.mjs`

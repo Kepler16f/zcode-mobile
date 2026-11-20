@@ -1,3 +1,4 @@
+import { Loader2Icon } from "lucide-react";
 import { Button } from "@/components/ui/button.js";
 import {
   Dialog,
@@ -35,6 +36,13 @@ export function AppUpdateDialog({
       ? "settings.appVersionUpdateFound"
       : "settings.updateDialogTitle";
 
+  const hasFooterActions =
+    phase === "available" ||
+    phase === "failed" ||
+    phase === "downloading" ||
+    phase === "downloaded" ||
+    phase === "unavailable";
+
   return (
     <Dialog open={flow.open} onOpenChange={flow.handleOpenChange}>
       {/* 宽度用**内联样式**而不是 Tailwind 任意值类：端侧 APK 携带的是 checked-in 的
@@ -59,8 +67,9 @@ export function AppUpdateDialog({
           </DialogDescription>
         </DialogHeader>
         {phase === "checking" ? (
-          <div className="text-ui-base text-foreground-subtle">
-            {intl.formatMessage({ id: "settings.appVersionChecking" })}
+          <div className="flex items-center gap-2 text-ui-base text-foreground-subtle">
+            <Loader2Icon className="size-4 shrink-0 animate-spin" aria-hidden="true" />
+            <span>{intl.formatMessage({ id: "settings.appVersionChecking" })}</span>
           </div>
         ) : null}
         {phase === "up-to-date" ? (
@@ -139,61 +148,68 @@ export function AppUpdateDialog({
             {intl.formatMessage({ id: "settings.updateFailed" }, { error: flow.error })}
           </div>
         ) : null}
-        <DialogFooter className="flex-col gap-2 sm:flex-row sm:justify-end">
-          {phase === "available" || phase === "failed" ? (
-            <>
-              <Button
-                type="button"
-                size="lg"
-                className="min-h-11 w-full sm:w-auto"
-                onClick={flow.handleDownload}
-              >
-                {intl.formatMessage({ id: "settings.updateDownload" })}
-              </Button>
+        {hasFooterActions ? (
+          <DialogFooter className="flex-col gap-2 sm:flex-row sm:justify-end">
+            {phase === "unavailable" ? (
               <Button
                 type="button"
                 size="lg"
                 variant="outline"
                 className="min-h-11 w-full sm:w-auto"
-                onClick={flow.handleBackgroundDownload}
+                onClick={flow.runCheck}
               >
-                {intl.formatMessage({ id: "settings.updateDownloadInBackground" })}
+                {intl.formatMessage({ id: "common.retry" })}
               </Button>
-            </>
-          ) : null}
-          {isDownloading ? (
-            <Button
-              type="button"
-              size="lg"
-              variant="outline"
-              className="min-h-11 w-full sm:w-auto"
-              onClick={flow.handleCancelDownload}
-            >
-              {intl.formatMessage({ id: "settings.updateCancel" })}
-            </Button>
-          ) : null}
-          {phase !== "checking" && phase !== "up-to-date" && phase !== "unavailable" ? (
-            <Button
-              type="button"
-              size="lg"
-              variant="secondary"
-              className="min-h-11 w-full sm:w-auto"
-              disabled={!flow.canInstall}
-              onClick={flow.handleInstall}
-            >
-              {intl.formatMessage({ id: "settings.updateInstall" })}
-            </Button>
-          ) : null}
-          <Button
-            type="button"
-            size="lg"
-            variant="ghost"
-            className="min-h-11 w-full sm:w-auto"
-            onClick={() => flow.handleOpenChange(false)}
-          >
-            {intl.formatMessage({ id: "settings.updateClose" })}
-          </Button>
-        </DialogFooter>
+            ) : null}
+            {phase === "available" || phase === "failed" ? (
+              <>
+                <Button
+                  type="button"
+                  size="lg"
+                  className="min-h-11 w-full sm:w-auto"
+                  onClick={flow.handleDownload}
+                >
+                  {intl.formatMessage({ id: "settings.updateDownload" })}
+                </Button>
+                <Button
+                  type="button"
+                  size="lg"
+                  variant="outline"
+                  className="min-h-11 w-full sm:w-auto"
+                  onClick={flow.handleBackgroundDownload}
+                >
+                  {intl.formatMessage({ id: "settings.updateDownloadInBackground" })}
+                </Button>
+              </>
+            ) : null}
+            {isDownloading ? (
+              <Button
+                type="button"
+                size="lg"
+                variant="outline"
+                className="min-h-11 w-full sm:w-auto"
+                onClick={flow.handleCancelDownload}
+              >
+                {intl.formatMessage({ id: "settings.updateCancel" })}
+              </Button>
+            ) : null}
+            {phase === "available" ||
+            phase === "downloading" ||
+            phase === "downloaded" ||
+            phase === "failed" ? (
+              <Button
+                type="button"
+                size="lg"
+                variant="secondary"
+                className="min-h-11 w-full sm:w-auto"
+                disabled={!flow.canInstall}
+                onClick={flow.handleInstall}
+              >
+                {intl.formatMessage({ id: "settings.updateInstall" })}
+              </Button>
+            ) : null}
+          </DialogFooter>
+        ) : null}
       </DialogContent>
     </Dialog>
   );

@@ -58,7 +58,7 @@ class ModelHttpBridge {
         val id = UUID.randomUUID().toString()
         val job = Job()
         jobs[id] = job
-        Thread { runJob(job, request) }.apply { isDaemon = true; start() }
+        Thread { runJob(id, job, request) }.apply { isDaemon = true; start() }
         return JSONObject().put("id", id).toString()
     }
 
@@ -127,7 +127,11 @@ class ModelHttpBridge {
         }
     }
 
-    private fun runJob(job: Job, request: String) {
+    private fun emitModelWake(id: String) {
+        AsyncBridgeJobs.emitScript("window.__zcodeModelWake?.(${JSONObject.quote(id)})")
+    }
+
+    private fun runJob(id: String, job: Job, request: String) {
         val deadlineAt = System.currentTimeMillis() + DEADLINE_MS
         var phase = "解析请求"
         try {
@@ -221,6 +225,7 @@ class ModelHttpBridge {
                         }
                     }
                     job.headers = JSONObject().put("status", status).put("headers", responseHeaders)
+                    emitModelWake(id)
                     val raw = if (status >= 400) conn.errorStream else conn.inputStream
                     val stream = decodeStream(raw, conn.getHeaderField("Content-Encoding"))
                     var total = 0L
@@ -237,6 +242,7 @@ class ModelHttpBridge {
                                 require(System.currentTimeMillis() < deadlineAt) { "模型请求超时" }
                                 require(System.currentTimeMillis() - job.lastPoll <= IDLE_LIMIT_MS) { "模型读取方已离线" }
                             }
+                            if (!job.cancelled) emitModelWake(id)
                         }
                     }
                     return
@@ -261,6 +267,7 @@ class ModelHttpBridge {
             job.finishedAt = System.currentTimeMillis()
             job.connection = null
             job.output = null
+            emitModelWake(id)
         }
     }
 

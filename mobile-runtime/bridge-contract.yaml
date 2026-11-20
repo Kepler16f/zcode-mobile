@@ -1,0 +1,561 @@
+version: 1
+description: "Android WebView <-> JS 原生桥单一事实来源契约（14 个主 WebView 全局桥 + 2 个内置浏览器子页垫片 + 5 个原生回调事件）"
+
+bridges:
+  zcodeSqlite:
+    kotlinClass: SqliteBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/SqliteBridge.kt
+    purpose: "SQLite 数据库直通桥（@zcode/persistence 与 session 存储）"
+    consumers:
+      - mobile-runtime/compat/shims/sqlite-native.mjs
+      - mobile-runtime/compat/shims/sqlite.mjs
+    methods:
+      open:
+        arity: 1
+        args: "path: String"
+        returns: "Long (数据库句柄 handle)"
+        errors: "非法路径/打开失败抛异常，JS 侧捕获转存储错误"
+      close:
+        arity: 1
+        args: "handle: Long"
+        returns: "Unit"
+        errors: "句柄不存在时静默忽略"
+      exec:
+        arity: 2
+        args: "handle: Long, sql: String"
+        returns: "String? (null 表示成功，或 JSON 错误对象)"
+        errors: "SQL 语法/约束错误通过返回值或异常暴露"
+      query:
+        arity: 4
+        args: "handle: Long, sql: String, params: String (JSON array), mode: String"
+        returns: "String (JSON 行数组或单行对象)"
+        errors: "参数或 SQL 失败时返回 JSON error"
+
+  zcodeDevice:
+    kotlinClass: DeviceProbe
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/DeviceProbe.kt
+    purpose: "设备信息探针、外部链接拉起、全盘存储权限与历史 L1/L2 自检接口"
+    consumers:
+      - mobile-runtime/ui/platform.ts
+      - mobile-runtime/ui/quota-transport.ts
+      - mobile-runtime/ui/agent.ts
+      - mobile-runtime/ui/tool-engine.ts
+      - zcode/packages/ui/src/settings/mobileAppBridge.ts
+      - zcode/packages/ui/src/settingsCodePreview.tsx
+    methods:
+      name:
+        arity: 0
+        args: ""
+        returns: "String ('zcodeDevice')"
+        errors: "无"
+      openExternal:
+        arity: 1
+        args: "url: String (http/https/授权 URI)"
+        returns: "String (JSON { ok, error? })"
+        errors: "无匹配 Activity 或非法 URI 返回 ok=false"
+      execL1:
+        arity: 2
+        args: "command: String, timeoutMs: Long"
+        returns: "String (JSON L1 自检执行结果)"
+        errors: "超时或命令异常返回 JSON error"
+      execL2:
+        arity: 0
+        args: ""
+        returns: "String (JSON L2 能力探针结果)"
+        errors: "失败返回 JSON error"
+      openAllFilesPermission:
+        arity: 0
+        args: ""
+        returns: "String (JSON { ok, error? })"
+        errors: "拉起 MANAGE_ALL_FILES 系统设置页失败返回 ok=false"
+      allFilesGranted:
+        arity: 0
+        args: ""
+        returns: "Boolean (是否已获 MANAGE_EXTERNAL_STORAGE 权限)"
+        errors: "无"
+      externalStorageRoot:
+        arity: 0
+        args: ""
+        returns: "String (外部主存储绝对路径)"
+        errors: "无"
+      deviceInfo:
+        arity: 0
+        args: ""
+        returns: "String (JSON { appVersion, versionCode, sdkInt, abi, ... })"
+        errors: "无"
+
+  zcodeExec:
+    kotlinClass: ExecBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/ExecBridge.kt
+    purpose: "异步/同步子进程执行（toybox / /system/bin/sh）与沙箱 zip 解压"
+    consumers:
+      - mobile-runtime/ports/execution-bridge-android.mjs
+      - mobile-runtime/ports/native-async.mjs
+      - mobile-runtime/ports/file-system.mjs
+      - mobile-runtime/ui/tool-engine.ts
+      - mobile-runtime/ui/synthetic-commands.ts
+    methods:
+      start:
+        arity: 1
+        args: "request: String (JSON { file?, args?, useShell?, command?, cwd?, env?, stdin?, timeoutMs? })"
+        returns: "String (JSON { id }，完成后经 __zcodeJobDone 推送)"
+        errors: "参数非法或线程创建失败返回 { error }"
+      poll:
+        arity: 1
+        args: "id: String"
+        returns: "String (JSON { done, result?, error? })"
+        errors: "id 不存在或已被读取返回 { error }"
+      ack:
+        arity: 1
+        args: "id: String"
+        returns: "Boolean (确认 __zcodeJobDone 已收并释放任务槽)"
+        errors: "任务未完成或不存在返回 false"
+      cancel:
+        arity: 1
+        args: "id: String"
+        returns: "Boolean"
+        errors: "id 不存在返回 false"
+      exec:
+        arity: 1
+        args: "request: String (JSON)"
+        returns: "String (同步执行结果 JSON { exitCode, stdout, stderr, ... })"
+        errors: "进程失败返回 { error }"
+      unzip:
+        arity: 1
+        args: "request: String (JSON { zip, dest })"
+        returns: "String (JSON { ok, files?, error? })"
+        errors: "zip-slip 或读写失败返回 { ok: false, error }"
+
+  zcodeFs:
+    kotlinClass: FsBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/FsBridge.kt
+    purpose: "应用私有磁盘（/work 等）同步文件操作及批量 statMany/readMany"
+    consumers:
+      - mobile-runtime/compat/vfs-native.mjs
+      - mobile-runtime/compat/vfs.mjs
+    methods:
+      name:
+        arity: 0
+        args: ""
+        returns: "String ('zcodeFs')"
+        errors: "无"
+      call:
+        arity: 1
+        args: "request: String (JSON { op, path?, paths?, ... })"
+        returns: "String (JSON { ok, ... , code?, message? })"
+        errors: "越界/IO 失败返回 { ok: false, code, path, message }"
+
+  zcodeTree:
+    kotlinClass: TreeBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/TreeBridge.kt
+    purpose: "SAF 外部授权目录（/mnt/<mount>/...）DocumentFile 同步文件桥"
+    consumers:
+      - mobile-runtime/compat/vfs-tree.mjs
+      - mobile-runtime/compat/vfs.mjs
+    methods:
+      name:
+        arity: 0
+        args: ""
+        returns: "String ('zcodeTree')"
+        errors: "无"
+      call:
+        arity: 1
+        args: "request: String (JSON { op, path?, paths?, ... })"
+        returns: "String (JSON { ok, ... , code?, message? })"
+        errors: "授权失效或 DocumentFile 错误返回 { ok: false, code, message }"
+
+  zcodeWorkspace:
+    kotlinClass: WorkspaceBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/WorkspaceBridge.kt
+    purpose: "SAF 工作区目录选择器与持久化挂载表管理"
+    consumers:
+      - mobile-runtime/ui/platform.ts
+      - mobile-runtime/compat/workspace-aliases.mjs
+    methods:
+      name:
+        arity: 0
+        args: ""
+        returns: "String ('zcodeWorkspace')"
+        errors: "无"
+      pickDirectory:
+        arity: 1
+        args: "requestId: String"
+        returns: "String ('started' | error JSON，路径经 __zcodeWorkspacePicked 回调)"
+        errors: "已有进行中请求或无 requestId 返回错误 JSON"
+      cancelDirectory:
+        arity: 1
+        args: "requestId: String"
+        returns: "Unit"
+        errors: "requestId 不匹配时忽略"
+      listTrees:
+        arity: 0
+        args: ""
+        returns: "String (JSON 数组 [{ name, uri, label }])"
+        errors: "无"
+      localTreeAliases:
+        arity: 0
+        args: ""
+        returns: "String (JSON 对象 { '/mnt/...': '/sdcard/...' })"
+        errors: "无"
+      forgetTree:
+        arity: 1
+        args: "name: String"
+        returns: "String (JSON { ok })"
+        errors: "未找到返回 { ok: false }"
+
+  zcodeCredentials:
+    kotlinClass: CredentialBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/CredentialBridge.kt
+    purpose: "Android Keystore AES-GCM 加密凭据存储（API Key / OAuth / ZCode JWT）"
+    consumers:
+      - mobile-runtime/ui/credentials.ts
+      - mobile-runtime/ui/services.ts
+    methods:
+      name:
+        arity: 0
+        args: ""
+        returns: "String ('zcodeCredentials')"
+        errors: "无"
+      engine:
+        arity: 0
+        args: ""
+        returns: "String ('keystore' | 'encrypted-prefs' | 'plain')"
+        errors: "无"
+      call:
+        arity: 1
+        args: "request: String (JSON { op: 'get'|'set'|'delete'|'keys', key, value? })"
+        returns: "String (JSON { ok, value?, keys?, error? })"
+        errors: "加解密或 JSON 解析异常返回 { ok: false, error }"
+
+  zcodeOAuthLink:
+    kotlinClass: OAuthLinkBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/OAuthLinkBridge.kt
+    purpose: "Deep-Link OAuth 回调队列读取（避免 code 拼进 evaluateJavascript）"
+    consumers:
+      - mobile-runtime/ui/platform.ts
+    methods:
+      take:
+        arity: 0
+        args: ""
+        returns: "String (回调 URL 字符串，队列为空返回 '')"
+        errors: "无"
+      stats:
+        arity: 0
+        args: ""
+        returns: "String (JSON { pending, receivedTotal, ... })"
+        errors: "无"
+
+  zcodeUi:
+    kotlinClass: UIChromeBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/UIChromeBridge.kt
+    purpose: "系统深浅色主题同步、状态栏/刘海安全区 insets 与抽屉返回键协同"
+    consumers:
+      - mobile-runtime/ui/entry.tsx
+      - mobile-runtime/ui/system-theme-media.ts
+      - mobile-runtime/ui/system-insets.ts
+      - mobile-runtime/ui/web-mobile-shell.ts
+    methods:
+      name:
+        arity: 0
+        args: ""
+        returns: "String ('zcodeUi')"
+        errors: "无"
+      setThemeDark:
+        arity: 1
+        args: "dark: Boolean"
+        returns: "Unit"
+        errors: "无"
+      systemDark:
+        arity: 0
+        args: ""
+        returns: "Boolean"
+        errors: "无"
+      safeInsets:
+        arity: 0
+        args: ""
+        returns: "String (JSON { top, bottom, left, right } dp)"
+        errors: "无"
+      setDrawerOpen:
+        arity: 1
+        args: "open: Boolean"
+        returns: "Unit"
+        errors: "无"
+      setInSettings:
+        arity: 1
+        args: "open: Boolean"
+        returns: "Unit"
+        errors: "无"
+
+  zcodeBrowser:
+    kotlinClass: BrowserBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/BrowserBridge.kt
+    purpose: "内置可视浏览器 BrowserActivity 控制、Start Plan 官方领取页及阿里云 SmartCaptcha 人机验证"
+    consumers:
+      - mobile-runtime/ui/tool-engine.ts
+      - mobile-runtime/ui/plugins-mobile.ts
+      - mobile-runtime/ui/coding-plan-claim-dialog.tsx
+      - mobile-runtime/ui/promo-claim.ts
+    methods:
+      start:
+        arity: 1
+        args: "request: String (JSON { action, url? })"
+        returns: "String (JSON { id }，完成后经 __zcodeJobDone 推送)"
+        errors: "非法 JSON 或参数返回 { error }"
+      poll:
+        arity: 1
+        args: "id: String"
+        returns: "String (JSON { done, result?, error? })"
+        errors: "id 不存在返回 { error }"
+      ack:
+        arity: 1
+        args: "id: String"
+        returns: "Boolean"
+        errors: "任务未完成或不存在返回 false"
+      cancel:
+        arity: 1
+        args: "id: String"
+        returns: "Boolean"
+        errors: "id 不存在返回 false"
+      open:
+        arity: 1
+        args: "request: String (JSON { url })"
+        returns: "String (JSON { ok, content?, error? })"
+        errors: "非 http/https 地址或页面打开超时返回 ok=false"
+      navigate:
+        arity: 1
+        args: "request: String (JSON { url })"
+        returns: "String (同 open)"
+        errors: "同 open"
+      openClaimPage:
+        arity: 1
+        args: "request: String (JSON { url, token, lang? })"
+        returns: "String (JSON { ok, error? })"
+        errors: "URL 非白名单/参数无效返回 ok=false"
+      openCaptchaChallenge:
+        arity: 1
+        args: "request: String (JSON { prefix, sceneId, region?, lang? })"
+        returns: "String (JSON { ok, id?, error? })"
+        errors: "缺少 prefix/sceneId 返回 ok=false"
+      pollCaptchaResult:
+        arity: 1
+        args: "id: String"
+        returns: "String (JSON { done, ok, captchaVerifyParam?, cancelled?, error? })"
+        errors: "未知挑战 id 返回 done=true, ok=false"
+      back:
+        arity: 0
+        args: ""
+        returns: "String (JSON { ok, content?, error? })"
+        errors: "浏览器未打开返回 ok=false"
+      read:
+        arity: 0
+        args: ""
+        returns: "String (JSON { ok, content?, error? })"
+        errors: "浏览器未打开返回 ok=false"
+      close:
+        arity: 0
+        args: ""
+        returns: "String (JSON { ok })"
+        errors: "无"
+
+  zcodeGitHttp:
+    kotlinClass: GitHttpBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/GitHttpBridge.kt
+    purpose: "原生 HttpURLConnection 非流式网络代理（Git HTTP + 官方额度/Start Plan 领取 API 绕过 WebView CORS）"
+    consumers:
+      - mobile-runtime/ui/quota-transport.ts
+      - mobile-runtime/ui/git-tool.ts
+      - mobile-runtime/ui/oauth.ts
+      - mobile-runtime/ui/fetch-tool.ts
+      - mobile-runtime/ui/mcp-runtime.ts
+    methods:
+      start:
+        arity: 1
+        args: "request: String (JSON { url, method, headers?, bodyBase64?, body? })"
+        returns: "String (JSON { id }，完成后经 __zcodeJobDone 推送)"
+        errors: "参数或连接异常返回 { error }"
+      poll:
+        arity: 1
+        args: "id: String"
+        returns: "String (JSON { done, result?, error? })"
+        errors: "id 不存在返回 { error }"
+      ack:
+        arity: 1
+        args: "id: String"
+        returns: "Boolean"
+        errors: "任务未完成或不存在返回 false"
+      cancel:
+        arity: 1
+        args: "id: String"
+        returns: "Boolean"
+        errors: "id 不存在返回 false"
+      call:
+        arity: 1
+        args: "request: String (同步 HTTP 请求 JSON)"
+        returns: "String (JSON { status, headers, bodyBase64, error? })"
+        errors: "超时/SSRF 拦截/网络失败返回 { error }"
+
+  zcodeModelHttp:
+    kotlinClass: ModelHttpBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/ModelHttpBridge.kt
+    purpose: "流式 SSE / HTTP 原生模型网关通道（SSRF 防护 + 队列分块 + __zcodeModelWake 推送唤醒）"
+    consumers:
+      - mobile-runtime/ui/model-transport.ts
+    methods:
+      start:
+        arity: 1
+        args: "request: String (JSON { url, headers, body })"
+        returns: "String (JSON { id } | { error })"
+        errors: "指向本机/链路本地或头部超限拒绝连接并返回 { error }"
+      poll:
+        arity: 1
+        args: "id: String"
+        returns: "String (JSON { status?, headers?, bodyBase64?, done?, error? })"
+        errors: "任务不存在或响应超 64 MiB 返回 { error }"
+      cancel:
+        arity: 1
+        args: "id: String"
+        returns: "Boolean"
+        errors: "id 不存在返回 false"
+
+  zcodeUpdate:
+    kotlinClass: UpdateBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/UpdateBridge.kt
+    purpose: "应用内 APK 版本检查、后台下载、进度查询与 FileProvider 安装触发"
+    consumers:
+      - mobile-runtime/ui/app-update.ts
+      - zcode/packages/ui/src/settings/appUpdateFlow.ts
+      - zcode/packages/ui/src/settings/mobileAppBridge.ts
+    methods:
+      checkForUpdate:
+        arity: 0
+        args: ""
+        returns: "String (JSON 版本检查结果)"
+        errors: "网络异常返回 { error }"
+      startCheckForUpdate:
+        arity: 0
+        args: ""
+        returns: "String (JSON { ok, id }，异步不阻塞 WebView 主线程)"
+        errors: "无"
+      pollCheckForUpdate:
+        arity: 1
+        args: "id: String"
+        returns: "String (JSON { done, result? })"
+        errors: "id 不存在或已过期返回 done=true, ok=false"
+      cancelCheckForUpdate:
+        arity: 1
+        args: "id: String"
+        returns: "String (JSON { ok })"
+        errors: "无"
+      startDownload:
+        arity: 2
+        args: "url: String, background: Boolean"
+        returns: "String (JSON { ok, jobId?, error? })"
+        errors: "非法 URL 返回 { ok: false, error }"
+      getDownloadProgress:
+        arity: 1
+        args: "jobId: String"
+        returns: "String (JSON { ok, state, downloaded, total, filePath?, error? })"
+        errors: "jobId 无效返回 { ok: false, error }"
+      cancelDownload:
+        arity: 1
+        args: "jobId: String"
+        returns: "String (JSON { ok })"
+        errors: "jobId 不存在返回 { ok: false }"
+      installApk:
+        arity: 1
+        args: "filePath: String"
+        returns: "String (JSON { ok, error? })"
+        errors: "越出私有目录或缺安装权限返回 need_install_permission"
+      openInstallPermission:
+        arity: 0
+        args: ""
+        returns: "String (JSON { ok })"
+        errors: "无法跳转权限页返回 { ok: false }"
+
+  zcodeNotify:
+    kotlinClass: NotificationBridge
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/NotificationBridge.kt
+    purpose: "Android 13+ 通知权限申请、本地通知发送与前台保活开关"
+    consumers:
+      - mobile-runtime/ui/app-notify.ts
+      - mobile-runtime/ui/app-update.ts
+      - zcode/packages/ui/src/settings/appUpdateFlow.ts
+      - zcode/packages/ui/src/settings/keepAliveNotificationRow.tsx
+      - zcode/packages/ui/src/settings/mobileAppBridge.ts
+    methods:
+      requestPermission:
+        arity: 0
+        args: ""
+        returns: "String (JSON { granted, requested? })"
+        errors: "无"
+      hasPermission:
+        arity: 0
+        args: ""
+        returns: "Boolean"
+        errors: "无"
+      notify:
+        arity: 4
+        args: "id: String, title: String, text: String, ongoing: Boolean"
+        returns: "String (JSON { ok, error? })"
+        errors: "无通知权限时返回 { ok: false }"
+      setKeepAlive:
+        arity: 1
+        args: "enabled: Boolean"
+        returns: "String (JSON { ok })"
+        errors: "服务启停异常返回 { ok: false }"
+
+innerShims:
+  zcodeBridge:
+    kotlinClass: ClaimShim
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/BrowserBridge.kt
+    host: BrowserActivity
+    purpose: "Start Plan / Coding Plan 内嵌官方页面向 App 通知领取或购买完成"
+    methods:
+      notifyPurchaseComplete:
+        arity: 1
+        args: "payload: String?"
+        returns: "Unit"
+        errors: "静默忽略异常"
+      getLang:
+        arity: 0
+        args: ""
+        returns: "String"
+        errors: "无"
+
+  ZCodeCaptchaBridge:
+    kotlinClass: CaptchaShim
+    kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/BrowserBridge.kt
+    host: BrowserActivity
+    purpose: "阿里云 SmartCaptcha 验证页面回传真实 captchaVerifyParam"
+    methods:
+      onVerified:
+        arity: 2
+        args: "param: String?, region: String?"
+        returns: "Unit"
+        errors: "空 param 时视为失败"
+
+callbacks:
+  __zcodeJobDone:
+    emitter: AsyncBridgeJobs.kt
+    consumer: mobile-runtime/ports/native-async.mjs
+    signature: "(id: string, envelope: { done: true, result: object }) => void"
+  __zcodeModelWake:
+    emitter: ModelHttpBridge.kt
+    consumer: mobile-runtime/ui/model-transport.ts
+    signature: "(id: string) => void"
+  __zcodeWorkspacePicked:
+    emitter: WorkspaceBridge.kt
+    consumer: mobile-runtime/ui/platform.ts
+    signature: "(mountPathOrErrorJson: string | null, requestId?: string) => void"
+  __zcodeOAuthLink:
+    emitter: MainActivity.kt
+    consumer: mobile-runtime/ui/platform.ts
+    signature: "() => void"
+  __zcodeInsets:
+    emitter: UIChromeBridge.kt
+    consumer: mobile-runtime/ui/system-insets.ts
+    signature: "(insets: { top: number, bottom: number, left: number, right: number }) => void"
+  __zcodeHandleBack:
+    emitter: MainActivity.kt
+    consumer: mobile-runtime/ui/web-mobile-shell.ts
+    signature: "() => boolean"

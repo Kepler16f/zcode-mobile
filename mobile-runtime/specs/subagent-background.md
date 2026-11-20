@@ -67,3 +67,7 @@
 - 后台子代理的工具调用仍受父轮模式与审批约束（计划模式下的写操作被拒）；
 - 前台子代理路径逐字不变（不传 run_in_background / resume 时行为完全一致）。
 - 续接沿用同一个子会话与上一次的 transcript（含上一次结论）；续接不存在的 agentId 时如实报错。
+
+## 验证方式
+
+- `node mobile-runtime/build/subagent-background-smoke.mjs`

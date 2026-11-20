@@ -13,3 +13,11 @@
 ```
 
 验收：Skills/Subagents/MCP 已接入部分读写及运行时一致，未支持配置报错且原因可见；Hook trust 调用真实 authority、仅保留 .zcode 来源；Browser 开关写入失败不报告成功，无桥不能开启，有桥时与引擎读取一致。
+
+## 验证方式
+
+- `node mobile-runtime/build/capability-truthfulness-smoke.mjs`
+- `node mobile-runtime/build/services-smoke.mjs`
+- `node mobile-runtime/build/skills-subagents-smoke.mjs`
+- `node mobile-runtime/build/mcp-runtime-smoke.mjs`
+- `node mobile-runtime/build/hooks-smoke.mjs`

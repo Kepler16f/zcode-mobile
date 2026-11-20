@@ -19,3 +19,9 @@
 工作区 profile 的启停标识必须包含工作区路径，两个目录下同名 profile 不能共用状态。编辑和删除只允许操作服务最近实际发现或创建的、身份与路径一致的 profile；写入与删除前验证所属的用户或工作区 agent 根及路径中的符号链接，不接受请求自行指定任意旧文件路径。缺少可信发现记录时拒绝修改并要求重新加载列表。
 
 技能复制需要实际复制技能目录的文件树；移动端对包含符号链接的目录明确拒绝，避免复制时跨越授权边界。通用目录移除须使用受边界约束的技能删除逻辑，不能使用子串匹配路径。
+
+## 验证方式
+
+- `node mobile-runtime/build/skills-subagents-smoke.mjs`
+- `node mobile-runtime/build/skill-copy-smoke.mjs`
+- `node mobile-runtime/build/subagents-isolation-smoke.mjs`

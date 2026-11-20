@@ -51,6 +51,8 @@ export interface AccountProviderConnectionResolverOptions {
     forceRefresh: boolean,
   ) => Promise<string | null>;
   readonly loadAccountIdentity: (family: ProviderFamilyDomain) => Promise<string | null>;
+  /** 同步上游 v3.18.2：当 providerFamilyDomain 尚未初始化时，按登录渠道确定 Start Plan 所属家族。 */
+  readonly loadStartPlanFamily?: () => Promise<ProviderFamilyDomain | null>;
   readonly resolveFamilyAvailability: AccountProviderFamilyAvailabilityResolver;
 }
 
@@ -77,6 +79,7 @@ export function createAccountProviderConnectionResolver(
   let previousScopes = new Map<string, string>();
   return async ({ configuredProviders, reasons = [] }) => {
     const settings = structuredClone(await options.readSettings());
+    const startPlanFamilyPromise = options.loadStartPlanFamily?.() ?? Promise.resolve(null);
     const forceCredentialRefresh = reasons.some(isCredentialRefreshReason);
     const accountIdentityByFamily = new Map<ProviderFamilyDomain, Promise<string | null>>();
     const loadAccountIdentity = (family: ProviderFamilyDomain) => {
@@ -202,12 +205,15 @@ export function createAccountProviderConnectionResolver(
               unavailableReason: resolveAccountUnavailableReason(availability.reason),
             }
           : {}),
-        // Start 跟随登录身份，付费套餐跟随连接选择；两者可同时 current，不改写权益或配置。
+        // 同步上游 v3.18.2：Start 跟随登录身份，付费套餐跟随连接选择；
+        // 当国内/免绑付费账号的 providerFamilyDomain 为空时，按登录渠道确定唯一 Start 家族，
+        // 避免 Start 永远 current=false 导致模型无法使用、设置页看不到已领取权益。
         current:
-          settings.providerFamilyDomain === access.accountType &&
-          (access.mode === "start-plan"
-            ? Boolean(await loadAccountIdentity(access.accountType))
-            : selection?.kind === access.mode),
+          access.mode === "start-plan"
+            ? Boolean(await loadAccountIdentity(access.accountType)) &&
+              (settings.providerFamilyDomain ?? (await startPlanFamilyPromise)) === access.accountType
+            : settings.providerFamilyDomain === access.accountType &&
+              selection?.kind === access.mode,
         // 两个 Team 共用 Provider ID，观察器必须按同一快照中的完整身份比较，
         // 不能把手动换套餐/账号误当成原套餐失效。它只进入 Account State，不进入 Config。
         connectionKey: createHash("sha256")
@@ -308,14 +314,20 @@ export async function resolveCurrentAccountAccess(input: {
   readonly access: ZCodeProviderAccountAccess;
   readonly readSettings: () => Promise<AccountProviderConnectionSettings>;
   readonly loadAccountIdentity: (family: ProviderFamilyDomain) => Promise<string | null>;
+  readonly loadStartPlanFamily?: () => Promise<ProviderFamilyDomain | null>;
 }): Promise<ZCodeAccountAccess | null> {
   const settings = await input.readSettings();
   const { accountType, mode } = input.access;
-  if (settings.providerFamilyDomain !== accountType) return null;
   if (mode === "start-plan") {
+    // 同步上游 v3.18.2：与 Account State 的 current 同一判定，
+    // providerFamilyDomain 为空时按登录渠道确定 Start 所属家族，确保已领取的 Start Plan 可查看且可调用。
+    const effectiveFamily =
+      settings.providerFamilyDomain ?? (await input.loadStartPlanFamily?.()) ?? null;
+    if (effectiveFamily !== accountType) return null;
     if (!(await input.loadAccountIdentity(accountType))?.trim()) return null;
     return { type: "zhipu-account", family: accountType, planKind: "start-plan" };
   }
+  if (settings.providerFamilyDomain !== accountType) return null;
   const selection = settings.selections[accountType];
   if (!selection) return null;
   if (mode === "off-peak") {

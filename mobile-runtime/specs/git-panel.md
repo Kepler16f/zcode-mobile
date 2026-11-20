@@ -25,3 +25,9 @@ Git 仓库和工作树由 isomorphic-git 与同一份移动 VFS 持有。面板�
 - clone 和 remote 新保存的仓库 URL 不得包含用户名或密码；嵌入的认证信息只用于本次网络请求的认证回调，后续请求显式提供凭据。禁止带查询串或片段的远端地址，以免令牌进入配置；错误与响应不得泄露凭据。已有含用户名或密码的远端保持原配置，展示时脱敏，网络请求临时使用去除凭据的 URL 和认证回调，避免查看远端时破坏用户现有配置；已有带查询串或片段的远端须提示用户重新配置。
 
 验收覆盖 Agent 与面板同秒同尺寸修改的一致性、暂存删除、带空格路径、多路径预检、词法越界、目录和 `.git` 符号链接越界、恶意 Git 目录、推送拒绝和凭据脱敏、未出生仓库日志、真实故障与同分支切换。不得向外部远端执行测试推送。
+
+## 验证方式
+
+- `node mobile-runtime/build/git-panel-smoke.mjs`
+- `node mobile-runtime/build/git-boundary-smoke.mjs`
+- `node mobile-runtime/build/git-smoke.mjs`

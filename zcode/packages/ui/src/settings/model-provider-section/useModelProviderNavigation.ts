@@ -52,6 +52,8 @@ interface UseModelProviderNavigationOptions {
   displayOrder?: ProviderOrderView;
   codingPlanEntitlements?: Partial<Record<string, CodingPlanEntitlementState>>;
   providerFamilyDomain?: ProviderFamilyDomain | null;
+  /** 同步上游 v3.18.2：Start 所属家族（国内登录未关联付费套餐时 providerFamilyDomain 为空）。 */
+  startPlanFamilyDomain?: ProviderFamilyDomain | null;
   connectionSelections?: ProviderFamilyConnectionSelectionSettings;
   pendingConnectionSelections?: ProviderFamilyConnectionSelectionSettings;
   familyConnectionSettingsLoading?: boolean;
@@ -71,6 +73,7 @@ export function useModelProviderNavigation({
   displayOrder,
   codingPlanEntitlements = {},
   providerFamilyDomain = null,
+  startPlanFamilyDomain = providerFamilyDomain,
   connectionSelections = {},
   pendingConnectionSelections = {},
   familyConnectionSettingsLoading = false,
@@ -92,7 +95,10 @@ export function useModelProviderNavigation({
   const codingPlanItems = useMemo(
     () =>
       CODING_PLAN_PROVIDER_SPECS.filter((spec) =>
-        shouldShowCodingPlanForProviderFamilyDomain(spec.oauthProviderId, providerFamilyDomain),
+        shouldShowCodingPlanForProviderFamilyDomain(
+          spec.oauthProviderId,
+          isStartPlanModelProviderId(spec.id) ? startPlanFamilyDomain : providerFamilyDomain,
+        ),
       ).map((spec) => {
         const provider = modelProviders.find((item) => item.providerId === spec.id) ?? null;
         const accountEntitled = entitledAccountProviderIds.has(spec.id);
@@ -148,6 +154,7 @@ export function useModelProviderNavigation({
       modelProviders,
       modelProvidersLoading,
       providerFamilyDomain,
+      startPlanFamilyDomain,
     ],
   );
   const connectionModeCodingPlanItems = useMemo(

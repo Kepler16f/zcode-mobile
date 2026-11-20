@@ -8,9 +8,12 @@ import { fileURLToPath } from "node:url";
 import { compatPlugin } from "../compat/build-plugin.mjs";
 import { buildToyboxRegistry } from "./gen-toybox-registry.mjs";
 import {mobileShikiDependency,mobileDiffsWorker,relocateCssAssets,assertShikiConsistency} from "./mobile-ui-assets.mjs";
+import { assertMobileUiBundleIntegrity, createOnigurumaWasmPlugin } from "./bundle-guards.mjs";
+import { readOfficialCompatVersion } from "./official-version.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "../..");
+const officialVersion = readOfficialCompatVersion(root);
 const zcodeRoot = path.join(root, "zcode");
 const cliRoot = path.join(zcodeRoot, "apps/zcode-cli");
 const esbuild = createRequire(path.join(cliRoot, "package.json"))("esbuild");
@@ -65,8 +68,37 @@ const assetUrl = {
   },
 };
 
+// 上游领取/购买页用 Electron `<webview>` 承载，Android WebView 没有该标签，Start Plan 领取页打不开。
+// 换成原生 BrowserActivity 承载的实现（ui/coding-plan-claim-dialog.tsx）。
+const claimDialog = {
+  name: "mobile-claim-dialog",
+  setup(b) {
+    b.onResolve({ filter: /(^|[/\\])CodingPlanEmbeddedWebviewDialog\.js$/ }, () => ({
+      path: path.join(root, "mobile-runtime/ui/coding-plan-claim-dialog.tsx"),
+    }));
+  },
+};
+
+// A-04：移动端剥离重型 PDF / Office / PPTX 解析引擎（exceljs、duke_sheets_wasm、pdfjs 等），
+// 用轻量安全降级组件替换叶子动态模块，确保点击附件只提示暂不支持预览而无 404/JS 报错。
+const heavyPreviewStub = {
+  name: "mobile-heavy-preview-stub",
+  setup(b) {
+    b.onResolve(
+      {
+        filter:
+          /(^|[/\\])(pdf-viewer|pptx-preview-viewer|previewPaneOfficeXlsxContent|previewPaneOfficeDocxContent|previewPaneOfficeLegacyDocContent)\.(?:js|ts|tsx)$/,
+      },
+      () => ({
+        path: path.join(root, "mobile-runtime/ui/unsupported-preview.tsx"),
+      }),
+    );
+  },
+};
+
 const trimmedRegistry = buildToyboxRegistry();
 const shikiDependency=mobileShikiDependency(zcodeRoot);
+const onigurumaWasm=createOnigurumaWasmPlugin({resolvePinned:shikiDependency.resolvePinned,outdir});
 const diffsWorker=mobileDiffsWorker(zcodeRoot);
 
 // 随包模型清单：直接调上游构建脚本，不在这里重新实现"读哪个 env、校验哪套 schema"。
@@ -139,6 +171,7 @@ const result = await esbuild.build({
     // 随包的 ZCode Built-in Provider Config：和上游 server 用同一个 loader、同一个符号
     // （packages/server/tsup.config.ts:23），loader 会在构建期跑一遍 Release schema 校验，
     // 所以"打包成功但模型清单是坏的"这种问题在构建这一步就炸，不会等到装机才发现。
+    __ZCODE_VERSION__: JSON.stringify(officialVersion),
     __ZCODE_BUILTIN_PROVIDER_CONFIG_JSON__: JSON.stringify(zcodeBuiltin.content),
   },
   loader: {
@@ -146,7 +179,7 @@ const result = await esbuild.build({
     ".webp": "file", ".mp3": "file", ".woff": "file", ".woff2": "file", ".ttf": "file",
     ".wasm": "file", ".css": "css",
   },
-  plugins: [deepImport, assetUrl, shikiDependency.plugin, diffsWorker.plugin, compatPlugin({ external: ["typescript"], bashRegistryOverride: trimmedRegistry.file })],
+  plugins: [deepImport, assetUrl, claimDialog, heavyPreviewStub, onigurumaWasm, shikiDependency.plugin, diffsWorker.plugin, compatPlugin({ external: ["typescript"], bashRegistryOverride: trimmedRegistry.file })],
 });
 
 // 和 bundle.mjs 同一条断言：registry 裁剪要是被别的路径又引进来，bundle 会安静地涨回 5 MB。
@@ -219,6 +252,17 @@ if (existsSync(webDistAssets)) {
       sourceRoot:path.dirname(webDistAssets),outdir});
     await fsp.writeFile(path.join(outdir, "zcode-ui.css"), assets.css);
     console.log(`CSS本地资源完整复制：${assets.copied.length} 个`);
+    const integrity = assertMobileUiBundleIntegrity({
+      outdir,
+      metafile: result.metafile,
+      cssText: assets.css,
+      languageWhitelist: shikiDependency.languageWhitelist,
+      // 裁剪后 dist-ui 约 ~22.6 MiB（基线 31.9 MiB），设置 25 MiB 守门上限防包体静默回潮。
+      maxTotalBytes: 25 * 1024 * 1024,
+    });
+    console.log(
+      `构建守门通过：${integrity.fileCount} 文件，总计 ${(integrity.totalBytes / 1024 / 1024).toFixed(2)} MiB，CSS 资源 ${integrity.cssAssetCount} 个`,
+    );
   } else throw new Error("packages/web/dist 里没有 Tailwind CSS：先构建上游 Web");
 } else {
   throw new Error("packages/web/dist 不存在：先构建上游 Web");

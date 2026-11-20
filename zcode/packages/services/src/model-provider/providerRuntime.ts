@@ -179,15 +179,13 @@ function createSettingsMutationTarget(
       ),
     refresh: (reason) => registryService.refresh(reason),
     refreshSources: async (reason) => {
-      const sourceResults = await Promise.allSettled([
+      const [, accountResult] = await Promise.allSettled([
         configRuntime.refreshZCodeBuiltin({ force: true }),
         accountSource.refresh?.(reason) ?? Promise.resolve(),
       ]);
+      // 同步上游 v3.18.2：远端 builtin 刷新失败不应回滚本地配置或掩盖账号刷新结果。
       const snapshot = await registryService.refresh(reason);
-      const failed = sourceResults.find(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
-      );
-      if (failed) throw failed.reason;
+      if (accountResult.status === "rejected") throw accountResult.reason;
       return snapshot;
     },
   };

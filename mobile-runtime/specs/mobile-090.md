@@ -11,3 +11,15 @@
 - 子会话虽由父轮驱动而没有独立run句柄，正文仍复用5秒合并检查点；切后台保存两者，重启不恢复虚构的子代理运行者。
 - 每轮保存请求实际modelId/providerId与token，模型切换后历史不改归属。
 - 验收包含竖屏抽屉与横屏恢复、开关期间主线程响应、模型A/B统计、子会话重启与隐藏、记忆跨会话开关、活动原生网络、旧SAF路径Git/历史连续性。
+
+## 验证方式
+
+- `node mobile-runtime/build/mobile-090-smoke.mjs`
+- `node mobile-runtime/build/mobile-090-e2e.mjs`
+- `node mobile-runtime/build/audit-shiki-versions.mjs`
+- `node mobile-runtime/build/bundle-guard-smoke.mjs`
+- `node mobile-runtime/build/quota-transport-smoke.mjs`
+- `node mobile-runtime/build/start-plan-promo-smoke.mjs`
+- `node mobile-runtime/build/workspace-realpath-smoke.mjs`
+- `node mobile-runtime/build/taskindex-node-smoke.mjs`
+- `node mobile-runtime/build/memory-mobile-smoke.mjs`

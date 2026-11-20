@@ -42,7 +42,7 @@ import {
   IClientScenesService,
   IFileWatcherService,
 } from "@zcode/services";
-import { ZCODE_VERSION, buildRuntimeZCodeEndpointUrls } from "@zcode/shared";
+import { buildRuntimeZCodeEndpointUrls } from "@zcode/shared";
 import { createClientConfigService } from "@zcode/services/deep/client-config/clientConfigService.js";
 import { createClientScenesService } from "@zcode/services/deep/client-scenes/clientScenesService.js";
 import { createQueuePair, ChannelServer } from "@zcode/rpc";
@@ -75,6 +75,10 @@ import { createMobileProviderRuntime } from "./providers.js";
 import { createMobileCredentialService, credentialEngine } from "./credentials.js";
 import { createFetchApiClient, createMobileOAuthService, createTracedOAuthService } from "./oauth.js";
 import { createQuotaApiClient } from "./quota-transport.js";
+import {
+  installMobilePromoVerificationHook,
+  reportStartPlanActivationEvents,
+} from "./promo-claim.js";
 import { createMobileAccountSource, createMobileAccountRequestAuthService } from "./account.js";
 import { createUsageStatsService } from "@zcode/services/deep/usage-stats/usageStatsService.js";
 import { createMobileAgentService } from "./agent.js";
@@ -89,7 +93,7 @@ import { createMobileSystemService } from "./system.js";
 import { createMobileUsageStatsService } from "./usage-stats.js";
 import { createMobileMemoryContext } from "./memory-context.js";
 import { createMobileFileWatcherService } from "./file-watcher.js";
-import { desktopCompatibilityVersion } from "./server-compat.js";
+import { officialCompatibilityVersion } from "./server-compat.js";
 import { createToolEngineFactory } from "./tool-engine.js";
 import { createMobileMcpRuntime } from "./mcp-runtime.js";
 import { localWorkspacePath } from "../compat/workspace-aliases.mjs";
@@ -247,6 +251,12 @@ export async function createMobileServices(options: {
   }
   const credentialService = credentialsAvailable ? createMobileCredentialService() : null;
   const apiClient = createFetchApiClient();
+  // 共享同一个官方域 ApiClient 实例：zaiStartPlanBilling 的 inflightBalanceRequests
+  // 按 ApiClient 引用建 WeakMap 去重与 429 冷却，accountSource / usageEntitlement / subscription
+  // 必须共用同一实例，避免打开设置页时并发重复打爆 /billing/balance 触发 HTTP 429。
+  const hasNativeHttpBridge =
+    typeof (globalThis as { zcodeGitHttp?: unknown }).zcodeGitHttp === "object";
+  const officialApiClient = hasNativeHttpBridge ? createQuotaApiClient() : apiClient;
 
   // 服务端 entitlement（0.7.3，用户报"体验套餐仍然无法查看、活动领取界面也看不到"）。
   // App Usage 屏继续读本机 sessionStore 聚合；但套餐额度、体验套餐预览、活动领取/重置机会
@@ -257,13 +267,12 @@ export async function createMobileServices(options: {
   let usageEntitlementUpstream: ReturnType<typeof createUsageStatsService> | null = null;
   if (credentialService) {
     try {
-      const quotaApiClient = createQuotaApiClient();
       usageEntitlementUpstream = createUsageStatsService({
-        apiClient: quotaApiClient as never,
+        apiClient: officialApiClient as never,
         accountRequestAuthService: createMobileAccountRequestAuthService({
           credentialService,
           settingService,
-          apiClient: quotaApiClient,
+          apiClient: officialApiClient,
         }),
         credentialService,
         // 只为满足形状：getAppUsageSnapshot 由端侧本地聚合实现，上游这一格永远不会被调到；
@@ -320,7 +329,7 @@ export async function createMobileServices(options: {
               const created = createMobileAccountSource({
                 credentialService,
                 settingService,
-                apiClient,
+                apiClient: officialApiClient,
                 configSource: configService as never,
               });
               codingPlanApiKey = created.resolveCodingPlanApiKey;
@@ -500,7 +509,7 @@ export async function createMobileServices(options: {
     { name: "clientConfigService", descriptor: IClientConfigService, make: () => createClientConfigService({
       apiClient: apiClient as never,
       resolveRequestContext: () => ({endpointOrigin:buildRuntimeZCodeEndpointUrls({}).origin,
-        appVersion:desktopCompatibilityVersion(ZCODE_VERSION), platform:"linux-arm64"}),
+        appVersion:officialCompatibilityVersion(), platform:"linux-arm64"}),
     }) },
     { name: "clientScenesService", descriptor: IClientScenesService, make: () => createClientScenesService({apiClient:apiClient as never}) },
     { name: "settingsSyncService", descriptor: ISettingsSyncService, make: () => createSettingsSyncService({ settingService }) },
@@ -552,18 +561,25 @@ export async function createMobileServices(options: {
           { name: "oauthService", descriptor: IOAuthService, make: () => createTracedOAuthService(createMobileOAuthService(credentialService)) },
         ]
       : []),
-    // 体验套餐（StartPlanCard/套餐列表）：只读公开的 client/configs，apiClient 用 fetch 版。
-    // 闭包实测 279 模块 / 1.20 MB / 0 缺失垫片（probe-ui-closure）；resolveOffPeakModelSelectionView
-    // 只有 getOffPeakClientConfig 会用，端侧 P0 没有闲时任务面，不给即 undefined——不拖 providerRuntime 进来。
-    // 凭据桥不在时用只读替身：预览能读，购买/余额类接口拿不到 token 就如实报错，不假装有权益。
+    // Start Plan 赠送活动预览/领取（billing/preview、billing/claim、marketing/touch）与 client/configs：
+    // 若 Native HTTP 桥就绪，走 createQuotaApiClient（带完整 ZCode 官方头，且绕过 WebView CORS）；
+    // 纯 Node/浏览器自检时回退到 fetch apiClient。
     {
       name: "codingPlanSubscriptionService",
       descriptor: ICodingPlanSubscriptionService,
-      make: () =>
-        createCodingPlanSubscriptionService({
-          apiClient,
+      make: () => {
+        installMobilePromoVerificationHook();
+        if (hasNativeHttpBridge && credentialService) {
+          void reportStartPlanActivationEvents({
+            apiRequest: (url, init) => officialApiClient.request(url, init),
+            loadJwt: () => credentialService.load("zcodejwttoken"),
+          });
+        }
+        return createCodingPlanSubscriptionService({
+          apiClient: officialApiClient as never,
           credentialService: credentialService ?? { load: async () => null },
-        }),
+        });
+      },
     },
     {
       name: "zcodeTaskService",

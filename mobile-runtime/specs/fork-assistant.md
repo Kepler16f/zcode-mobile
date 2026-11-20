@@ -69,3 +69,8 @@
 渲染入口，并把该轮的**最后一段**助手回复作为目标）。因此端侧在轮次收口时
 给该轮最后一段已完成且有正文的助手回复盖上 `canFork`，其余助手行不带这格——
 UI 不会把分叉按钮挂到中间段落上。
+
+## 验证方式
+
+- `node mobile-runtime/build/fork-assistant-smoke.mjs`
+- `node mobile-runtime/build/fork-ui-e2e.mjs`

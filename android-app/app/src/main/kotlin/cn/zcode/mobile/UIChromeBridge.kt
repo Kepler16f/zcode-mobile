@@ -78,9 +78,26 @@ class UIChromeBridge(
     var drawerOpen: Boolean = false
         private set
 
+    /**
+     * 设置层是否打开：打开期间放行左侧全面屏返回手势，并让系统返回键优先退出设置回到主页，
+     * 避免从设置页按返回键直接把整个应用退回桌面/关闭。
+     */
+    @Volatile
+    var inSettings: Boolean = false
+        private set
+
+    var onNavStateChanged: (() -> Unit)? = null
+
     @JavascriptInterface
     fun setDrawerOpen(open: Boolean) {
         drawerOpen = open
+    }
+
+    @JavascriptInterface
+    fun setInSettings(open: Boolean) {
+        if (inSettings == open) return
+        inSettings = open
+        activity.runOnUiThread { onNavStateChanged?.invoke() }
     }
 
     private fun prefs() = activity.getSharedPreferences("zcode-ui-chrome", Context.MODE_PRIVATE)

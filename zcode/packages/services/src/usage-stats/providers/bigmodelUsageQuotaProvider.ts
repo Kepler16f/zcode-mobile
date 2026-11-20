@@ -445,8 +445,13 @@ export class BigModelUsageQuotaProvider {
       };
     }
 
+    const balances = readZaiStartPlanBalances(balancePayload);
+    const normalizedBalances = normalizeZaiStartPlanBalanceLimits(
+      balances,
+      balancePayload.data?.plans,
+    );
     const currentPlan = pickCurrentZaiStartPlan(balancePayload.data?.plans);
-    if (!currentPlan) {
+    if (!currentPlan && normalizedBalances.length === 0) {
       return {
         generatedAt,
         authenticated: true,
@@ -462,10 +467,7 @@ export class BigModelUsageQuotaProvider {
       };
     }
 
-    warnOnUnattributedStartPlanBuckets(
-      balancePayload.data?.plans,
-      readZaiStartPlanBalances(balancePayload),
-    );
+    warnOnUnattributedStartPlanBuckets(balancePayload.data?.plans, balances);
 
     return {
       generatedAt,
@@ -476,14 +478,16 @@ export class BigModelUsageQuotaProvider {
       ...(typeof balancePayload.data?.server_time === "number" &&
       Number.isFinite(balancePayload.data.server_time) &&
       balancePayload.data.server_time >= 0
-        ? { serverTime: balancePayload.data.server_time * 1_000 }
+        ? {
+            serverTime:
+              balancePayload.data.server_time > 1e11
+                ? balancePayload.data.server_time
+                : balancePayload.data.server_time * 1_000,
+          }
         : {}),
-      remaining: buildZaiStartPlanRemaining(readZaiStartPlanBalances(balancePayload)),
-      subscription: buildZaiStartPlanSubscription(balancePayload.data?.plans),
-      quota: buildZaiStartPlanQuota(
-        readZaiStartPlanBalances(balancePayload),
-        balancePayload.data?.plans,
-      ),
+      remaining: buildZaiStartPlanRemaining(balances),
+      subscription: buildZaiStartPlanSubscription(balancePayload.data?.plans, balances),
+      quota: buildZaiStartPlanQuota(balances, balancePayload.data?.plans),
     };
   }
 
@@ -1216,10 +1220,43 @@ function buildSubscriptionSnapshot(summary: {
 
 function buildZaiStartPlanSubscription(
   plans: ZaiStartPlanPlan[] | undefined,
+  balances?: ZaiStartPlanBalance[] | undefined,
 ): UsageEntitlementSnapshot["subscription"] {
   const activePlans = (plans ?? []).filter(
     (plan) => readNonEmptyString(plan.status)?.toLowerCase() === "active",
   );
+  if (activePlans.length === 0 && balances?.length) {
+    // 部分赠送活动在 balances 已下发可用额度桶但 plans 为空或状态名非 active 时，
+    // 按 balances 的 plan_id 聚合出可展示的套餐条目，避免已领取额度在设置页隐身。
+    const seen = new Map<string, ZaiStartPlanBalance>();
+    for (const balance of balances) {
+      const pid = readNonEmptyString(balance.plan_id) ?? "start-plan";
+      const key = pid.toLowerCase();
+      if (!seen.has(key)) seen.set(key, balance);
+    }
+    return {
+      identityType: "unknown",
+      identityMasked: null,
+      details: [...seen.values()].map((balance) => ({
+        productId: readNonEmptyString(balance.plan_id) ?? "start-plan",
+        productName: readNonEmptyString(balance.show_name) ?? "Start Plan",
+        purchaseTime: null,
+        beginTime: formatUnixSecondsAsIso(balance.period_start),
+        billingCycle: null,
+        renewTime: null,
+        expireTime: formatUnixSecondsAsIso(balance.expires_at ?? balance.period_end),
+        entitlements: readNonEmptyString(balance.entitlement_id)
+          ? [
+              {
+                entitlementId: readNonEmptyString(balance.entitlement_id)!,
+                showName: readNonEmptyString(balance.show_name),
+                effectiveTime: formatUnixSecondsAsIso(balance.period_start),
+              },
+            ]
+          : [],
+      })),
+    };
+  }
   return {
     identityType: "unknown",
     identityMasked: null,
@@ -1327,9 +1364,11 @@ function normalizeZaiStartPlanBalanceLimits(
     .map((balance) => {
       const total = parseNumber(balance.total_units);
       const used = parseNumber(balance.used_units);
-      // Start Plan 余额卡必须展示后端给出的 remaining_units。
-      // available_units 会再扣除进行中请求的 reserved_units，不能作为“剩余”兜底。
-      const remaining = parseNumber(balance.remaining_units);
+      // 优先展示后端给出的 remaining_units；仅当缺失时兜底 available_units 或 total - used。
+      const remaining =
+        parseNumber(balance.remaining_units) ??
+        parseNumber(balance.available_units) ??
+        (total !== null && used !== null ? Math.max(0, total - used) : null);
       if (total === null && used === null && remaining === null) {
         return null;
       }
@@ -1410,15 +1449,17 @@ function parseNumber(value: number | string | null | undefined): number | null {
 }
 
 function pickCurrentZaiStartPlan(plans: ZaiStartPlanPlan[] | undefined): ZaiStartPlanPlan | null {
+  const activePlans =
+    plans?.filter((plan) => readNonEmptyString(plan.status)?.toLowerCase() === "active") ?? [];
+  if (activePlans.length === 0) {
+    return null;
+  }
   return (
-    plans?.find((plan) => {
-      const status = readNonEmptyString(plan.status)?.toLowerCase();
+    activePlans.find((plan) => {
       const planId = readNonEmptyString(plan.plan_id)?.toLowerCase();
       const name = readNonEmptyString(plan.name)?.toLowerCase();
-      return (
-        status === "active" && (isZaiStartPlanIdentity(planId) || isZaiStartPlanIdentity(name))
-      );
-    }) ?? null
+      return isZaiStartPlanIdentity(planId) || isZaiStartPlanIdentity(name);
+    }) ?? activePlans[0]!
   );
 }
 
@@ -1499,7 +1540,7 @@ function parseUnixSeconds(value: number | string | null | undefined): number | n
     return null;
   }
 
-  return numericValue;
+  return numericValue > 1e11 ? numericValue / 1000 : numericValue;
 }
 
 function buildUsageMonitorUrl(

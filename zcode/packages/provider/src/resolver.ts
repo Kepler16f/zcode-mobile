@@ -254,13 +254,23 @@ export class ProviderConfigResolver {
       const providerExecutable =
         enabled && accessEntitled && accountCurrent && providerIssues.length === 0;
       const models = orderedModelIds.map((modelId): ResolvedProviderModel => {
-        const modelConfig = effectiveModelRules.resolve({
+        const rawModelConfig = effectiveModelRules.resolve({
           providerId,
           templateId,
           modelId,
           apiType: config.api?.type,
           baseUrl: config.api?.baseUrl,
         });
+        // Start Plan 的 builtinIds 是 /billing/balance 动态下发的真实可调用模型白名单；
+        // 活动赠送的新模型即便在旧规则中缺省 enabled，只要用户未显式禁用（enabled !== false），
+        // 就在校验前补齐 enabled: true，避免被完整度校验拦截。
+        const modelConfig =
+          config.access?.type === "zhipu-account" &&
+          config.access.mode === "start-plan" &&
+          builtinIds.has(modelId) &&
+          rawModelConfig.enabled === undefined
+            ? rawModelConfig.overlay(new ModelConfig({ enabled: true }))
+            : rawModelConfig;
         const effectiveBuiltinConfig = input.zcodeBuiltinModelRules.resolve({
           providerId,
           templateId,

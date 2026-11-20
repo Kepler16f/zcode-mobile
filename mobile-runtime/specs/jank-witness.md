@@ -9,3 +9,7 @@
 - 证人表覆盖全部同步原生桥族：fs/tree/sqlite/exec/browser/device/githttp/model。model 是原生模型流桥——模型响应逐块在 UI 线程上同步 poll，不在表里就归因不到它。
 - 读数只有一份：`localStorage["zcode-mobile.jank.diag"]` 同时装冻结样本、桥计数与最慢单次，自检报告一条读数即可回答"堵了多久、堵在哪一下"。
 - 验收：Node 侧冒烟（`build/jank-witness-smoke.mjs`）覆盖装壳透明、计数形状、慢调用落盘、心跳 gap 归因、后台不误记、模型桥入表与 phase 节流。
+
+## 验证方式
+
+- `node mobile-runtime/build/jank-witness-smoke.mjs`

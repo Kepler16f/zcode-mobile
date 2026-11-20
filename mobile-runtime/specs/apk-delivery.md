@@ -24,3 +24,10 @@ packageDebug → 重压条目（等级 9）→ zipalign -p -f 4 → apksigner �
 - **收益**：0.10.0 实测 17,138,665 B → 12,888,672 B（省 4.25 MB），比 0.9.2 的 14,652,462 B
   还小 1.76 MB，而这一版多了会话分叉、子代理后台、Git 面板与文件监视四项能力。
 - 只对 debug 变体做；release 变体本身就使用较高等级。
+
+## 验证方式
+
+- `node mobile-runtime/build/apk-delivery-smoke.mjs`
+- `node mobile-runtime/build/verify-repacked-apk.mjs`
+- `node mobile-runtime/build/bundle-guard-smoke.mjs`
+- `node mobile-runtime/build/ui-assets-smoke.mjs`

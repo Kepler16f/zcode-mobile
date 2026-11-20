@@ -8,3 +8,10 @@
 - 旧接口继续用于自检及旧宿主；新增 JS 调用方优先使用异步协议并透传取消信号。
 
 验收覆盖：输入 EOF、并发大输出、超时和取消；异步等待时事件循环可运行；重定向敏感头策略；非可信页面无法在主 WebView 加载；无桥时返回结构化失败。
+
+## 验证方式
+
+- `node mobile-runtime/build/native-async-smoke.mjs`
+- `node mobile-runtime/build/bridge-async-smoke.mjs`
+- `node mobile-runtime/build/bridge-contract-check.mjs`
+- `node mobile-runtime/build/egress-ssrf-smoke.mjs`

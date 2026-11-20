@@ -112,6 +112,7 @@ let lastKey = "";
  * 桥不在（桌面 harness）时静默 no-op；状态只在变化时推（幂等，避免每帧空转）。
  */
 let lastPushedDrawerOpen: boolean | null = null;
+let lastPushedInSettings: boolean | null = null;
 /** 右侧抽屉开合的缓存投影：观察器更新它，sync() 只读值，不再每帧查一次全文档。 */
 let sideDrawerOpen = false;
 function pushDrawerOpen(open: boolean): void {
@@ -124,6 +125,49 @@ function pushDrawerOpen(open: boolean): void {
   } catch {
     // 桥调用失败不致命：返回键拦截退化成默认行为（退出），抽屉本身不受影响。
   }
+}
+
+function isSettingsPageOpen(): boolean {
+  const d = doc();
+  if (!d) return false;
+  return (
+    coveredBySettingsLayer() ||
+    d.querySelector('[data-testid="settings-back-button"]') != null
+  );
+}
+
+function pushInSettings(open: boolean): void {
+  if (lastPushedInSettings === open) return;
+  lastPushedInSettings = open;
+  try {
+    (globalThis as { zcodeUi?: { setInSettings?(open: boolean): void } }).zcodeUi?.setInSettings?.(open);
+  } catch {
+    // 桥调用失败不致命
+  }
+}
+
+function handleNativeBack(): boolean {
+  const d = doc();
+  if (!d) return false;
+  // 若当前有打开的弹窗（如检查更新对话框），先关闭弹窗，再退回主页。
+  const openDialog = d.querySelector<HTMLElement>('[role="dialog"][data-state="open"]');
+  if (openDialog) {
+    const closeBtn =
+      openDialog.querySelector<HTMLElement>('[data-slot="dialog-close"]') ??
+      openDialog.querySelector<HTMLElement>('button[aria-label="Close"], button[aria-label="关闭"]');
+    if (closeBtn) {
+      closeBtn.click();
+      return true;
+    }
+    openDialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    return true;
+  }
+  const settingsBack = d.querySelector<HTMLElement>('[data-testid="settings-back-button"]');
+  if (settingsBack) {
+    settingsBack.click();
+    return true;
+  }
+  return false;
 }
 
 /** 右侧抽屉的真实状态（面板用 aria-hidden 表达开关）。流式期 sync 每帧都会调它。 */
@@ -164,6 +208,8 @@ function coveredBySettingsLayer(): boolean {
  */
 
 function sync(): void {
+  const inSettings = isSettingsPageOpen();
+  pushInSettings(inSettings);
   const panel = sidebar();
   if (!panel) {
     // 0.6.0（用户报"侧边栏进设置整个画面变暗，点一下才恢复"）：进设置页这类整页导航会把
@@ -177,7 +223,7 @@ function sync(): void {
     return;
   }
   // 覆盖态走与"面板没了"同一套收场：遮罩离场 + 投影复位（返回时重建）。
-  if (coveredBySettingsLayer()) {
+  if (inSettings) {
     hideScrim();
     lastPanel = null;
     lastKey = "";
@@ -573,11 +619,12 @@ export function installNarrowSidebarDrawer(): void {
     if (tf === "") return false; // 没被投影成抽屉（不该在窄屏出现，保守当关）
     return !/translateX\(\s*-/.test(tf); // 含负位移 = 移出左缘 = 关；translateX(0) = 开
   };
+  (globalThis as { __zcodeHandleBack?: () => boolean }).__zcodeHandleBack = handleNativeBack;
   d.addEventListener(
     "touchstart",
     (event) => {
       const t = event.touches?.[0];
-      if (!isDrawerMode() || !t) {
+      if (!isDrawerMode() || !t || isSettingsPageOpen()) {
         swipe = null;
         return;
       }

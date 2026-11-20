@@ -39,12 +39,14 @@ internal class AsyncBridgeJobs {
         val job = Job()
         jobs[id] = job
         Thread {
-            job.result = try {
+            val resultJson = try {
                 operation(job)
             } catch (e: Exception) {
                 JSONObject().put("error", "${e.javaClass.simpleName}: ${e.message}").toString()
             }
+            job.result = resultJson
             job.completedAt = System.currentTimeMillis()
+            emitDone(id, resultJson)
         }.apply { isDaemon = true; start() }
         return JSONObject().put("id", id).toString()
     }
@@ -56,6 +58,21 @@ internal class AsyncBridgeJobs {
         return JSONObject().put("done", true).put("result", JSONObject(result)).toString()
     }
 
+    fun ack(id: String): Boolean {
+        val job = jobs[id] ?: return false
+        if (job.result == null) return false
+        return jobs.remove(id, job)
+    }
+
+    private fun emitDone(id: String, resultJson: String) {
+        val envelope = try {
+            JSONObject().put("done", true).put("result", JSONObject(resultJson))
+        } catch (_: Exception) {
+            return
+        }
+        emitScript("window.__zcodeJobDone?.(${JSONObject.quote(id)}, $envelope)")
+    }
+
     fun cancel(id: String): Boolean {
         // 取消后调用方仍需等任务收口，才能安全回写文件；poll 取走结果时再移出表。
         val job = jobs[id] ?: return false
@@ -65,8 +82,25 @@ internal class AsyncBridgeJobs {
 
     fun cancelAll() { jobs.values.forEach { it.cancel() } }
 
-    private companion object {
-        const val MAX_JOBS = 64
-        const val RETENTION_MS = 10 * 60 * 1000L
+    companion object {
+        private const val MAX_JOBS = 64
+        private const val RETENTION_MS = 10 * 60 * 1000L
+
+        @Volatile
+        private var scriptEmitter: ((String) -> Unit)? = null
+
+        fun attachEmitter(emitter: (String) -> Unit) {
+            scriptEmitter = emitter
+        }
+
+        fun detachEmitter(emitter: (String) -> Unit) {
+            if (scriptEmitter === emitter) {
+                scriptEmitter = null
+            }
+        }
+
+        fun emitScript(script: String) {
+            scriptEmitter?.invoke(script)
+        }
     }
 }
