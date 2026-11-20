@@ -66,6 +66,19 @@ try {
   const midFirst = received.headers["x-device-mid"];
   await createQuotaApiClient().request("https://zcode.z.ai/api/v1/zcode-plan/billing/balance", {});
   assert.equal(received.headers["x-device-mid"], midFirst, "Device-Mid 没有跨请求持久化");
+  // ②' 端点迁移（0.12.3）：Start Plan 的 anthropic 请求重写到 open.bigmodel.cn。
+  await createQuotaApiClient().request("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages", {
+    method: "POST",
+    headers: { Authorization: "Bearer jwt-token", "x-api-key": "jwt-token" },
+  });
+  assert.equal(
+    received.url,
+    "https://open.bigmodel.cn/api/anthropic/v1/messages",
+    "zcode-plan/anthropic 没有重写到 open.bigmodel.cn（旧端点已 405）",
+  );
+  assert.equal(received.headers.authorization, "Bearer jwt-token", "迁移后 Authorization 丢失");
+  assert.equal(received.headers["x-api-key"], "jwt-token", "迁移后 x-api-key 丢失");
+  assert.equal(received.headers["x-platform"], "linux-arm64", "迁移后身份头丢失");
   // ② 外部域名：零注入（其余出网面行为不变）。
   await createQuotaApiClient().request("https://api.github.com/repos/x", {});
   assert.equal(received.headers["x-platform"], undefined, "外部域被误注入上下文头");

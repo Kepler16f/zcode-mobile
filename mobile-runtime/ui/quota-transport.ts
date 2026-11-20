@@ -245,10 +245,35 @@ export function officialIdentityRequest(
     return { url: input instanceof URL ? input : new URL("https://zcode.z.ai"), headers };
   }
   if (!isContextHost(parsed)) return { url: parsed, headers };
+  parsed = rewriteOfficialUrl(parsed);
+  return { url: parsed, headers: mergeContextHeaders(parsed, headers) };
+}
+
+/** 端点迁移（0.12.3，官方 3.18.2 asar 实证）：Start Plan / Coding Plan 的 anthropic
+ * 模型请求已从 zcode.z.ai 的 `/api/v1/zcode-plan/anthropic` **迁到**
+ * `https://open.bigmodel.cn/api/anthropic`——旧端点对新版凭据回
+ * 405 "This client is not supported. Please use the official ZCode client."
+ * （2026-11-21 实测：旧端点 POST 405；open.bigmodel.cn 无凭据 401"未收到
+ * Authorization"、假凭据 401"令牌已过期"＝端点活着且双腿都读）。provider 配置
+ * 快照里的 baseUrl（服务端/装配下发）仍是旧形状，出网前在此归一。
+ * 返回新 URL（含 app_version 归一）；非官方域原样。 */
+function rewriteOfficialUrl(input: URL): URL {
+  if (!isContextHost(input)) return input;
+  let parsed = input;
+  if (
+    parsed.pathname === "/api/v1/zcode-plan/anthropic" ||
+    parsed.pathname.startsWith("/api/v1/zcode-plan/anthropic/")
+  ) {
+    const rewritten = new URL("https://open.bigmodel.cn/api/anthropic");
+    rewritten.pathname =
+      "/api/anthropic" + parsed.pathname.slice("/api/v1/zcode-plan/anthropic".length);
+    rewritten.search = parsed.search;
+    parsed = rewritten;
+  }
   if (parsed.searchParams.has("app_version")) {
     parsed.searchParams.set("app_version", officialVersion());
   }
-  return { url: parsed, headers: mergeContextHeaders(parsed, headers) };
+  return parsed;
 }
 
 /** 只取头（URL 归一结果由调用方自行处理时用；**注意** app_version 归一不会体现在返回值里）。 */
@@ -267,13 +292,9 @@ export function createQuotaApiClient(): MobileApiClient {
         ? rest.signal ? AbortSignal.any([rest.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs)
         : rest.signal;
       const url = rewritePlatformForServer(input);
-      const parsed = url instanceof URL ? url : new URL(url, globalThis.location?.href ?? "https://zcode.z.ai");
-      // 0.11.4：zcode-plan 端点的 app_version 同口径归一——上游用 ZCODE_VERSION
-      // （仓库构建=0.0.0-dev）填参，服务端 3001 parameter error。与上下文头同一
-      // 官方版本来源（desktopCompatibilityVersion 覆盖优先，缺省当前官方发行版）。
-      if (isContextHost(parsed) && parsed.searchParams.has("app_version")) {
-        parsed.searchParams.set("app_version", officialVersion());
-      }
+      // 0.12.3：官方域统一归一（Start Plan anthropic 端点迁移 + app_version 口径）。
+      let parsed = url instanceof URL ? new URL(url.href) : new URL(url, globalThis.location?.href ?? "https://zcode.z.ai");
+      parsed = rewriteOfficialUrl(parsed);
       const callerHeaders = Object.fromEntries(new Headers(rest.headers).entries());
       const contextHeaders = mergeContextHeaders(parsed, callerHeaders);
       const diagBase = {
