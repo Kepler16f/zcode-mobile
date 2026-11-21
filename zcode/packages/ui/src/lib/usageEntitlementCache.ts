@@ -2,7 +2,10 @@ import type { UsageEntitlementSnapshot } from "@zcode/shared";
 
 // 旧缓存可能由 quota level 合成订阅；切换命名空间避免升级后恢复伪权益。
 const USAGE_ENTITLEMENT_CACHE_PREFIX = "zcode:usage-entitlement:subscription-v2:";
-export const USAGE_ENTITLEMENT_CACHE_TTL_MS = 10 * 60 * 1000;
+// 0.12.4（用户报"额度在别处使用后进度条不同步"）：10 分钟 TTL 让他处消耗的额度在
+// 手机上最长滞后 10 分钟。90 秒＝打开供应商页时的静默校正间隔足够短，又不至于每次
+// 渲染都打 balance（balance 端有 1s inflight 去重兜底，见 zaiStartPlanBilling.ts）。
+export const USAGE_ENTITLEMENT_CACHE_TTL_MS = 90 * 1000;
 
 interface CachedUsageEntitlementSnapshot {
   cachedAt: number;

@@ -249,27 +249,15 @@ export function officialIdentityRequest(
   return { url: parsed, headers: mergeContextHeaders(parsed, headers) };
 }
 
-/** 端点迁移（0.12.3，官方 3.18.2 asar 实证）：Start Plan / Coding Plan 的 anthropic
- * 模型请求已从 zcode.z.ai 的 `/api/v1/zcode-plan/anthropic` **迁到**
- * `https://open.bigmodel.cn/api/anthropic`——旧端点对新版凭据回
- * 405 "This client is not supported. Please use the official ZCode client."
- * （2026-11-21 实测：旧端点 POST 405；open.bigmodel.cn 无凭据 401"未收到
- * Authorization"、假凭据 401"令牌已过期"＝端点活着且双腿都读）。provider 配置
- * 快照里的 baseUrl（服务端/装配下发）仍是旧形状，出网前在此归一。
- * 返回新 URL（含 app_version 归一）；非官方域原样。 */
+/** app_version 归一（0.11.4）：上游用 ZCODE_VERSION（仓库构建=0.0.0-dev）填参，服务端
+ * 3001 parameter error。官方发行版本号可经 desktopCompatibilityVersion 覆盖。 */
 function rewriteOfficialUrl(input: URL): URL {
   if (!isContextHost(input)) return input;
-  let parsed = input;
-  if (
-    parsed.pathname === "/api/v1/zcode-plan/anthropic" ||
-    parsed.pathname.startsWith("/api/v1/zcode-plan/anthropic/")
-  ) {
-    const rewritten = new URL("https://open.bigmodel.cn/api/anthropic");
-    rewritten.pathname =
-      "/api/anthropic" + parsed.pathname.slice("/api/v1/zcode-plan/anthropic".length);
-    rewritten.search = parsed.search;
-    parsed = rewritten;
-  }
+  const parsed = input;
+  // 0.12.4 回滚：0.12.3 曾把 zcode-plan/anthropic 迁到 open.bigmodel.cn（Coding Plan 的
+  // 端点）——方向错误。Start Plan（赠送试用 token）与 Coding Plan（付费订阅）是两个
+  // 不同的额度体系，模型请求都走 zcode.z.ai 的 zcode-plan 网关；405 是服务端**客户端
+  // 身份校验**（"请用官方 ZCode 客户端"），不是端点废弃。
   if (parsed.searchParams.has("app_version")) {
     parsed.searchParams.set("app_version", officialVersion());
   }

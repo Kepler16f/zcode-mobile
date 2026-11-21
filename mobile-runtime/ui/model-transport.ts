@@ -29,7 +29,15 @@ interface ModelDiagEntry {
   dangerousBrowserHeader: boolean;
   hasZcodeAgent: boolean;
   status?: number;
+  errorBody?: string;
   error?: string;
+}
+
+/** 从取证 Packet 收集错误响应体（前 300 字）；无 body/解不了返回空串。 */
+async function readErrorBodySnippet(packet: Packet): Promise<string> {
+  if (!packet.bodyBase64) return "";
+  const raw = atob(packet.bodyBase64);
+  return raw.slice(0, 300);
 }
 
 function recordModelDiag(entry: ModelDiagEntry): void {
@@ -200,13 +208,22 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
     }
     const status = initial.status!;
     const headers = initial.headers;
-    recordModelDiag({
+    // 0.12.4：4xx/5xx 时把响应体前 300 字也记进取证——405 "This client is not
+    // supported" 这类服务端判定，只有响应体能给出"到底差在哪"（缺什么头/什么参数）。
+    const diagStatusEntry: ModelDiagEntry = {
       at: Date.now(),
       url,
       dangerousBrowserHeader: headerHas(diagHeaders, "anthropic-dangerous-direct-browser-access"),
       hasZcodeAgent: headerHas(diagHeaders, "x-zcode-agent"),
       status,
-    });
+    };
+    if (status >= 400) {
+      // 收集完错误响应体（前 300 字）后再落盘；取证失败不影响响应回传。
+      const errorBody = await readErrorBodySnippet(initial).catch(() => "");
+      recordModelDiag({ ...diagStatusEntry, errorBody });
+    } else {
+      recordModelDiag(diagStatusEntry);
+    }
     let lastYieldAt = performance.now();
     const body = new ReadableStream<Uint8Array>({
       async pull(controller) {
