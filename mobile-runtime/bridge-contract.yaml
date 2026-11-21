@@ -248,12 +248,13 @@ bridges:
   zcodeUi:
     kotlinClass: UIChromeBridge
     kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/UIChromeBridge.kt
-    purpose: "系统深浅色主题同步、状态栏/刘海安全区 insets 与抽屉返回键协同"
+    purpose: "系统深浅色主题同步、状态栏/刘海安全区 insets、抽屉返回键协同与诊断入口开关"
     consumers:
       - mobile-runtime/ui/entry.tsx
       - mobile-runtime/ui/system-theme-media.ts
       - mobile-runtime/ui/system-insets.ts
       - mobile-runtime/ui/web-mobile-shell.ts
+      - zcode/packages/ui/src/settings/selfcheckEntryRow.tsx
     methods:
       name:
         arity: 0
@@ -284,6 +285,16 @@ bridges:
         arity: 1
         args: "open: Boolean"
         returns: "Unit"
+        errors: "无"
+      setSelfcheckEntry:
+        arity: 1
+        args: "visible: Boolean"
+        returns: "Unit"
+        errors: "无"
+      isSelfcheckEntryEnabled:
+        arity: 0
+        args: ""
+        returns: "Boolean"
         errors: "无"
 
   zcodeBrowser:
