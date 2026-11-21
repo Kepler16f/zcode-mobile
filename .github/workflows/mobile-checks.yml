@@ -59,7 +59,12 @@ jobs:
           node mobile-runtime/build/bridge-contract-check.mjs
           node mobile-runtime/build/specs-verify-check.mjs
       - name: Build mobile bundles
+        # bundle-ui 认 ZCODE_UI_METAFILE（模块图落盘）；audit-shiki-versions 从这里读
+        # shiki 版本组合。没有它 audit 在 CI 干净 checkout 上 ENOENT（tmp/ 是 gitignore，
+        # 本机残留文件不进仓库）。
         run: node mobile-runtime/build/build-mobile.mjs
+        env:
+          ZCODE_UI_METAFILE: tmp/shiki-metafile-090.json
       - name: Runtime regression checks
         run: |
           node mobile-runtime/build/bundle-guard-smoke.mjs
