@@ -82,10 +82,12 @@ class MainActivity : Activity() {
                 val target = if (webView.url?.startsWith(UI_PAGE) == true) SELFCHECK_PAGE else UI_PAGE
                 webView.loadUrl(target)
             }
-            visibility = if (intent?.getBooleanExtra(EXTRA_SHOW_SELFCHECK, false) == true) {
-                View.VISIBLE
-            } else {
-                View.GONE
+            // 0.12.5：adb 参数强制显示优先；否则读设置页"诊断入口"开关（zcode-ui-chrome prefs）。
+            // 默认关——0.9.1 的隐藏决定保留，但用户可从设置页自行打开（排查 405 需要）。
+            visibility = when {
+                intent?.getBooleanExtra(EXTRA_SHOW_SELFCHECK, false) == true -> View.VISIBLE
+                uiChrome.isSelfcheckEntryEnabled() -> View.VISIBLE
+                else -> View.GONE
             }
         }
 
@@ -268,6 +270,13 @@ class MainActivity : Activity() {
             // 系统栏主题（§1.5.19）：页面应用主题后调 setThemeDark 把布尔传进来，状态栏/导航/窗口底色
             // 跟着深浅色，不再被 themes.xml 写死成深色。
             addJavascriptInterface(uiChrome, "zcodeUi")
+            // 诊断入口开关（0.12.5）：设置页切换后即时生效（开关写 prefs + 调桥，桥回调这里）。
+            uiChrome.onSelfcheckEntryChanged = {
+                runOnUiThread {
+                    pageSwitch.visibility =
+                        if (uiChrome.selfcheckEntryEnabled) View.VISIBLE else View.GONE
+                }
+            }
             // 内置浏览器（0.6.0）：Browser 工具的 open/navigate/back/read/close 走这条桥。
             addJavascriptInterface(BrowserBridge(applicationContext), "zcodeBrowser")
             // Git 传输 HTTP 桥（0.6.7）：isomorphic-git 的 fetch 传输在 WebView 里被 CORS

@@ -31,6 +31,7 @@ import { DataBaseDirControl } from "@/settings/DataBaseDirControl.js";
 import { MobileCompatibilitySettings } from "@/settings/MobileCompatibilitySettings.js";
 import { AppVersionUpdateRow } from "@/settings/appVersionUpdateRow.js";
 import { KeepAliveNotificationRow } from "@/settings/keepAliveNotificationRow.js";
+import { SelfcheckEntryRow } from "@/settings/selfcheckEntryRow.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { useOptionalServices } from "@/hooks/useServices.js";
 import { ProactiveSuggestionsSetting } from "@/settings/ProactiveSuggestionsSetting.js";
@@ -287,6 +288,7 @@ export function GeneralSectionContent({
             两行都只在端侧原生桥在时渲染，桌面/网页宿主看不到它们。*/}
         <AppVersionUpdateRow />
         <KeepAliveNotificationRow />
+        <SelfcheckEntryRow />
         <SettingsRow
           label={intl.formatMessage({ id: "settings.locale" })}
           description={intl.formatMessage({ id: "settings.localeDescription" })}

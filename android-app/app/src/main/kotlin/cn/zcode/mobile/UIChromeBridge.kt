@@ -86,6 +86,12 @@ class UIChromeBridge(
     var inSettings: Boolean = false
         private set
 
+    /** 诊断入口（贴角小牌）是否可见：设置页开关写、Activity 读（0.12.5）。缺省关。 */
+    @Volatile
+    var selfcheckEntryEnabled: Boolean = false
+        private set
+
+    var onSelfcheckEntryChanged: (() -> Unit)? = null
     var onNavStateChanged: (() -> Unit)? = null
 
     @JavascriptInterface
@@ -98,6 +104,18 @@ class UIChromeBridge(
         if (inSettings == open) return
         inSettings = open
         activity.runOnUiThread { onNavStateChanged?.invoke() }
+    }
+
+    /**
+     * 诊断入口（0.12.5，用户排查 405 需要看自检报告）：设置页的"诊断入口"开关调这里。
+     * 写进 zcode-ui-chrome prefs（与 theme-dark 同文件）并即时生效；Activity 重建后
+     * onCreate 用 isSelfcheckEntryEnabled() 恢复可见性。缺省关（0.9.1 的隐藏决定保留）。
+     */
+    @JavascriptInterface
+    fun setSelfcheckEntry(visible: Boolean) {
+        prefs().edit().putBoolean(KEY_SELFCHECK_ENTRY, visible).apply()
+        selfcheckEntryEnabled = visible
+        activity.runOnUiThread { onSelfcheckEntryChanged?.invoke() }
     }
 
     private fun prefs() = activity.getSharedPreferences("zcode-ui-chrome", Context.MODE_PRIVATE)
@@ -149,6 +167,7 @@ class UIChromeBridge(
 
     companion object {
         const val KEY_DARK = "theme-dark"
+        const val KEY_SELFCHECK_ENTRY = "selfcheck-entry"
         val DARK = 0xFF161616.toInt()
         val LIGHT = 0xFFFFFFFF.toInt()
         val LIGHT_STATUS_BAR = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)

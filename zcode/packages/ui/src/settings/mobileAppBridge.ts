@@ -41,6 +41,16 @@ export type DeviceBridge = {
   deviceInfo?(): string;
 };
 
+/**
+ * 端侧原生桥：外壳 UI 状态（window.zcodeUi，UIChromeBridge）。
+ * 0.12.5 只暴露"诊断入口"贴角小牌的读写——设置页开关调这两条，
+ * Activity 侧读同一份 prefs 恢复可见性。
+ */
+export type UiChromeBridge = {
+  setSelfcheckEntry?(visible: boolean): void;
+  isSelfcheckEntryEnabled?(): boolean;
+};
+
 /** checkForUpdate 的回包。 */
 export type UpdateCheckResult = {
   ok?: boolean;
@@ -134,6 +144,12 @@ export function getNotifyBridge(): NotifyBridge | undefined {
 export function getDeviceBridge(): DeviceBridge | undefined {
   const bridge = (hostGlobal() as { zcodeDevice?: DeviceBridge }).zcodeDevice;
   return bridge && typeof bridge.deviceInfo === "function" ? bridge : undefined;
+}
+
+/** 外壳 UI 状态桥（诊断入口开关的读写面）。 */
+export function getUiChromeBridge(): UiChromeBridge | undefined {
+  const bridge = (hostGlobal() as { zcodeUi?: UiChromeBridge }).zcodeUi;
+  return bridge && typeof bridge.setSelfcheckEntry === "function" ? bridge : undefined;
 }
 
 /**

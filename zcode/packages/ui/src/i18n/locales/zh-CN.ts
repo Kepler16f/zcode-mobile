@@ -2029,6 +2029,8 @@ const zhCN: Record<string, string> = {
   "settings.keepAliveNotification": "后台保活通知",
   "settings.keepAliveNotificationDescription": "会话运行时保持应用存活，并在后台持续回复。",
   "settings.keepAliveNotification.needsPermission": "需要通知权限才能开启后台保活",
+  "settings.selfcheckEntry": "诊断入口",
+  "settings.selfcheckEntryDescription": "在主界面贴角显示自检小牌，可在应用内查看诊断报告。",
   "settings.systemTitle": "常规",
   "settings.systemDescription": "这些设置会影响当前窗口的显示与交互。",
   "settings.locale": "界面语言",

@@ -2165,6 +2165,9 @@ const enUS: Record<string, string> = {
     "Keeps the app alive while a session is running and keeps replying in the background.",
   "settings.keepAliveNotification.needsPermission":
     "Notification permission is required to enable background keep-alive",
+  "settings.selfcheckEntry": "Diagnostics entry",
+  "settings.selfcheckEntryDescription":
+    "Show the corner self-check chip on the main screen to view diagnostic reports in-app.",
   "settings.systemTitle": "General",
   "settings.systemDescription": "These preferences affect the current window experience.",
   "settings.locale": "Language",
