@@ -118,6 +118,10 @@ class UIChromeBridge(
         activity.runOnUiThread { onSelfcheckEntryChanged?.invoke() }
     }
 
+    /** 设置页开关的初始态来源：读同一份 prefs 事实，JS 侧不缓存。 */
+    @JavascriptInterface
+    fun isSelfcheckEntryEnabled(): Boolean = selfcheckEntryEnabled
+
     private fun prefs() = activity.getSharedPreferences("zcode-ui-chrome", Context.MODE_PRIVATE)
 
     private fun applyChrome(dark: Boolean) {

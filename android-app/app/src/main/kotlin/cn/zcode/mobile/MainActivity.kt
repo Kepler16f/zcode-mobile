@@ -86,7 +86,7 @@ class MainActivity : Activity() {
             // 默认关——0.9.1 的隐藏决定保留，但用户可从设置页自行打开（排查 405 需要）。
             visibility = when {
                 intent?.getBooleanExtra(EXTRA_SHOW_SELFCHECK, false) == true -> View.VISIBLE
-                uiChrome.isSelfcheckEntryEnabled() -> View.VISIBLE
+                uiChrome.selfcheckEntryEnabled -> View.VISIBLE
                 else -> View.GONE
             }
         }
