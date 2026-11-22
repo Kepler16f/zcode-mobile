@@ -25,7 +25,7 @@ const server=http.createServer(async(req,res)=>{
 });
 await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const nativeBridge={start(raw){const id=String(++serial),request=JSON.parse(raw),job={queue:[],done:false,controller:new AbortController()};jobs.set(id,job);
- assert.match(request.url,/api\.minimaxi\.com\/anthropic\/v1\/messages$/);
+ assert.match(request.url,/^(https:\/\/api\.minimaxi\.com\/anthropic\/v1\/messages|https:\/\/zcode\.z\.ai\/api\/v1\/zcode-plan\/anthropic\/v1\/messages)$/,'模型请求只该打第三方 anthropic 网关或官方 zcode-plan 网关');
  (async()=>{try{const res=await originalFetch(`http://127.0.0.1:${server.address().port}`,{method:'POST',headers:request.headers,body:request.body,signal:job.controller.signal});job.status=res.status;job.headers=Object.fromEntries(res.headers);for await(const bytes of res.body)job.queue.push(Buffer.from(bytes).toString('base64'));}catch{job.error='native connection failed';}finally{job.done=true;}})();return JSON.stringify({id});},
  poll(id){const job=jobs.get(id);if(!job)return JSON.stringify({error:'missing'});const bodyBase64=job.queue.shift();const done=job.done&&!job.queue.length;const packet={status:job.status,headers:job.headers,bodyBase64,done,...(done&&job.error?{error:job.error}:{})};if(done)jobs.delete(id);return JSON.stringify(packet);},
  cancel(id){const job=jobs.get(id);if(job){cancelled++;job.controller.abort();jobs.delete(id);}return true;}};
@@ -38,6 +38,23 @@ try{
  const result=await streamModelCompletion({target,messages:[{role:'user',content:'ping'}],onDelta:text=>{assert.equal(ended,false,'必须在服务端断开前输出增量');incremental=true;}});
  assert.equal(result.text,'你好');assert.ok(incremental);assert.equal(result.truncated,false);
  assert.equal(requestRecord.body.model,'MiniMax-M2.7');assert.equal(requestRecord.headers['x-api-key'],'test-only-key');
+ assert.ok(!String(requestRecord.headers['user-agent']??'').includes('ai-sdk/anthropic'),'第三方网关不得被注入 SDK UA 后缀');
+
+ // 0.12.6 官方域 UA 双层拼接（官方 ai-sdk/anthropic UO() 把上下文 UA 与 SDK UA 空格 join）：
+ // `ZCode/<ver> ai-sdk/anthropic/<sdkVer>`。第三方网关不读 UA，零影响。diag 记录实际头名清单。
+ {
+  const midStore=new Map();
+  globalThis.localStorage={getItem:(k)=>midStore.has(k)?midStore.get(k):null,setItem:(k,v)=>midStore.set(k,String(v))};
+  const officialResponse=await mobileModelFetch('https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages',{headers:{'content-type':'application/json'},body:'{}'});
+  await officialResponse.text().catch(()=>{});
+  assert.match(String(requestRecord.headers['user-agent']??''),/^ZCode\/\d+\.\d+\.\d+ ai-sdk\/anthropic\/\d+\.\d+\.\d+$/,'官方域模型请求 UA 必须是 ZCode/<ver> ai-sdk/anthropic/<sdkVer> 双层形状');
+  assert.ok(requestRecord.headers['x-platform'],'官方域模型请求必须带身份头');
+  const diag=JSON.parse(midStore.get('zcode-mobile.model.diag')??'[]');
+  const last=diag[diag.length-1];
+  assert.ok(last&&Array.isArray(last.headerNames)&&last.headerNames.includes('x-platform'),'model.diag 必须记录实际头名清单（含归一层注入的身份头）');
+  assert.ok(!last.headerNames.includes('anthropic-dangerous-direct-browser-access'),'原生路径必须剥掉浏览器自报头');
+  delete globalThis.localStorage;
+ }
 
  // 正式会话通过同一原生桥发请求，不能只证明设置页的测试可用。
  ended=false;

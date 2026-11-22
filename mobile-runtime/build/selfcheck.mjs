@@ -941,6 +941,36 @@ export async function runDeviceChecks(rt) {
     };
   });
 
+  // M15（0.12.6）：模型请求取证。405 "This client is not supported" 的判定依据在
+  // 响应体里（0.12.4 起记录）；headerNames/userAgent 让装机报告能与官方请求逐头对比。
+  // 读法：errorBody ⇒ 服务端判定原文；headerNames 缺 anthropic-version ⇒ 协议头没带上；
+  // userAgent 不含 ai-sdk/anthropic ⇒ UA 还是旧形状。
+  await check("M15：模型请求取证（最近 5 次请求事实）", () => {
+    let entries = null;
+    try {
+      const raw = globalThis.localStorage?.getItem("zcode-mobile.model.diag") ?? "null";
+      entries = raw ? JSON.parse(raw) : [];
+    } catch {
+      return { fail: "读数坏了（JSON 解析失败）", raw: globalThis.localStorage?.getItem("zcode-mobile.model.diag") };
+    }
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return { skipped: true, reason: "本机还没发过模型请求（发一条消息或跑一次测试连接后再看）" };
+    }
+    const last = entries[entries.length - 1];
+    return {
+      count: entries.length,
+      last,
+      recent: entries.slice(-5),
+      note: last.error
+        ? "请求在端侧失败（桥/网络层），看 error"
+        : last.status === 405
+          ? "服务端判非官方客户端（405）——看 errorBody 的判定原文与 userAgent/headerNames 差异"
+          : last.status && last.status >= 400
+            ? `服务端拒绝（HTTP ${last.status}）——看 errorBody`
+            : "请求已发出且被受理，看 status",
+    };
+  });
+
   // 没有真机也能验原生桥：装一个按 Kotlin 语义实现的假 zcodeSqlite，底下是同一个 SQLite
   // （sql.js 就是真 sqlite3 编译的），所以列亲和性、多语句、BLOB 这些窄化的行为和装到手机上
   // 一致。桌面那套 store 从这里过，就代表桥的协议对，剩下的只是 Kotlin 的 IO。

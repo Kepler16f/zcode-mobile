@@ -5,11 +5,14 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { compatPlugin } from "../compat/build-plugin.mjs";
 import { buildToyboxRegistry } from "./gen-toybox-registry.mjs";
-import { readOfficialCompatVersion } from "./official-version.mjs";
+import { readOfficialVersions } from "./official-version.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "../..");
-const officialVersion = readOfficialCompatVersion(root);
+// 官方版本双口径：CLI 版本（__ZCODE_VERSION__）与 ai-sdk/anthropic UA 版本，构建期
+// 从本机官方安装包实挖（跟随上游），CI/无官方安装降级 server-compat.ts 兜底常量。
+const officialVersions = readOfficialVersions(root);
+const officialVersion = officialVersions.version;
 const cliRoot = path.join(root, "zcode/apps/zcode-cli");
 const esbuild = createRequire(path.join(cliRoot, "package.json"))("esbuild");
 
@@ -34,6 +37,7 @@ const result = await esbuild.build({
   external: ["typescript"],
   define: {
     __ZCODE_VERSION__: JSON.stringify(officialVersion),
+    __ZCODE_AI_SDK_ANTHROPIC_VERSION__: JSON.stringify(officialVersions.aiSdkAnthropic),
   },
   // 浏览器没有全局 Buffer，Glob/二进制分支直接用裸标识符。
   inject: [path.join(root, "mobile-runtime/compat/prelude.mjs")],

@@ -18,6 +18,8 @@ const inputFiles = [
   "mobile-runtime/build/bundle-fingerprint.mjs", "mobile-runtime/build/gen-toybox-registry.mjs",
   "mobile-runtime/build/build-mobile.mjs", "mobile-runtime/build/rebind-dark.mjs",
   "mobile-runtime/build/mobile-ui-assets.mjs",
+  // official-version.mjs 的实挖结果变成 bundle define（__ZCODE_VERSION__ 等），不改它就不换产物。
+  "mobile-runtime/build/official-version.mjs", "mobile-runtime/build/bundle-guards.mjs",
   "mobile-runtime/package-lock.json", "zcode/pnpm-lock.yaml", "zcode/package.json",
   "zcode/apps/zcode-cli/pnpm-lock.yaml",
   "zcode/config/provider/zcode-builtin.json", "zcode/scripts/builtin-provider-config.mjs",

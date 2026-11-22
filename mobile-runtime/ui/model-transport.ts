@@ -1,8 +1,15 @@
 import { getOrCreateSessionId, isZCodeContextHost, officialIdentityRequest } from "./quota-transport.js";
+import { officialAiSdkAnthropicVersion } from "./server-compat.js";
 
 function headerHas(headers: Record<string, string>, name: string): boolean {
   const lower = name.toLowerCase();
   return Object.keys(headers).some((key) => key.toLowerCase() === lower);
+}
+
+function headerValue(headers: Record<string, string>, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  const found = Object.keys(headers).find((key) => key.toLowerCase() === lower);
+  return found ? headers[found] : undefined;
 }
 
 function withZCodeChatTraceHeaders(url: URL, headers: Record<string, string>): Record<string, string> {
@@ -28,6 +35,9 @@ interface ModelDiagEntry {
   url: string;
   dangerousBrowserHeader: boolean;
   hasZcodeAgent: boolean;
+  /** 实际发出的头名清单（小写、只记名不记值）——装机报告可与官方请求逐头对比。 */
+  headerNames?: string[];
+  userAgent?: string;
   status?: number;
   errorBody?: string;
   error?: string;
@@ -127,17 +137,31 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
   // 网关按 ZCode 客户端身份头放行，缺头就 3001/拒绝，表现为"领到了额度却用不了"。
   // 只对官方域生效，第三方网关零注入。
   const identity = officialIdentityRequest(url, init.headers);
+  // UA 对齐官方桌面 CLI 的双层拼接形状（0.12.6）：官方 ai-sdk/anthropic 客户端用 UO()
+  // 把上下文层 UA 与 SDK UA 空格连接成 `ZCode/3.18.2 ai-sdk/anthropic/3.0.81`——归一层
+  // 只给了前半截，这里补后半截（仅官方域；第三方网关不读 UA，零影响）。
+  const officialModelHeaders: Record<string, string> = {};
+  for (const [name, value] of Object.entries(identity.headers)) {
+    if (name.toLowerCase() === "user-agent" && isZCodeContextHost(identity.url)) {
+      const suffix = ` ai-sdk/anthropic/${officialAiSdkAnthropicVersion()}`;
+      officialModelHeaders[name] = value.includes("ai-sdk/anthropic/") ? value : `${value}${suffix}`;
+      continue;
+    }
+    officialModelHeaders[name] = value;
+  }
   url = identity.url.toString();
   // 原生路径剥掉浏览器 CORS 自报头（官方桌面 CLI 不发它；服务端据此回 405 "This client
   // is not supported"——0.11.6 装机主诉）。桌面浏览器 harness 的 fetch 路径保留原头（CORS 需要）。
   const diagHeaders = init.headers;
-  init = { ...init, headers: withZCodeChatTraceHeaders(identity.url, stripBrowserOnlyHeaders(identity.headers)) };
+  init = { ...init, headers: withZCodeChatTraceHeaders(identity.url, stripBrowserOnlyHeaders(officialModelHeaders)) };
+  const diagHeaderNames = Object.keys(init.headers).map((name) => name.toLowerCase()).sort();
+  const diagUserAgent = headerValue(init.headers, "user-agent");
   const bridge = (globalThis as { zcodeModelHttp?: NativeModelBridge }).zcodeModelHttp;
   if (!bridge) {
     // 壳里缺桥 = 应用装配坏了（桥注册失败 / 装的是旧包 / 页面在装配前就发了请求）。
     // 这时回退 fetch 只会得到 `Failed to fetch`，把真因藏起来——直接说清楚。
     if (isAndroidShell()) {
-      recordModelDiag({ at: Date.now(), url, dangerousBrowserHeader: headerHas(diagHeaders, "anthropic-dangerous-direct-browser-access"), hasZcodeAgent: headerHas(diagHeaders, "x-zcode-agent"), error: "原生模型桥不可用" });
+      recordModelDiag({ at: Date.now(), url, dangerousBrowserHeader: headerHas(diagHeaders, "anthropic-dangerous-direct-browser-access"), hasZcodeAgent: headerHas(diagHeaders, "x-zcode-agent"), headerNames: diagHeaderNames, userAgent: diagUserAgent, error: "原生模型桥不可用" });
       throw new Error("原生模型桥不可用：请重新安装最新版本应用（模型请求需要走原生网络通道，WebView 直连会被跨源策略拦截）");
     }
     return fetch(url, { ...init, method: "POST" });
@@ -215,6 +239,8 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
       url,
       dangerousBrowserHeader: headerHas(diagHeaders, "anthropic-dangerous-direct-browser-access"),
       hasZcodeAgent: headerHas(diagHeaders, "x-zcode-agent"),
+      headerNames: diagHeaderNames,
+      userAgent: diagUserAgent,
       status,
     };
     if (status >= 400) {

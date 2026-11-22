@@ -13,15 +13,45 @@
 // 不该由这里吞掉或改写。
 
 export const DESKTOP_COMPATIBILITY_VERSION_KEY = "zcode-mobile.desktopCompatibilityVersion";
-/** 对服务端自报的官方发行版本（2026-11 官方主线 3.18.x）。仓库构建是 0.0.0-dev，会被判成"过旧"（forceUpdate 3.5.3）。 */
+/**
+ * 兜底用官方发行版本号（CI/无官方安装的机器上 define 缺席时才生效）。**不要在这里跟随
+ * 上游**——0.12.6（用户点名"ZCode/3.18.2 这种不要写死，很可能要跟随上游更新"）起，
+ * 真值由构建期 official-version.mjs 从本机官方安装包实挖（官方壳主进程同样写死版本并
+ * 经 env 传给 CLI，"壳带版本"就是官方自己的形状），经 `__ZCODE_VERSION__` define 注入。
+ */
 export const OFFICIAL_COMPAT_VERSION = "3.18.2";
-/** 用户覆盖优先，缺省为官方发行版本；所有官方域请求（含 client/configs）都应读这个口径。 */
+/**
+ * 官方桌面 CLI 模型请求的 ai-sdk/anthropic UA 版本兜底（同上，构建期实挖经
+ * `__ZCODE_AI_SDK_ANTHROPIC_VERSION__` 注入）。官方模型请求的 UA 是上下文层与 SDK 层
+ * **空格拼接**：`ZCode/3.18.2 ai-sdk/anthropic/3.0.81`（官方 UO() 把已有 user-agent 与
+ * SDK UA join）。zcode-plan 网关 405 "This client is not supported" 的判定若看 UA，
+ * 差这个后缀就是差异点。
+ */
+export const OFFICIAL_AI_SDK_ANTHROPIC_VERSION = "3.0.81";
+
+/** 用户覆盖优先，其次构建期实挖值（跟随上游），写死常量只在 define 缺席时兜底。 */
 export function officialCompatibilityVersion(): string {
   try {
     const v = globalThis.localStorage?.getItem(DESKTOP_COMPATIBILITY_VERSION_KEY)?.trim();
     if (v && /^\d+\.\d+\.\d+/.test(v)) return v;
   } catch { /* localStorage 不可用走缺省 */ }
+  // typeof 守卫：esbuild 只在注入了 define 的 bundle 里替换该标识符；Node harness
+  // 直跑源码时它未声明，typeof 对未声明变量安全返回 "undefined"（不抛 ReferenceError）。
+  if (typeof __ZCODE_VERSION__ !== "undefined" && /^\d+\.\d+\.\d+/.test(__ZCODE_VERSION__)) {
+    return __ZCODE_VERSION__;
+  }
   return OFFICIAL_COMPAT_VERSION;
+}
+
+/** ai-sdk/anthropic 的 UA 版本：优先构建期实挖，写死常量兜底（口径同上）。 */
+export function officialAiSdkAnthropicVersion(): string {
+  if (
+    typeof __ZCODE_AI_SDK_ANTHROPIC_VERSION__ !== "undefined" &&
+    /^\d+\.\d+\.\d+/.test(__ZCODE_AI_SDK_ANTHROPIC_VERSION__)
+  ) {
+    return __ZCODE_AI_SDK_ANTHROPIC_VERSION__;
+  }
+  return OFFICIAL_AI_SDK_ANTHROPIC_VERSION;
 }
 export function desktopCompatibilityVersion(fallback: string): string {
   try {return globalThis.localStorage?.getItem(DESKTOP_COMPATIBILITY_VERSION_KEY)?.trim() || fallback;} catch {return fallback;}

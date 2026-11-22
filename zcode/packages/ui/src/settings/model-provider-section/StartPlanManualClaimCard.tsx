@@ -5,7 +5,7 @@ import type {
   UsageEntitlementSubscriptionDetail,
   UsageQuotaLimit,
 } from "@zcode/shared";
-import { CheckCircle2Icon, GiftIcon, Loader2Icon, RefreshCwIcon } from "lucide-react";
+import { CheckCircle2Icon, ExternalLinkIcon, GiftIcon, Loader2Icon, RefreshCwIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button.js";
 import { useOptionalServices } from "@/hooks/useServices.js";
@@ -256,71 +256,65 @@ export function StartPlanManualClaimCard({
 
   if (!subscriptionService) return null;
 
+  // 视觉口径（0.12.6，用户点名"查找活动的 ui 不好看……不用这么多文字，按钮为主"）：
+  // 参照官方上游 StartPlanCard 的渐变赠卡与 zcode-pool 的 claim-strip（图标 + 活动名 +
+  // 一行信息 + 领取按钮），把说明性长文案全部压成一行；CTA 是「领取」/「检查」，其余动作
+  // 收成图标按钮。类只用产物里已存在的 token（新 JIT 任意值类真机不生效，见 apk-web-css）。
   return (
     <div
       data-testid="start-plan-manual-claim-card"
       className="rounded-xl border border-border bg-surface/60 p-4 text-left"
     >
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <GiftIcon className="size-4 text-primary" aria-hidden="true" />
-          <span className="text-ui-sm font-medium text-foreground">
-            {isZh ? "Start Plan 活动赠送领取" : "Start Plan Promotional Grants"}
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <GiftIcon className="size-4 shrink-0 text-primary" aria-hidden="true" />
+          <span className="truncate text-ui-sm font-medium text-foreground">
+            {isZh ? "活动赠送" : "Promo grants"}
           </span>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1">
           {onOpenOfficialPage ? (
-            <Button type="button" size="xs" variant="ghost" onClick={onOpenOfficialPage}>
-              {isZh ? "官网活动页" : "Claim Page"}
+            <Button
+              type="button"
+              size="icon-sm"
+              variant="ghost"
+              aria-label={isZh ? "官网活动页" : "Official claim page"}
+              onClick={onOpenOfficialPage}
+            >
+              <ExternalLinkIcon className="size-3.5" aria-hidden="true" />
             </Button>
           ) : null}
           {!isDisconnected ? (
             <Button
               type="button"
-              size="xs"
-              variant="outline"
+              size="icon-sm"
+              variant="ghost"
+              aria-label={isZh ? "检查可领活动" : "Check offers"}
               disabled={loading}
               onClick={() => void loadOffers(true)}
             >
               {loading ? (
-                <Loader2Icon className="mr-1 size-3 animate-spin" aria-hidden="true" />
+                <Loader2Icon className="size-3.5 animate-spin" aria-hidden="true" />
               ) : (
-                <RefreshCwIcon className="mr-1 size-3" aria-hidden="true" />
+                <RefreshCwIcon className="size-3.5" aria-hidden="true" />
               )}
-              {isZh ? "检查可领活动" : "Check Offers"}
             </Button>
           ) : null}
         </div>
       </div>
 
       {isDisconnected ? (
-        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-ui-xs text-muted-foreground">
-          <span>
-            {isZh
-              ? "连接 ZCode 账号后，可自动检测并领取官方 Start Plan / 周末活动赠送 Token。"
-              : "Connect your ZCode account to check and claim promotional Start Plan token grants."}
+        <div className="mt-3 flex items-center justify-between gap-2">
+          <span className="min-w-0 truncate text-ui-xs text-muted-foreground">
+            {isZh ? "连接账号后可领取活动赠送" : "Connect to claim promo grants"}
           </span>
           {onLogin ? (
-            <Button type="button" size="xs" variant="secondary" onClick={onLogin}>
-              {isZh ? "立即连接" : "Connect"}
+            <Button type="button" size="sm" variant="secondary" className="shrink-0" onClick={onLogin}>
+              {isZh ? "连接" : "Connect"}
             </Button>
           ) : null}
         </div>
-      ) : null}
-
-      {!isDisconnected && loadError ? (
-        <p className="mt-2 text-ui-xs text-destructive">{loadError}</p>
-      ) : null}
-
-      {!isDisconnected && !loading && !loadError && plans.length === 0 ? (
-        <p className="mt-2 text-ui-xs text-muted-foreground">
-          {isZh
-            ? "暂无新的待领取活动；若你在其他活动页面有赠额，也可点击右上角「官网活动页」查看或点「检查可领活动」同步。"
-            : "No new claimable promotional grants found right now. Refresh anytime or check the official claim page."}
-        </p>
-      ) : null}
-
-      {plans.length > 0 ? (
+      ) : plans.length > 0 ? (
         <div className="mt-3 space-y-2">
           {plans.map((plan) => {
             const busy = claimingPlanId === plan.planId;
@@ -332,76 +326,83 @@ export function StartPlanManualClaimCard({
             return (
               <div
                 key={plan.planId}
-                className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border/80 bg-background/60 p-3"
+                className="flex items-center justify-between gap-2 rounded-lg border border-border/80 bg-background/60 p-3"
               >
                 <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-ui-sm font-medium text-foreground">{plan.name}</span>
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className="truncate text-ui-sm font-medium text-foreground">{plan.name}</span>
                     {isClaimed ? (
-                      <span className="inline-flex items-center gap-1 rounded-full bg-success/15 px-2 py-0.5 text-ui-2xs font-medium text-success">
+                      <span
+                        className="inline-flex shrink-0 items-center gap-1 rounded-full bg-success/15 px-1.5 py-0.5 text-ui-2xs font-medium text-success"
+                      >
                         <CheckCircle2Icon className="size-3" aria-hidden="true" />
-                        {isZh ? "已领取" : "Claimed"}
+                        {isZh ? "已领" : "Claimed"}
                       </span>
                     ) : null}
                   </div>
-                  {plan.description ? (
-                    <div className="mt-0.5 text-ui-xs text-muted-foreground">{plan.description}</div>
-                  ) : null}
-                  {matchedLimits.length > 0 ? (
-                    <div className="mt-1 flex flex-wrap gap-1.5">
-                      {matchedLimits.map((limit, idx) => {
-                        const remaining = limit.remaining ?? 0;
-                        const formatted = new Intl.NumberFormat(isZh ? "zh-CN" : "en-US").format(
-                          remaining,
-                        );
-                        return (
-                          <span
-                            key={`${plan.planId}-balance-${idx}`}
-                            className="rounded bg-surface px-1.5 py-0.5 text-ui-2xs text-foreground"
-                          >
-                            {isZh ? `当前剩余 ${formatted}` : `Remaining ${formatted}`}
-                          </span>
-                        );
-                      })}
+                  {!isClaimed && plan.entitlements[0] ? (
+                    <div className="mt-1 truncate text-ui-xs text-muted-foreground">
+                      {formatClaimEntitlement(plan.entitlements[0], isZh)}
                     </div>
-                  ) : plan.entitlements.length > 0 ? (
-                    <div className="mt-1 flex flex-wrap gap-1.5">
-                      {plan.entitlements.map((entitlement) => (
-                        <span
-                          key={entitlement.entitlementId}
-                          className="rounded bg-surface px-1.5 py-0.5 text-ui-2xs text-foreground"
-                        >
-                          {formatClaimEntitlement(entitlement, isZh)}
-                        </span>
-                      ))}
+                  ) : matchedLimits.length > 0 && matchedLimits[0] && !isClaimed ? (
+                    <div className="mt-1 truncate text-ui-xs text-muted-foreground">
+                      {isZh
+                        ? `剩余 ${new Intl.NumberFormat(isZh ? "zh-CN" : "en-US").format(matchedLimits[0].remaining ?? 0)}`
+                        : `Remaining ${new Intl.NumberFormat(isZh ? "zh-CN" : "en-US").format(matchedLimits[0].remaining ?? 0)}`}
                     </div>
                   ) : null}
                 </div>
                 {isClaimed ? (
-                  <Button type="button" size="sm" variant="secondary" disabled>
+                  <Button type="button" size="sm" variant="secondary" disabled className="shrink-0">
                     <CheckCircle2Icon className="mr-1.5 size-3.5" aria-hidden="true" />
-                    {isZh ? "已领取" : "Claimed"}
+                    {isZh ? "已领" : "Claimed"}
                   </Button>
                 ) : (
                   <Button
                     type="button"
                     size="sm"
+                    className="shrink-0"
                     disabled={Boolean(claimingPlanId)}
                     onClick={() => void handleClaim(plan)}
                   >
-                    {busy ? <Loader2Icon className="mr-1.5 size-3.5 animate-spin" /> : null}
-                    {isZh ? (busy ? "领取中..." : "立即领取") : busy ? "Claiming..." : "Claim"}
+                    {busy ? <Loader2Icon className="mr-1.5 size-3.5 animate-spin" aria-hidden="true" /> : null}
+                    {isZh ? (busy ? "领取中" : "领取") : busy ? "Claiming" : "Claim"}
                   </Button>
                 )}
               </div>
             );
           })}
         </div>
-      ) : null}
+      ) : (
+        <div className="mt-3 flex items-center justify-between gap-2">
+          <span className="min-w-0 truncate text-ui-xs text-muted-foreground">
+            {loadError
+              ? loadError
+              : isZh
+                ? "暂无可领活动"
+                : "No claimable offers"}
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="shrink-0"
+            disabled={loading}
+            onClick={() => void loadOffers(false)}
+          >
+            {loading ? (
+              <Loader2Icon className="mr-1.5 size-3.5 animate-spin" aria-hidden="true" />
+            ) : (
+              <RefreshCwIcon className="mr-1.5 size-3.5" aria-hidden="true" />
+            )}
+            {isZh ? "检查" : "Check"}
+          </Button>
+        </div>
+      )}
 
       {feedback ? (
         <p
-          className={`mt-2 text-ui-xs ${
+          className={`mt-2 truncate text-ui-xs ${
             feedback.kind === "error"
               ? "text-destructive"
               : feedback.kind === "success"
