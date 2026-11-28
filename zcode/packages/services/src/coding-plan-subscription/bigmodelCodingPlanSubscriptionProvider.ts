@@ -267,13 +267,21 @@ export class BigModelCodingPlanSubscriptionProvider {
     };
   }
 
-  async getManualClaimPlanPreviews(): Promise<ManualClaimPlanPreviewSnapshot> {
+  async getManualClaimPlanPreviews(options?: {
+    forceRefresh?: boolean;
+  }): Promise<ManualClaimPlanPreviewSnapshot> {
     const token = await this.loadStartPlanJwtToken();
     const now = Date.now();
-    if (this.manualClaimPreviewRequest && this.manualClaimPreviewRequest.token === token) {
+    const forceRefresh = options?.forceRefresh === true;
+    if (
+      !forceRefresh &&
+      this.manualClaimPreviewRequest &&
+      this.manualClaimPreviewRequest.token === token
+    ) {
       return this.manualClaimPreviewRequest.promise;
     }
     if (
+      !forceRefresh &&
       this.manualClaimPreviewCache &&
       this.manualClaimPreviewCache.token === token &&
       this.manualClaimPreviewCache.expiresAt > now
@@ -391,7 +399,6 @@ export class BigModelCodingPlanSubscriptionProvider {
     if (verifyParam) {
       headers["X-Aliyun-Captcha-Verify-Param"] = verifyParam;
       const verifyRegion = request.captchaVerifyRegion?.trim() || "cn";
-      headers["X-Aliyun-Captcha-Region"] = verifyRegion;
       headers["X-Aliyun-Captcha-Verify-Region"] = verifyRegion;
     }
     const response = await this.apiClient.request(
@@ -455,13 +462,17 @@ export class BigModelCodingPlanSubscriptionProvider {
     if (
       code !== 0 &&
       code !== 3007 &&
-      ((response.status === 403 && captchaHeader.length > 0) || /captcha/i.test(payloadMsg))
+      ((response.status === 403 && captchaHeader.length > 0) ||
+        /captcha|安全验证|验证码|security verification/i.test(payloadMsg))
     ) {
       code = 3007;
     }
     const serverTime = readServerTimeMilliseconds(payload.data?.server_time);
-    if ((code === 0 || code === 1003) && request.campaignId?.trim()) {
-      void this.confirmMarketingTouchCampaign(token, request.campaignId.trim());
+    if (code === 0 || code === 1003) {
+      this.manualClaimPreviewCache = null;
+      if (request.campaignId?.trim()) {
+        void this.confirmMarketingTouchCampaign(token, request.campaignId.trim());
+      }
     }
     if (!response.ok || code !== 0 || !payload.data?.plan) {
       const failureEndsAt = payload.data?.plan?.ends_at;
