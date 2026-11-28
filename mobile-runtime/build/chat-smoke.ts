@@ -2157,7 +2157,7 @@ async function main() {
     const chunkBody = "正文".repeat(500); // 单轮完整正文约 1000 汉字，仍能与摘要指令一起装入单段预算
     // 0.12.9 起压缩请求的 system 是官方三段（约 1.6k token，3012 形状对齐）——单段预算
     // 必须盖过它 + 摘要指令 + 单轮正文，分段路径才仍然成立（真实设备窗口 64k 无感）。
-    const chunkPassBudget = 7000; // 盖过官方三段 system(约1.7k)+摘要指令+前段摘要+单轮（分段器一段可装1-2轮），全量4轮(约9.7k)仍必分段
+    const chunkPassBudget = 5000; // 盖过官方三段 system+摘要指令+前段摘要+单轮，但 4 轮全量装不下 → 必然分段（4.0.0 system 估算变小后从 7000 收紧）
     const rigChunk = makeRig(mock.url, undefined, undefined, undefined, {
       compactEnabled: false,       // 只测手动压缩这一条路，别让自动压缩插进来搅乱计数
       compactKeepRecentRows: 2,    // 保留最近一轮（两行）

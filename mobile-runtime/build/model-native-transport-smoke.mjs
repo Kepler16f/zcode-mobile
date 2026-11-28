@@ -47,7 +47,8 @@ try{
   globalThis.localStorage={getItem:(k)=>midStore.has(k)?midStore.get(k):null,setItem:(k,v)=>midStore.set(k,String(v))};
   const officialResponse=await mobileModelFetch('https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages',{headers:{'content-type':'application/json'},body:'{}'});
   await officialResponse.text().catch(()=>{});
-  assert.match(String(requestRecord.headers['user-agent']??''),/^ZCode\/\d+\.\d+\.\d+ ai-sdk\/anthropic\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/\d+\.\d+\.\d+ runtime\/node\.js\/v\d+\.\d+\.\d+$/,'官方域模型请求 UA 必须是 ZCode/<ver> ai-sdk/anthropic/<sdkVer> ai-sdk/provider-utils/<utilsVer> runtime/node.js/<nodeVer> 四段形状');
+  assert.match(String(requestRecord.headers['user-agent']??''),/^ZCode\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/\d+\.\d+\.\d+ runtime\/node\.js\/\d+$/,'官方域模型请求 UA 必须是官方 4.0.0 三段形状（无 ai-sdk/anthropic 段，dump req-001 实测）');
+  assert.equal(requestRecord.headers['anthropic-beta'],'mid-conversation-system-2026-04-07','官方域对话请求必须带 anthropic-beta 标记');
   assert.ok(requestRecord.headers['x-platform'],'官方域模型请求必须带身份头');
   const diag=JSON.parse(midStore.get('zcode-mobile.model.diag')??'[]');
   const last=diag[diag.length-1];
@@ -61,12 +62,12 @@ try{
  // metadata.user_id 形状 {"device_id","account_uuid","session_id"}。
  {
   const officialTarget={apiFormat:'anthropic-messages',baseUrl:'https://zcode.z.ai/api/v1/zcode-plan/anthropic',apiKey:'jwt-token',model:'GLM-5.3-Flash'};
-  const segments=['You are ZCode, an interactive coding agent','IDENTITY BODY','\n\nDYNAMIC BODY'];
+  const segments=['You are ZCode, an interactive agent','IDENTITY BODY','\n\nDYNAMIC BODY'];
   await streamModelCompletion({target:officialTarget,messages:[{role:'system',content:segments.join('\n\n'),systemSegments:segments},{role:'user',content:'hi'}],maxOutputTokens:64,onDelta(){}});
   const sentBody=requestRecord.body;
   assert.ok(Array.isArray(sentBody.system)&&sentBody.system.length===3,'官方域对话请求 system 必须是三段 text block');
-  assert.equal(sentBody.system[0].text,'You are ZCode, an interactive coding agent','system[0] 必须是官方 cli_prefix 逐字（含 coding 一词）');
-  assert.equal(sentBody.system[0].cache_control?.type,'ephemeral','system[0] 必须带 cache_control ephemeral');
+  assert.equal(sentBody.system[0].text,'You are ZCode, an interactive agent','system[0] 必须是官方 4.0.0 cli_prefix 逐字（无 coding 一词，dump 实测）');
+  assert.equal(sentBody.system[0].cache_control?.type,undefined,'system[0] 不带 cache_control（官方实测 block0 无）');
   assert.equal(sentBody.system[2].cache_control?.type,'ephemeral','system[2] 必须带 cache_control ephemeral');
   assert.ok(typeof sentBody.metadata?.user_id==='string'&&sentBody.metadata.user_id.includes('"device_id"'),'官方域对话请求必须带官方形状 metadata.user_id');
  }

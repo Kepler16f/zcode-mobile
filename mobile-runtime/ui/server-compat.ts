@@ -28,7 +28,12 @@ export const OFFICIAL_COMPAT_VERSION = "4.0.0";
  */
 export const OFFICIAL_AI_SDK_ANTHROPIC_VERSION = "3.0.81";
 export const OFFICIAL_AI_SDK_PROVIDER_UTILS_VERSION = "4.0.27";
-export const OFFICIAL_NODE_RUNTIME_UA = "runtime/node.js/v22.14.0";
+/**
+ * 官方 4.0.0 桌面 CLI 模型请求的 runtime UA 段（实测 dump：runtime/node.js/24——
+ * 桌面 spawn 的 Node 主版本；provider-utils 的 qua() 用 process.version 截主版本）。
+ * 端侧固定对齐官方桌面当前值。
+ */
+export const OFFICIAL_NODE_RUNTIME_UA = "runtime/node.js/24";
 
 /** 用户覆盖优先，其次构建期实挖值（跟随上游），写死常量只在 define 缺席时兜底。 */
 export function officialCompatibilityVersion(): string {
@@ -66,11 +71,14 @@ export function officialAiSdkProviderUtilsVersion(): string {
   return OFFICIAL_AI_SDK_PROVIDER_UTILS_VERSION;
 }
 
-/** 官方桌面 CLI 发送 Anthropic 模型请求时的完整四段 User-Agent。 */
+/**
+ * 官方 4.0.0 桌面 CLI 发送 ultra 模型请求的三段 User-Agent（dump req-001 实测逐字）：
+ * `ZCode/<ver> ai-sdk/provider-utils/<utils> runtime/node.js/<node>`——4.0.0 起桌面
+ * 不再拼 ai-sdk/anthropic 段（n2() 只在 postToApi 一层拼 provider-utils 与 runtime）。
+ */
 export function officialAnthropicModelUserAgent(): string {
   return [
     `ZCode/${officialCompatibilityVersion()}`,
-    `ai-sdk/anthropic/${officialAiSdkAnthropicVersion()}`,
     `ai-sdk/provider-utils/${officialAiSdkProviderUtilsVersion()}`,
     OFFICIAL_NODE_RUNTIME_UA,
   ].join(" ");

@@ -1,6 +1,5 @@
 import { getOrCreateSessionId, isZCodeContextHost, officialIdentityRequest } from "./quota-transport.js";
 import {
-  officialAiSdkAnthropicVersion,
   officialAiSdkProviderUtilsVersion,
   OFFICIAL_NODE_RUNTIME_UA,
 } from "./server-compat.js";
@@ -205,25 +204,27 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
   // 网关按 ZCode 客户端身份头放行，缺头就 3001/拒绝，表现为"领到了额度却用不了"。
   // 只对官方域生效，第三方网关零注入。
   const identity = officialIdentityRequest(url, init.headers);
-  // UA 对齐官方桌面 CLI 的双层拼接形状（0.12.6）：官方 ai-sdk/anthropic 客户端用 UO()
-  // 把上下文层 UA 与 SDK UA 空格连接成 `ZCode/3.18.2 ai-sdk/anthropic/3.0.81`——归一层
-  // 只给了前半截，这里补后半截（仅官方域；第三方网关不读 UA，零影响）。
+  // UA 对齐官方 4.0.0 桌面 CLI 的实测三段形状（dump req-001）：`ZCode/<ver>
+  // ai-sdk/provider-utils/<utils> runtime/node.js/<node>`——4.0.0 起不再拼 ai-sdk/anthropic
+  // 段（官方 n2() 只在 postToApi 一层拼 provider-utils 与 runtime）。仅官方域，第三方零影响。
   const officialModelHeaders: Record<string, string> = {};
   for (const [name, value] of Object.entries(identity.headers)) {
     if (name.toLowerCase() === "user-agent" && isZCodeContextHost(identity.url)) {
-      const sdkSuffix = [
-        `ai-sdk/anthropic/${officialAiSdkAnthropicVersion()}`,
-        `ai-sdk/provider-utils/${officialAiSdkProviderUtilsVersion()}`,
-        OFFICIAL_NODE_RUNTIME_UA,
-      ].join(" ");
       officialModelHeaders[name] = value.includes("ai-sdk/provider-utils/")
         ? value
-        : value.includes("ai-sdk/anthropic/")
-          ? `${value} ai-sdk/provider-utils/${officialAiSdkProviderUtilsVersion()} ${OFFICIAL_NODE_RUNTIME_UA}`
-          : `${value} ${sdkSuffix}`;
+        : `${value} ai-sdk/provider-utils/${officialAiSdkProviderUtilsVersion()} ${OFFICIAL_NODE_RUNTIME_UA}`;
       continue;
     }
     officialModelHeaders[name] = value;
+  }
+  // 官方 ultra 请求带 anthropic-beta（dump req-001 实测）：三条 system 消息合并的
+  // mid-conversation 标记。端侧官方域对话请求同带；探测请求（单块 system）不带。
+  if (
+    isZCodeContextHost(identity.url) &&
+    !officialModelHeaders["anthropic-beta"] &&
+    !isConnectivityProbeBody(init.body)
+  ) {
+    officialModelHeaders["anthropic-beta"] = "mid-conversation-system-2026-04-07";
   }
   url = identity.url.toString();
   // 原生路径剥掉浏览器 CORS 自报头（官方桌面 CLI 不发它；服务端据此回 405 "This client

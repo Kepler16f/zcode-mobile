@@ -571,12 +571,12 @@ function buildRequest(
   const anthropicSystemBlocks =
     target.apiFormat === "anthropic-messages"
       ? officialSystemSegments
-        ? // 官方三段逐块（对齐官方 wire：三块各带 ephemeral——ContextBuilder 的三条
-          // systemMessages 全带 EPHEMERAL_CACHE_CONTROL，ai-sdk 转块时逐块落 cache_control）。
-          officialSystemSegments.map((text) => ({
+        ? // 官方三段逐块（0.13.0 对齐官方 4.0.0 实测 wire：block[0] cli_prefix **无**
+          // cache_control，block[1]/[2] 各带 ephemeral——dump req-001 实证）。
+          officialSystemSegments.map((text, index) => ({
             type: "text",
             text,
-            cache_control: { type: "ephemeral" },
+            ...(index > 0 ? { cache_control: { type: "ephemeral" } } : {}),
           }))
         : toAnthropicSystemBlocks(systemMessages, officialZCodeHost)
       : undefined;

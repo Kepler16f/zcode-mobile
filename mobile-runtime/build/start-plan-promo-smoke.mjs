@@ -635,7 +635,7 @@ try {
   assert.equal(typeof parsedMetaUserId.session_id, "string");
   assert.match(
     String(hdr(capturedModelReq.headers, "user-agent") ?? ""),
-    /^ZCode\/\d+\.\d+\.\d+ ai-sdk\/anthropic\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/\d+\.\d+\.\d+ runtime\/node\.js\/v\d+\.\d+\.\d+$/,
+    /^ZCode\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/\d+\.\d+\.\d+ runtime\/node\.js\/\d+$/,
   );
   delete globalThis.__zcodeResolveModelVerificationHeaders;
 
