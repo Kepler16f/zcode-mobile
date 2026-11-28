@@ -1,12 +1,14 @@
-// ultra 签名链路冒烟：用与官方同构的假服务端（本文件内模拟握手+路由下发），
-// 验证端侧实现（ultra-signing.ts + model-transport 接线）产生的请求形状与官方 dump 一致。
-// 覆盖：凭据解析（JWT→apiKeyId/accessToken）、握手请求形状、privateCipher 往返、
-// 签名五头、X-Zcode-Authorization、URL 重写 zcode-plan→ultra、探测不带签名。
+// ultra 签名链路冒烟：用与官方同构的假服务端（模拟握手 + agent/configs 路由下发），
+// 验证端侧实现（ultra-signing.ts）：
+//   1. Coding Plan（open.bigmodel.cn / api.z.ai → ultra / ultra-zai）路由与 Ed25519 五头签名；
+//   2. Start Plan（zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages）绝不重写到 ultra；
+//   3. 凭据解析、握手 sig 复算、sessionId fail-closed。
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
+import { unlinkSync } from "node:fs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const esbuild = createRequire(path.join(root, "zcode/apps/zcode-cli/package.json"))("esbuild");
@@ -95,14 +97,23 @@ const sessionId = "abc123def456";
   assert.match(headers["X-Client-Pow"], /^[0-9a-f]{24}[0-9a-f]{8}$/, "x-client-pow 必须是 24 随机 hex + 8 hex 计数器");
 }
 
-// ── ② URL 重写（zcode-plan → ultra）──
+// ── ② URL 路由（Coding Plan → ultra；Start Plan zcode-plan 原样保留）──
 {
-  const rewritten = await signing.rewriteToUltraUrl(
-    "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
-    "bigmodel",
+  const codingPlan = await signing.resolveUltraRoute(
+    "https://open.bigmodel.cn/api/anthropic/v1/messages",
     (input, init) => fetch(input, init),
   );
-  assert.equal(rewritten, "https://zcode.z.ai/api/v1/ultra/anthropic/v1/messages", "zcode-plan 端点必须按 mapping 重写到 ultra");
+  assert.equal(codingPlan.routed, true);
+  assert.equal(codingPlan.includeZCodeAuthorization, true);
+  assert.equal(codingPlan.url, "https://zcode.z.ai/api/v1/ultra/anthropic/v1/messages", "Coding Plan 端点必须按 mapping 重写到 ultra");
+
+  const startPlan = await signing.resolveUltraRoute(
+    "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
+    (input, init) => fetch(input, init),
+  );
+  assert.equal(startPlan.routed, false, "Start Plan 不得路由到 ultra");
+  assert.equal(startPlan.includeZCodeAuthorization, false);
+  assert.equal(startPlan.url, "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages", "Start Plan 端点必须保持原样");
 }
 
 // ── ③ 第二次签名：pow 的计数器随机但形状稳定；不同请求 nonce 不同 ──
@@ -129,4 +140,5 @@ const sessionId = "abc123def456";
   assert.equal(dotted.handshakeBodyField, "apiKey");
 }
 
-console.log("ultra-signing-smoke: PASS（握手形状/往返解密/签名五头/URL 重写/fail-closed/凭据解析）");
+console.log("ultra-signing-smoke: PASS（握手形状/往返解密/签名五头/CodingPlan路由与StartPlan直发/fail-closed/凭据解析）");
+unlinkSync(out);

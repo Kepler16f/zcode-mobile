@@ -1,10 +1,12 @@
-// 官方 4.0.0 ultra 网关的客户端签名链路（0.13.0，3012 终局修复）。
+// 官方 4.0.0 Coding Plan ultra 网关的客户端签名与路由链路。
 //
-// 地面真相：官方桌面 4.0.0 的对话请求不再打 /api/v1/zcode-plan/anthropic（服务端已弃用，
-// 回 3012 "This client is not supported" 推迁移），而是：
-//   GET  /api/v1/agent/configs                  → 下发 proxyEndpoint.mapping（from→to）
-//   POST {bigmodel origin}/api/paas/c1f3a7e2/v2/client   → 握手换 Ed25519 私钥
-//   POST /api/v1/ultra[/ultra-zai]/anthropic/v1/messages + 签名五头
+// 地面真相（官方桌面 4.0.0 CLI zcode.cjs）：
+//   1. Start Plan（https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages）：
+//      不走 agent/configs 重写，也不带 c1f3a7e2 签名（requiresClientRequestSigning 明确返回 false）。
+//   2. Coding Plan（https://open.bigmodel.cn/api/anthropic/v1/messages 或 https://api.z.ai/api/anthropic/v1/messages）：
+//      GET  /api/v1/agent/configs                  → 下发 proxyEndpoint.mapping（coding-plan → ultra/ultra-zai）
+//      POST {origin}/api/paas/c1f3a7e2/v2/client   → 握手换 Ed25519 私钥
+//      POST /api/v1/ultra[/ultra-zai]/anthropic/v1/messages + 签名五头（+ 可选 X-ZCode-Authorization）
 // 签名协议逆向报告：D:/Zcode/tmp/signing-protocol-report.md（bundle 字节偏移齐全）。
 // 算法全部可用 WebView crypto.subtle 原生实现（Ed25519 需 Chromium ≥137，端侧 157 ✓）。
 //
@@ -276,27 +278,57 @@ export function readSigningFailureReason(bodyText: string): string {
 }
 
 /** agent/configs 的 mapping 缓存（TTL 300s/失败冷却 30s，对齐官方 _vt）。 */
+export interface UltraRouteEntry {
+  fromPrefix: string;
+  toPrefix: string;
+  includeZCodeAuthorization: boolean;
+}
+
 export interface UltraRouteMapping {
-  entries: Array<{ fromPrefix: string; toPrefix: string }>;
+  entries: UltraRouteEntry[];
   fetchedAt: number;
 }
 
+export interface UltraRouteResolution {
+  url: string;
+  routed: boolean;
+  includeZCodeAuthorization: boolean;
+}
+
 const OFFICIAL_AGENT_CONFIGS_URL = "https://zcode.z.ai/api/v1/agent/configs";
+const OFFICIAL_ENDPOINT_ORIGIN = "https://zcode.z.ai";
 let mappingCache: UltraRouteMapping | null = null;
 let mappingLastFailureAt = 0;
 
-/** 内置回退映射（agent/configs 拉不到时的保守形状——官方实测 mapping 的 from→to）。 */
+/** 内置回退映射（agent/configs 拉不到时，与官方实测 mapping 的 coding-plan → ultra 一致）。 */
 const FALLBACK_MAPPING: UltraRouteMapping = {
   entries: [
-    { fromPrefix: "https://zcode.z.ai/api/v1/zcode-plan/anthropic", toPrefix: "https://zcode.z.ai/api/v1/ultra/anthropic" },
-    { fromPrefix: "https://zcode.z.ai/api/v1/zcode-plan/anthropic", toPrefix: "https://zcode.z.ai/api/v1/ultra-zai/anthropic" },
+    {
+      fromPrefix: "https://open.bigmodel.cn/api/anthropic/v1/messages",
+      toPrefix: "https://zcode.z.ai/api/v1/ultra/anthropic/v1/messages",
+      includeZCodeAuthorization: true,
+    },
+    {
+      fromPrefix: "https://api.z.ai/api/anthropic/v1/messages",
+      toPrefix: "https://zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages",
+      includeZCodeAuthorization: true,
+    },
   ],
   fetchedAt: 0,
 };
 
+function normalizePathNoTrailing(pathname: string): string {
+  return pathname === "/" ? "/" : pathname.replace(/\/+$/u, "") || "/";
+}
+
+function canonicalEndpointKey(parsed: URL): string {
+  const port = parsed.port || "443";
+  return `${parsed.protocol}//${parsed.hostname.toLowerCase()}:${port}${normalizePathNoTrailing(parsed.pathname)}`;
+}
+
 /**
  * 拉 agent/configs 的路由映射（response envelope code=0 + data.proxyEndpoint.mapping）。
- * 失败回退内置映射；TTL/冷却对齐官方。响应头要求官方身份归一——由调用方的全局 fetch 包装承担。
+ * 失败回退内置映射；TTL/冷却对齐官方。响应头要求官方身份归一——由调用方提供。
  */
 export async function fetchUltraRouteMapping(clientFetch: typeof fetch): Promise<UltraRouteMapping> {
   if (mappingCache && Date.now() - mappingCache.fetchedAt < MAPPING_TTL_MS) return mappingCache;
@@ -312,12 +344,30 @@ export async function fetchUltraRouteMapping(clientFetch: typeof fetch): Promise
     };
     if (envelope.code !== 0) throw new Error("agent_configs_nonzero_code");
     const raw = envelope.data?.proxyEndpoint?.mapping ?? [];
-    const entries: UltraRouteMapping["entries"] = [];
+    const entries: UltraRouteEntry[] = [];
     for (const item of raw.slice(0, 256)) {
       if (typeof item.from !== "string" || typeof item.to !== "string") continue;
-      // 安全校验对齐官方：to 必须是 ultra 路径（X-Zcode-Authorization 只准发到这里）。
-      if (!/\/api\/v1\/ultra(-zai)?(\/|$)/.test(new URL(item.to).pathname)) continue;
-      entries.push({ fromPrefix: item.from, toPrefix: item.to });
+      const fromUrl = new URL(item.from);
+      const toUrl = new URL(item.to);
+      if (fromUrl.protocol !== "https:" || toUrl.protocol !== "https:") continue;
+      if (fromUrl.username || fromUrl.password || toUrl.username || toUrl.password) continue;
+      const authHeader = typeof item.zcodeAuthorizationHeader === "string" ? item.zcodeAuthorizationHeader.trim() : "";
+      const includeZCodeAuthorization = authHeader.length > 0;
+      const normalizedToPath = normalizePathNoTrailing(toUrl.pathname);
+      // 安全校验对齐官方 YSa：X-ZCode-Authorization 只准发给 official ultra/ultra-zai 路径。
+      if (
+        includeZCodeAuthorization &&
+        (authHeader.toLowerCase() !== "x-zcode-authorization" ||
+          toUrl.origin !== OFFICIAL_ENDPOINT_ORIGIN ||
+          !/^\/api\/v1\/ultra(-zai)?(\/|$)/.test(normalizedToPath))
+      ) {
+        continue;
+      }
+      entries.push({
+        fromPrefix: item.from,
+        toPrefix: item.to,
+        includeZCodeAuthorization,
+      });
     }
     if (entries.length === 0) throw new Error("agent_configs_empty_mapping");
     mappingCache = { entries, fetchedAt: Date.now() };
@@ -329,30 +379,56 @@ export async function fetchUltraRouteMapping(clientFetch: typeof fetch): Promise
 }
 
 /**
- * 按映射重写 zcode-plan 端点 → ultra 端点。端侧 start-plan 的 baseUrl 是
- * zcode.z.ai/api/v1/zcode-plan/anthropic（builtin config），不在官方 mapping 的 from
- * 集合里（官方 from 是 coding-plan 端点）——先按家族规则改写 from，再套 mapping。
+ * 按官方 agent/configs proxyEndpoint.mapping 解析路由（对齐官方 ProviderEndpointRoutingService._vt）：
+ *   - 仅命中 mapping.from 的 Coding Plan 请求（open.bigmodel.cn / api.z.ai）会重写到 ultra/ultra-zai；
+ *   - Start Plan（zcode.z.ai/api/v1/zcode-plan/anthropic/...）不在 mapping 中，保持 routed: false 原样直发。
  */
+export async function resolveUltraRoute(
+  url: string,
+  clientFetch: typeof fetch,
+): Promise<UltraRouteResolution> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return { url, routed: false, includeZCodeAuthorization: false };
+  }
+  if (parsed.protocol !== "https:") {
+    return { url, routed: false, includeZCodeAuthorization: false };
+  }
+  const mapping = await fetchUltraRouteMapping(clientFetch);
+  const reqKey = canonicalEndpointKey(parsed);
+  for (const entry of mapping.entries) {
+    let fromUrl: URL;
+    try {
+      fromUrl = new URL(entry.fromPrefix);
+    } catch {
+      continue;
+    }
+    const fromKey = canonicalEndpointKey(fromUrl);
+    if (reqKey === fromKey || reqKey.startsWith(`${fromKey}/`)) {
+      const targetUrl = new URL(entry.toPrefix);
+      const baseToPath = normalizePathNoTrailing(targetUrl.pathname);
+      const suffix = reqKey.slice(fromKey.length);
+      targetUrl.pathname = `${baseToPath}${suffix}`;
+      targetUrl.search = parsed.search;
+      return {
+        url: targetUrl.href,
+        routed: true,
+        includeZCodeAuthorization: entry.includeZCodeAuthorization,
+      };
+    }
+  }
+  return { url, routed: false, includeZCodeAuthorization: false };
+}
+
+/** URL 重写包装：返回解析后的目标 URL（未命中 mapping 时原样返回）。 */
 export async function rewriteToUltraUrl(
   url: string,
-  family: "bigmodel" | "zai",
-  clientFetch: typeof fetch,
+  familyOrClientFetch: "bigmodel" | "zai" | typeof fetch,
+  maybeClientFetch?: typeof fetch,
 ): Promise<string> {
-  const mapping = await fetchUltraRouteMapping(clientFetch);
-  // 家族 → 官方 coding-plan from 端点（mapping 里的 from）。
-  const officialFrom = family === "zai"
-    ? "https://api.z.ai/api/anthropic"
-    : "https://open.bigmodel.cn/api/anthropic";
-  const entry =
-    mapping.entries.find((item) => url.startsWith(item.fromPrefix)) ??
-    mapping.entries.find((item) => url.startsWith(item.fromPrefix.slice(0, item.fromPrefix.indexOf("/api/")))) ??
-    mapping.entries.find((item) => item.fromPrefix === officialFrom);
-  const target = entry ?? (family === "zai"
-    ? { fromPrefix: "https://api.z.ai/api/anthropic", toPrefix: "https://zcode.z.ai/api/v1/ultra-zai/anthropic" }
-    : { fromPrefix: "https://open.bigmodel.cn/api/anthropic", toPrefix: "https://zcode.z.ai/api/v1/ultra/anthropic" });
-  // zcode-plan/anthropic/v1/messages → <ultra>/v1/messages（path 平移）。
-  const marker = "/zcode-plan/anthropic";
-  const idx = url.indexOf(marker);
-  if (idx < 0) return url;
-  return `${target.toPrefix}${url.slice(idx + marker.length)}`;
+  const clientFetch = typeof familyOrClientFetch === "function" ? familyOrClientFetch : maybeClientFetch!;
+  const resolved = await resolveUltraRoute(url, clientFetch);
+  return resolved.url;
 }

@@ -91,6 +91,7 @@ import type { ModelTargetResolver } from "./provider-target.js";
 import { createMobileConnectivityTester } from "./model-connectivity.js";
 import { createMobileSystemService } from "./system.js";
 import { createMobileUsageStatsService } from "./usage-stats.js";
+import { setUltraZCodeJwtLoader } from "./model-transport.js";
 import { createMobileMemoryContext } from "./memory-context.js";
 import { createMobileFileWatcherService } from "./file-watcher.js";
 import { officialCompatibilityVersion } from "./server-compat.js";
@@ -563,6 +564,11 @@ export async function createMobileServices(options: {
           { name: "oauthService", descriptor: IOAuthService, make: () => createTracedOAuthService(createMobileOAuthService(credentialService)) },
         ]
       : []),
+    // Coding Plan 经 agent/configs 路由到 ultra 时，按需附带 ZCode OAuth JWT（对齐官方 _vt.readZCodeJwt）。
+    ...(() => {
+      setUltraZCodeJwtLoader(credentialService ? () => credentialService.load("zcodejwttoken") : null);
+      return [];
+    })(),
     // Start Plan 赠送活动预览/领取（billing/preview、billing/claim、marketing/touch）与 client/configs：
     // 若 Native HTTP 桥就绪，走 createQuotaApiClient（带完整 ZCode 官方头，且绕过 WebView CORS）；
     // 纯 Node/浏览器自检时回退到 fetch apiClient。

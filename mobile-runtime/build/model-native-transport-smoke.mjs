@@ -7,7 +7,7 @@ import {unlinkSync} from 'node:fs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
 const esbuild=createRequire(path.join(root,'zcode/apps/zcode-cli/package.json'))('esbuild');
 const out=path.join(root,`mobile-runtime/build/.tmp-model-native-${process.pid}.mjs`);
-await esbuild.build({stdin:{contents:'export {streamModelCompletion} from "./model-stream.ts"; export {mobileModelFetch} from "./model-transport.ts"; export {createMobileAgentService} from "./agent.ts"; export {createCommandEnvelope,getV4ClientId} from "../../zcode/packages/ui/src/v4/commandFactory.ts";',resolveDir:path.join(root,'mobile-runtime/ui')},outfile:out,bundle:true,format:'esm',platform:'node',target:'node24',logLevel:'warning',nodePaths:['web','ui','client','services','shared'].map(p=>path.join(root,'zcode/packages',p,'node_modules')).concat(path.join(root,'zcode/node_modules')),alias:{'@':path.join(root,'zcode/packages/ui/src')}});
+await esbuild.build({stdin:{contents:'export {streamModelCompletion} from "./model-stream.ts"; export {mobileModelFetch, setUltraZCodeJwtLoader} from "./model-transport.ts"; export {createMobileAgentService} from "./agent.ts"; export {createCommandEnvelope,getV4ClientId} from "../../zcode/packages/ui/src/v4/commandFactory.ts";',resolveDir:path.join(root,'mobile-runtime/ui')},outfile:out,bundle:true,format:'esm',platform:'node',target:'node24',logLevel:'warning',nodePaths:['web','ui','client','services','shared'].map(p=>path.join(root,'zcode/packages',p,'node_modules')).concat(path.join(root,'zcode/node_modules')),alias:{'@':path.join(root,'zcode/packages/ui/src')}});
 const originalFetch=globalThis.fetch;
 const jobs=new Map(); let serial=0,cancelled=0,mode='stream',requestRecord,ended=false;
 const server=http.createServer(async(req,res)=>{
@@ -24,13 +24,15 @@ const server=http.createServer(async(req,res)=>{
  setTimeout(()=>{ended=true;res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n');},180);
 });
 await new Promise(r=>server.listen(0,'127.0.0.1',r));
+let lastDispatchedUrl='';
 const nativeBridge={start(raw){const id=String(++serial),request=JSON.parse(raw),job={queue:[],done:false,controller:new AbortController()};jobs.set(id,job);
+ lastDispatchedUrl=request.url;
  assert.match(request.url,/^(https:\/\/api\.minimaxi\.com\/anthropic\/v1\/messages|https:\/\/zcode\.z\.ai\/api\/v1\/(zcode-plan|ultra)\/anthropic\/v1\/messages)$/,'模型请求只该打第三方 anthropic 网关或官方 zcode-plan/ultra 网关');
  (async()=>{try{const res=await originalFetch(`http://127.0.0.1:${server.address().port}`,{method:'POST',headers:request.headers,body:request.body,signal:job.controller.signal});job.status=res.status;job.headers=Object.fromEntries(res.headers);for await(const bytes of res.body)job.queue.push(Buffer.from(bytes).toString('base64'));}catch{job.error='native connection failed';}finally{job.done=true;}})();return JSON.stringify({id});},
  poll(id){const job=jobs.get(id);if(!job)return JSON.stringify({error:'missing'});const bodyBase64=job.queue.shift();const done=job.done&&!job.queue.length;const packet={status:job.status,headers:job.headers,bodyBase64,done,...(done&&job.error?{error:job.error}:{})};if(done)jobs.delete(id);return JSON.stringify(packet);},
  cancel(id){const job=jobs.get(id);if(job){cancelled++;job.controller.abort();jobs.delete(id);}return true;}};
 try{
- const {streamModelCompletion,mobileModelFetch,createMobileAgentService,createCommandEnvelope,getV4ClientId}=await import(pathToFileURL(out).href);
+ const {streamModelCompletion,mobileModelFetch,setUltraZCodeJwtLoader,createMobileAgentService,createCommandEnvelope,getV4ClientId}=await import(pathToFileURL(out).href);
  globalThis.zcodeModelHttp=nativeBridge;
  globalThis.fetch=async()=>{throw new TypeError('Failed to fetch (CORS)');};
  const target={apiFormat:'anthropic-messages',baseUrl:'https://api.minimaxi.com/anthropic',apiKey:'test-only-key',model:'MiniMax-M2.7'};
@@ -57,20 +59,37 @@ try{
   delete globalThis.localStorage;
  }
 
- // 0.13.0 ultra 签名链路（3012 终局）：官方域 messages + JWT 凭据 → 端点重写 zcode-plan→ultra
- // + X-Zcode-Authorization；握手 fetch 不可达时 fail-open（unsigned ultra 照发，官方同语义）。
+ // Start Plan 直发 zcode-plan（带 ZCode JWT 时也不重写到 ultra，也不打 c1f3a7e2 签名）。
  {
   const midStore=new Map();
   globalThis.localStorage={getItem:(k)=>midStore.has(k)?midStore.get(k):null,setItem:(k,v)=>midStore.set(k,String(v))};
-  const jwt=['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsInNpZ25fdHlwZSI6IlNJR04ifQ',Buffer.from(JSON.stringify({token_use:'project_access',api_key:'ak-smoke'})).toString('base64url'),'x'].join('.');
-  const ultraResponse=await mobileModelFetch('https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages',{headers:{'content-type':'application/json','authorization':`Bearer ${jwt}`,'x-session-id':'sess-smoke-session'},body:'{"model":"GLM-5.3-Flash"}'});
+  const jwt=['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsInNpZ25fdHlwZSI6IlNJR04ifQ',Buffer.from(JSON.stringify({token_use:'project_access',api_key:'ak-start'})).toString('base64url'),'x'].join('.');
+  const startResponse=await mobileModelFetch('https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages',{headers:{'content-type':'application/json','authorization':`Bearer ${jwt}`,'anthropic-dangerous-direct-browser-access':'true','x-session-id':'sess-start-plan'},body:'{"model":"GLM-5.3-Flash"}'});
+  await startResponse.text().catch(()=>{});
+  assert.equal(lastDispatchedUrl,'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages','Start Plan 必须直发 zcode-plan 端点，严禁重定向到 ultra');
+  assert.equal(requestRecord.headers['x-client-sig'],undefined,'Start Plan 不带 ultra 客户端签名');
+  assert.equal(requestRecord.headers['x-platform'],'linux-arm64');
+  const diag=JSON.parse(midStore.get('zcode-mobile.model.diag')??'[]');
+  const last=diag[diag.length-1];
+  assert.equal(last.dangerousBrowserHeader,false,'model.diag 应按剥头后的真实线头记录 dangerousBrowserHeader=false');
+  assert.equal(last.hasZcodeAgent,true,'model.diag 应按归一后的真实线头记录 hasZcodeAgent=true');
+  delete globalThis.localStorage;
+ }
+
+ // Coding Plan（open.bigmodel.cn）经 agent/configs 路由到 ultra，并按需附带 ZCode OAuth JWT；handshake fail-open。
+ {
+  const midStore=new Map();
+  globalThis.localStorage={getItem:(k)=>midStore.has(k)?midStore.get(k):null,setItem:(k,v)=>midStore.set(k,String(v))};
+  setUltraZCodeJwtLoader(async()=>'zcode-oauth-jwt-token');
+  const ultraResponse=await mobileModelFetch('https://open.bigmodel.cn/api/anthropic/v1/messages',{headers:{'content-type':'application/json','authorization':'Bearer coding-plan-id.secret','x-session-id':'sess-smoke-session'},body:'{"model":"GLM-5.3-Flash"}'});
   await ultraResponse.text().catch(()=>{});
-  // URL 重写已由桥 start 的 request.url 断言覆盖（mock handler 的 requestRecord 只存 headers/body）。
-  assert.match(String(requestRecord.headers['x-zcode-authorization']??''),/^Bearer ey/,'ultra 请求必须带 X-Zcode-Authorization（Bearer ZCode JWT）');
-  assert.equal(requestRecord.headers['x-platform'],'android-arm64','ultra 链路平台头用真值（官方无伪装语义）');
+  assert.equal(lastDispatchedUrl,'https://zcode.z.ai/api/v1/ultra/anthropic/v1/messages','Coding Plan 必须路由到 ultra');
+  assert.equal(requestRecord.headers['x-zcode-authorization'],'Bearer zcode-oauth-jwt-token','ultra 附带的 X-ZCode-Authorization 必须是 ZCode JWT');
+  assert.equal(requestRecord.headers['x-platform'],'linux-arm64','zcode.z.ai ultra 保持 linux-arm64 白名单值');
   const ultraDiag=JSON.parse(midStore.get('zcode-mobile.model.diag')??'[]');
   const ultraLast=ultraDiag[ultraDiag.length-1];
   assert.ok(ultraLast&&ultraLast.status!==undefined,'ultra 请求必须落 model.diag');
+  setUltraZCodeJwtLoader(null);
   delete globalThis.localStorage;
  }
 

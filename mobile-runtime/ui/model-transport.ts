@@ -5,7 +5,7 @@ import {
   isSigningBypassed,
   markSigningBypassed,
   readSigningFailureReason,
-  rewriteToUltraUrl,
+  resolveUltraRoute,
 } from "./ultra-signing.js";
 import { officialCompatibilityVersion } from "./server-compat.js";
 import {
@@ -165,17 +165,46 @@ function stripBrowserOnlyHeaders(headers: Record<string, string>): Record<string
   return out;
 }
 
+let ultraZCodeJwtLoader: (() => Promise<string | null | undefined>) | null = null;
+
+/** 注册 ZCode OAuth JWT 读取器（Coding Plan 经 agent/configs 路由到 ultra 时按需附带 X-ZCode-Authorization）。 */
+export function setUltraZCodeJwtLoader(loader: (() => Promise<string | null | undefined>) | null): void {
+  ultraZCodeJwtLoader = loader;
+}
+
+function isCodingPlanUltraUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase();
+    if (host !== "open.bigmodel.cn" && host !== "api.z.ai") return false;
+    return /^\/api\/anthropic(\/v1)?\/messages(\/|$)/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function readNormalizedZCodeAuthorization(): Promise<string | undefined> {
+  if (!ultraZCodeJwtLoader) return undefined;
+  try {
+    const raw = (await ultraZCodeJwtLoader())?.trim();
+    if (!raw || !/^[\x20-\x7e]+$/u.test(raw)) return undefined;
+    return /^Bearer\s/iu.test(raw) ? raw : `Bearer ${raw}`;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
- * ultra 签名链路的资格判定与头组/URL 准备（0.13.0）。
- * 官方 4.0.0 的对话请求 = agent/configs 下发路由 → ultra 端点 + X-Zcode-Authorization
- * （Bearer ZCode JWT）+ 签名五头；zcode-plan 端点已被服务端弃用（3012）。
- * 资格：官方域 zcode-plan anthropic messages 请求 + 非探测 + 有 JWT + 未 bypass。
+ * Coding Plan ultra 签名链路的资格判定与头组/URL 准备。
+ * 官方 4.0.0（zcode.cjs _vt + qpa）：
+ *   - Start Plan（zcode.z.ai/api/v1/zcode-plan/anthropic）直发 zcode-plan，不进 ultra、不做 c1f3a7e2 签名；
+ *   - Coding Plan（open.bigmodel.cn / api.z.ai 的 /api/anthropic/v1/messages）按 agent/configs 路由到
+ *     /api/v1/ultra[/ultra-zai]/anthropic/v1/messages 并附带 c1f3a7e2 签名五头及可选 X-ZCode-Authorization。
  */
-/** 同步资格判定：非官方域候选必须在不引入 await 的情况下直接短路——idle 看门狗
- *  测试对 fetch 路径的同步时序敏感，多一个微任务都会推迟首字节计时器的建立。 */
+/** 同步资格判定：非候选路径必须在零 await 下短路（idle 看门狗对 fetch 首字节时序敏感）。 */
 function isUltraCandidateSync(url: string, headers: Record<string, string>): boolean {
-  if (!url.includes("/v1/messages") || !url.includes("zcode.z.ai")) return false;
-  if (!url.includes("/zcode-plan/anthropic")) return false;
+  if (!isCodingPlanUltraUrl(url)) return false;
   const rawAuthorization = headerValue(headers, "authorization") ?? "";
   const apiKey = rawAuthorization.replace(/^Bearer\s+/i, "").trim() || headerValue(headers, "x-api-key")?.trim() || "";
   if (!apiKey || isSigningBypassed(apiKey)) return false;
@@ -186,27 +215,37 @@ async function rewriteToUltraUrlIfEligible(
   url: string,
   headers: Record<string, string>,
 ): Promise<{ url: string; headers: Record<string, string> } | null> {
-  if (!url.includes("/v1/messages") || !url.includes("zcode.z.ai")) return null;
-  if (!url.includes("/zcode-plan/anthropic")) return null;
+  if (!isCodingPlanUltraUrl(url)) return null;
   const rawAuthorization = headerValue(headers, "authorization") ?? "";
   const apiKey = rawAuthorization.replace(/^Bearer\s+/i, "").trim() || headerValue(headers, "x-api-key")?.trim() || "";
   if (!apiKey || isSigningBypassed(apiKey)) return null;
   const sessionId = headerValue(headers, "x-session-id")?.trim() ?? "";
+  const origin = new URL(url).origin;
+  const configsFetch: typeof fetch = (input, init) => {
+    const rawHeaders = new Headers(init?.headers ?? {});
+    const normalized = officialIdentityRequest(
+      input instanceof Request ? input.url : String(input),
+      Object.fromEntries(rawHeaders.entries()),
+    );
+    return fetch(normalized.url, { ...init, headers: normalized.headers });
+  };
   try {
-    const [rewritten, signingHeaders] = await Promise.all([
-      rewriteToUltraUrl(url, "bigmodel", (input, init) => fetch(input, init)),
+    const [route, signingHeaders] = await Promise.all([
+      resolveUltraRoute(url, configsFetch),
       buildUltraSigningHeaders({
         apiKey,
         sessionId,
         clientVersion: officialCompatibilityVersion(),
-        bigmodelOrigin: "https://open.bigmodel.cn",
+        bigmodelOrigin: origin,
       }),
     ]);
-    if (rewritten === url) return null; // 没改写成 ultra（映射缺失）就不打签名头，保持 zcode-plan 原请求
-    const extra: Record<string, string> = { ...signingHeaders, "X-Zcode-Authorization": `Bearer ${apiKey}` };
-    // 平台头真值（官方 jOi 无伪装语义）：ultra 按真实平台判定，不再沿用 billing 链的伪装。
-    setHeaderCaseInsensitive(extra, "X-Platform", "android-arm64");
-    return { url: rewritten, headers: extra };
+    if (!route.routed) return null;
+    const extra: Record<string, string> = { ...(signingHeaders ?? {}) };
+    if (route.includeZCodeAuthorization) {
+      const zcodeAuth = await readNormalizedZCodeAuthorization();
+      if (zcodeAuth) extra["X-ZCode-Authorization"] = zcodeAuth;
+    }
+    return { url: route.url, headers: extra };
   } catch {
     return null; // fail-open
   }
@@ -300,7 +339,6 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
   url = identity.url.toString();
   // 原生路径剥掉浏览器 CORS 自报头（官方桌面 CLI 不发它；服务端据此回 405 "This client
   // is not supported"——0.11.6 装机主诉）。桌面浏览器 harness 的 fetch 路径保留原头（CORS 需要）。
-  const diagHeaders = init.headers;
   init = {
     ...init,
     headers: withZCodeChatTraceHeaders(
@@ -309,13 +347,9 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
       init.body,
     ),
   };
-  const diagHeaderNames = Object.keys(init.headers).map((name) => name.toLowerCase()).sort();
-  const diagUserAgent = headerValue(init.headers, "user-agent");
-  // ── ultra 签名链路（0.13.0，3012 终局）：官方 4.0.0 的对话请求不再打 zcode-plan
-  // 端点（服务端弃用→3012），而是 agent/configs 下发路由 + v2/client 握手换 Ed25519
-  // 私钥 + 每请求签名五头。只对官方域的非探测 messages 请求生效；凭据/会话/版本缺一
-  // 或握手失败 → fail-open 按 unsigned 照发（官方 failOpenEligible 同语义）。
-  // 同步资格判定先短路：非候选路径零 await（idle 看门狗对 fetch 路径同步时序敏感）。
+  // ── Coding Plan ultra 签名链路（仅限 open.bigmodel.cn / api.z.ai 的 /api/anthropic/v1/messages）：
+  // Start Plan（zcode-plan/anthropic）直发原端点且不签名；Coding Plan 按 agent/configs 路由并做
+  // c1f3a7e2 握手签名（fail-open）。同步资格判定先短路：非候选路径零 await（idle 看门狗时序敏感）。
   const ultraTarget =
     isConnectivityProbeBody(init.body) || !isUltraCandidateSync(url, init.headers)
       ? null
@@ -326,6 +360,9 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
       setHeaderCaseInsensitive(init.headers, name, value);
     }
   }
+  const diagHeaders = init.headers;
+  const diagHeaderNames = Object.keys(init.headers).map((name) => name.toLowerCase()).sort();
+  const diagUserAgent = headerValue(init.headers, "user-agent");
   const bridge = (globalThis as { zcodeModelHttp?: NativeModelBridge }).zcodeModelHttp;
   if (!bridge) {
     // 壳里缺桥 = 应用装配坏了（桥注册失败 / 装的是旧包 / 页面在装配前就发了请求）。
