@@ -68,6 +68,36 @@ export interface AccountProviderConfigSourceOptions extends AccountProviderConne
 }
 
 /**
+ * off-peak 与 highspeed 都是已连接的个人/团队 Coding Plan 派生出的执行入口，
+ * 本身不单独校验套餐列表，也不按 selection.kind 直接比对模式。
+ */
+function isCodingPlanDerivedMode(mode: string | undefined): mode is "off-peak" | "highspeed" {
+  return mode === "off-peak" || mode === "highspeed";
+}
+
+/**
+ * 解析 Start Plan 所属的有效家族：
+ * 1. providerFamilyDomain 为空时按登录渠道确定唯一 Start 家族；
+ * 2. 若 providerFamilyDomain 是登录前“跳过”遗留的另一家族（且该家族下并未保存过付费套餐选择），
+ *    优先采用当前已登录账号的 Start 家族，避免把已登录的国内/海外 Start 误判为未连接。
+ */
+function resolveEffectiveStartPlanFamily(
+  settings: AccountProviderConnectionSettings,
+  loginStartPlanFamily: ProviderFamilyDomain | null,
+): ProviderFamilyDomain | null {
+  const configured = settings.providerFamilyDomain;
+  if (!configured) return loginStartPlanFamily;
+  if (
+    loginStartPlanFamily &&
+    configured !== loginStartPlanFamily &&
+    !settings.selections[configured]
+  ) {
+    return loginStartPlanFamily;
+  }
+  return configured;
+}
+
+/**
  * 把现有账号域、连接模式和套餐权益统一投影为领域层 Connection Result。
  *
  * 该适配器不保存凭据。Personal Coding Plan Key 的物理来源由注入端决定；
@@ -101,7 +131,7 @@ export function createAccountProviderConnectionResolver(
           config.access?.type === "zhipu-account" &&
           config.access.accountType === family &&
           config.access.mode &&
-          config.access.mode !== "off-peak"
+          !isCodingPlanDerivedMode(config.access.mode)
             ? [{ providerId, config, planKind: config.access.mode }]
             : [],
         );
@@ -164,14 +194,15 @@ export function createAccountProviderConnectionResolver(
       // last-known-good 只对同账号、同 Team 身份成立。切账号后的网络失败不能复活旧权益。
       const scope = JSON.stringify([
         await loadAccountIdentity(access.accountType),
-        access.mode === "team-coding-plan" && selection?.kind === "team-coding-plan"
+        (access.mode === "team-coding-plan" || isCodingPlanDerivedMode(access.mode)) &&
+        selection?.kind === "team-coding-plan"
           ? [selection.organizationId, selection.projectId, selection.productId]
           : null,
       ]);
       scopes.set(providerId, scope);
       const resetPrevious =
         previousScopes.has(providerId) && previousScopes.get(providerId) !== scope;
-      if (access.mode === "off-peak") {
+      if (isCodingPlanDerivedMode(access.mode)) {
         const selectedPlanKind = selection?.kind;
         const matchingPlanAvailable =
           settings.providerFamilyDomain === access.accountType &&
@@ -205,13 +236,14 @@ export function createAccountProviderConnectionResolver(
               unavailableReason: resolveAccountUnavailableReason(availability.reason),
             }
           : {}),
-        // 同步上游 v3.18.2：Start 跟随登录身份，付费套餐跟随连接选择；
-        // 当国内/免绑付费账号的 providerFamilyDomain 为空时，按登录渠道确定唯一 Start 家族，
+        // 同步上游 v4.0.0：Start 跟随登录身份，付费套餐跟随连接选择；
+        // 当国内/免绑付费账号的 providerFamilyDomain 为空或存在登录前遗留值时，按登录渠道确定唯一 Start 家族，
         // 避免 Start 永远 current=false 导致模型无法使用、设置页看不到已领取权益。
         current:
           access.mode === "start-plan"
             ? Boolean(await loadAccountIdentity(access.accountType)) &&
-              (settings.providerFamilyDomain ?? (await startPlanFamilyPromise)) === access.accountType
+              resolveEffectiveStartPlanFamily(settings, await startPlanFamilyPromise) ===
+                access.accountType
             : settings.providerFamilyDomain === access.accountType &&
               selection?.kind === access.mode,
         // 两个 Team 共用 Provider ID，观察器必须按同一快照中的完整身份比较，
@@ -319,10 +351,12 @@ export async function resolveCurrentAccountAccess(input: {
   const settings = await input.readSettings();
   const { accountType, mode } = input.access;
   if (mode === "start-plan") {
-    // 同步上游 v3.18.2：与 Account State 的 current 同一判定，
-    // providerFamilyDomain 为空时按登录渠道确定 Start 所属家族，确保已领取的 Start Plan 可查看且可调用。
-    const effectiveFamily =
-      settings.providerFamilyDomain ?? (await input.loadStartPlanFamily?.()) ?? null;
+    // 同步上游 v4.0.0：与 Account State 的 current 同一判定，
+    // providerFamilyDomain 为空或为登录前遗留值时按登录渠道确定 Start 所属家族，确保已领取的 Start Plan 可查看且可调用。
+    const effectiveFamily = resolveEffectiveStartPlanFamily(
+      settings,
+      (await input.loadStartPlanFamily?.()) ?? null,
+    );
     if (effectiveFamily !== accountType) return null;
     if (!(await input.loadAccountIdentity(accountType))?.trim()) return null;
     return { type: "zhipu-account", family: accountType, planKind: "start-plan" };
@@ -330,7 +364,7 @@ export async function resolveCurrentAccountAccess(input: {
   if (settings.providerFamilyDomain !== accountType) return null;
   const selection = settings.selections[accountType];
   if (!selection) return null;
-  if (mode === "off-peak") {
+  if (isCodingPlanDerivedMode(mode)) {
     if (selection.kind !== "individual-coding-plan" && selection.kind !== "team-coding-plan") {
       return null;
     }
