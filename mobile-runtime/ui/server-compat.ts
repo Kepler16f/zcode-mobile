@@ -19,15 +19,16 @@ export const DESKTOP_COMPATIBILITY_VERSION_KEY = "zcode-mobile.desktopCompatibil
  * 真值由构建期 official-version.mjs 从本机官方安装包实挖（官方壳主进程同样写死版本并
  * 经 env 传给 CLI，"壳带版本"就是官方自己的形状），经 `__ZCODE_VERSION__` define 注入。
  */
-export const OFFICIAL_COMPAT_VERSION = "3.18.2";
+export const OFFICIAL_COMPAT_VERSION = "4.0.0";
 /**
- * 官方桌面 CLI 模型请求的 ai-sdk/anthropic UA 版本兜底（同上，构建期实挖经
- * `__ZCODE_AI_SDK_ANTHROPIC_VERSION__` 注入）。官方模型请求的 UA 是上下文层与 SDK 层
- * **空格拼接**：`ZCode/3.18.2 ai-sdk/anthropic/3.0.81`（官方 UO() 把已有 user-agent 与
- * SDK UA join）。zcode-plan 网关 405 "This client is not supported" 的判定若看 UA，
- * 差这个后缀就是差异点。
+ * 官方桌面 CLI 模型请求的 AI SDK UA 版本兜底（同上，构建期从 glm/zcode.cjs 实挖经
+ * `__ZCODE_AI_SDK_ANTHROPIC_VERSION__` 与 `__ZCODE_AI_SDK_PROVIDER_UTILS_VERSION__` 注入）。
+ * 官方模型请求在 FIn() 与 postToApi() 两层经 n2() 依次空格拼接：
+ * `ZCode/<ver> ai-sdk/anthropic/<sdkVer> ai-sdk/provider-utils/<utilsVer> runtime/node.js/<nodeVer>`。
  */
 export const OFFICIAL_AI_SDK_ANTHROPIC_VERSION = "3.0.81";
+export const OFFICIAL_AI_SDK_PROVIDER_UTILS_VERSION = "4.0.27";
+export const OFFICIAL_NODE_RUNTIME_UA = "runtime/node.js/v22.14.0";
 
 /** 用户覆盖优先，其次构建期实挖值（跟随上游），写死常量只在 define 缺席时兜底。 */
 export function officialCompatibilityVersion(): string {
@@ -52,6 +53,27 @@ export function officialAiSdkAnthropicVersion(): string {
     return __ZCODE_AI_SDK_ANTHROPIC_VERSION__;
   }
   return OFFICIAL_AI_SDK_ANTHROPIC_VERSION;
+}
+
+/** ai-sdk/provider-utils 的 UA 版本：优先构建期实挖，写死常量兜底。 */
+export function officialAiSdkProviderUtilsVersion(): string {
+  if (
+    typeof __ZCODE_AI_SDK_PROVIDER_UTILS_VERSION__ !== "undefined" &&
+    /^\d+\.\d+\.\d+/.test(__ZCODE_AI_SDK_PROVIDER_UTILS_VERSION__)
+  ) {
+    return __ZCODE_AI_SDK_PROVIDER_UTILS_VERSION__;
+  }
+  return OFFICIAL_AI_SDK_PROVIDER_UTILS_VERSION;
+}
+
+/** 官方桌面 CLI 发送 Anthropic 模型请求时的完整四段 User-Agent。 */
+export function officialAnthropicModelUserAgent(): string {
+  return [
+    `ZCode/${officialCompatibilityVersion()}`,
+    `ai-sdk/anthropic/${officialAiSdkAnthropicVersion()}`,
+    `ai-sdk/provider-utils/${officialAiSdkProviderUtilsVersion()}`,
+    OFFICIAL_NODE_RUNTIME_UA,
+  ].join(" ");
 }
 export function desktopCompatibilityVersion(fallback: string): string {
   try {return globalThis.localStorage?.getItem(DESKTOP_COMPATIBILITY_VERSION_KEY)?.trim() || fallback;} catch {return fallback;}

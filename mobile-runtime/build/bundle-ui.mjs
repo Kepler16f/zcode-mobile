@@ -16,6 +16,9 @@ const root = path.resolve(here, "../..");
 // 与 bundle.mjs 同一份实挖结果：CLI 版本 + ai-sdk/anthropic UA 版本（跟随上游，见 official-version.mjs）。
 const officialVersions = readOfficialVersions(root);
 const officialVersion = officialVersions.version;
+console.log(
+  `[official-version] ZCode/${officialVersion} ai-sdk/anthropic/${officialVersions.aiSdkAnthropic} ai-sdk/provider-utils/${officialVersions.aiSdkProviderUtils} (${officialVersions.source})`,
+);
 const zcodeRoot = path.join(root, "zcode");
 const cliRoot = path.join(zcodeRoot, "apps/zcode-cli");
 const esbuild = createRequire(path.join(cliRoot, "package.json"))("esbuild");
@@ -175,6 +178,7 @@ const result = await esbuild.build({
     // 所以"打包成功但模型清单是坏的"这种问题在构建这一步就炸，不会等到装机才发现。
     __ZCODE_VERSION__: JSON.stringify(officialVersion),
     __ZCODE_AI_SDK_ANTHROPIC_VERSION__: JSON.stringify(officialVersions.aiSdkAnthropic),
+    __ZCODE_AI_SDK_PROVIDER_UTILS_VERSION__: JSON.stringify(officialVersions.aiSdkProviderUtils),
     __ZCODE_BUILTIN_PROVIDER_CONFIG_JSON__: JSON.stringify(zcodeBuiltin.content),
   },
   loader: {

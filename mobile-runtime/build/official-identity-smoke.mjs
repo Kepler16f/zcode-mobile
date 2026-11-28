@@ -52,9 +52,9 @@ const official = calls[0];
 assert.equal(official.headers.authorization, "Bearer jwt-token", "业务 Authorization 被覆盖");
 assert.equal(official.headers["x-platform"], "linux-arm64", "X-Platform 未归一");
 assert.equal(official.headers["x-os-category"], "linux", "X-Os-Category 未归一");
-assert.ok(/^3\.\d+\.\d+/.test(official.headers["x-zcode-app-version"] ?? ""), "版本头不是官方版本号形状");
+assert.ok(/^[1-9]\d*\.\d+\.\d+/.test(official.headers["x-zcode-app-version"] ?? ""), "版本头不是官方版本号形状");
 assert.ok(official.headers["x-device-mid"], "X-Device-Mid 缺失");
-assert.ok(/app_version=3\.\d+\.\d+/.test(official.url), `app_version 未归一：${official.url}`);
+assert.ok(/app_version=[1-9]\d*\.\d+\.\d+/.test(official.url), `app_version 未归一：${official.url}`);
 
 // ② 非官方域：零注入。
 await globalThis.fetch("https://api.github.com/repos/x", { headers: { Authorization: "Bearer t" } });

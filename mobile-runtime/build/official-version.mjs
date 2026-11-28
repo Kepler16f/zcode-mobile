@@ -22,9 +22,13 @@ function readServerCompatFallback(root) {
   const source = readFileSync(path.join(root, "mobile-runtime/ui/server-compat.ts"), "utf8");
   const compat = source.match(/export\s+const\s+OFFICIAL_COMPAT_VERSION\s*=\s*"([^"]+)"/);
   const aiSdk = source.match(/export\s+const\s+OFFICIAL_AI_SDK_ANTHROPIC_VERSION\s*=\s*"([^"]+)"/);
+  const providerUtils = source.match(
+    /export\s+const\s+OFFICIAL_AI_SDK_PROVIDER_UTILS_VERSION\s*=\s*"([^"]+)"/,
+  );
   return {
     compat: compat?.[1],
     aiSdkAnthropic: aiSdk?.[1],
+    aiSdkProviderUtils: providerUtils?.[1],
   };
 }
 
@@ -54,6 +58,16 @@ function probeCompatVersionFromShell(asarPath) {
 function probeAiSdkAnthropicVersionFromCli(cliPath) {
   const source = readFileSync(cliPath, "utf8");
   const reference = source.match(/ai-sdk\/anthropic\/\$\{([A-Za-z_$][\w$]*)\}/);
+  if (!reference?.[1]) return null;
+  const assignment = new RegExp(
+    `${variablePattern(reference[1])}="((?:\\d+\\.){2}\\d+)"`,
+  ).exec(source);
+  return assignment?.[1] ?? null;
+}
+
+function probeAiSdkProviderUtilsVersionFromCli(cliPath) {
+  const source = readFileSync(cliPath, "utf8");
+  const reference = source.match(/ai-sdk\/provider-utils\/\$\{([A-Za-z_$][\w$]*)\}/);
   if (!reference?.[1]) return null;
   const assignment = new RegExp(
     `${variablePattern(reference[1])}="((?:\\d+\\.){2}\\d+)"`,
@@ -94,14 +108,26 @@ export function readOfficialVersions(root) {
       probeCompatVersionFromShell(path.join(dir, "app.asar")) ?? fallback.compat;
     const aiSdkAnthropic =
       probeAiSdkAnthropicVersionFromCli(cliPath) ?? fallback.aiSdkAnthropic;
-    if (compat && aiSdkAnthropic) {
-      return { version: compat, aiSdkAnthropic, source: "official-shell" };
+    const aiSdkProviderUtils =
+      probeAiSdkProviderUtilsVersionFromCli(cliPath) ?? fallback.aiSdkProviderUtils;
+    if (compat && aiSdkAnthropic && aiSdkProviderUtils) {
+      return {
+        version: compat,
+        aiSdkAnthropic,
+        aiSdkProviderUtils,
+        source: "official-shell",
+      };
     }
   }
-  if (!fallback.compat || !fallback.aiSdkAnthropic) {
+  if (!fallback.compat || !fallback.aiSdkAnthropic || !fallback.aiSdkProviderUtils) {
     throw new Error("官方版本实挖失败且 server-compat.ts 兜底常量缺失");
   }
-  return { version: fallback.compat, aiSdkAnthropic: fallback.aiSdkAnthropic, source: "fallback" };
+  return {
+    version: fallback.compat,
+    aiSdkAnthropic: fallback.aiSdkAnthropic,
+    aiSdkProviderUtils: fallback.aiSdkProviderUtils,
+    source: "fallback",
+  };
 }
 
 /** 兼容旧调用（bundle.mjs/bundle-ui.mjs 一直用这一个）。 */

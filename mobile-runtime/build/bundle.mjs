@@ -13,6 +13,9 @@ const root = path.resolve(here, "../..");
 // 从本机官方安装包实挖（跟随上游），CI/无官方安装降级 server-compat.ts 兜底常量。
 const officialVersions = readOfficialVersions(root);
 const officialVersion = officialVersions.version;
+console.log(
+  `[official-version] ZCode/${officialVersion} ai-sdk/anthropic/${officialVersions.aiSdkAnthropic} ai-sdk/provider-utils/${officialVersions.aiSdkProviderUtils} (${officialVersions.source})`,
+);
 const cliRoot = path.join(root, "zcode/apps/zcode-cli");
 const esbuild = createRequire(path.join(cliRoot, "package.json"))("esbuild");
 
@@ -38,6 +41,7 @@ const result = await esbuild.build({
   define: {
     __ZCODE_VERSION__: JSON.stringify(officialVersion),
     __ZCODE_AI_SDK_ANTHROPIC_VERSION__: JSON.stringify(officialVersions.aiSdkAnthropic),
+    __ZCODE_AI_SDK_PROVIDER_UTILS_VERSION__: JSON.stringify(officialVersions.aiSdkProviderUtils),
   },
   // 浏览器没有全局 Buffer，Glob/二进制分支直接用裸标识符。
   inject: [path.join(root, "mobile-runtime/compat/prelude.mjs")],
