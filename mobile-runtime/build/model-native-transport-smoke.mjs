@@ -47,13 +47,28 @@ try{
   globalThis.localStorage={getItem:(k)=>midStore.has(k)?midStore.get(k):null,setItem:(k,v)=>midStore.set(k,String(v))};
   const officialResponse=await mobileModelFetch('https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages',{headers:{'content-type':'application/json'},body:'{}'});
   await officialResponse.text().catch(()=>{});
-  assert.match(String(requestRecord.headers['user-agent']??''),/^ZCode\/\d+\.\d+\.\d+ ai-sdk\/anthropic\/\d+\.\d+\.\d+$/,'官方域模型请求 UA 必须是 ZCode/<ver> ai-sdk/anthropic/<sdkVer> 双层形状');
+  assert.match(String(requestRecord.headers['user-agent']??''),/^ZCode\/\d+\.\d+\.\d+ ai-sdk\/anthropic\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/\d+\.\d+\.\d+ runtime\/node\.js\/v\d+\.\d+\.\d+$/,'官方域模型请求 UA 必须是 ZCode/<ver> ai-sdk/anthropic/<sdkVer> ai-sdk/provider-utils/<utilsVer> runtime/node.js/<nodeVer> 四段形状');
   assert.ok(requestRecord.headers['x-platform'],'官方域模型请求必须带身份头');
   const diag=JSON.parse(midStore.get('zcode-mobile.model.diag')??'[]');
   const last=diag[diag.length-1];
   assert.ok(last&&Array.isArray(last.headerNames)&&last.headerNames.includes('x-platform'),'model.diag 必须记录实际头名清单（含归一层注入的身份头）');
   assert.ok(!last.headerNames.includes('anthropic-dangerous-direct-browser-access'),'原生路径必须剥掉浏览器自报头');
   delete globalThis.localStorage;
+ }
+
+ // 0.12.9 官方对话请求的 system 三段形状（3012 根因修复）：网关按请求体判客户端，
+ // 官方是 cli_prefix/identity/dynamic 三个 text block、每块带 cache_control ephemeral；
+ // metadata.user_id 形状 {"device_id","account_uuid","session_id"}。
+ {
+  const officialTarget={apiFormat:'anthropic-messages',baseUrl:'https://zcode.z.ai/api/v1/zcode-plan/anthropic',apiKey:'jwt-token',model:'GLM-5.3-Flash'};
+  const segments=['You are ZCode, an interactive coding agent','IDENTITY BODY','\n\nDYNAMIC BODY'];
+  await streamModelCompletion({target:officialTarget,messages:[{role:'system',content:segments.join('\n\n'),systemSegments:segments},{role:'user',content:'hi'}],maxOutputTokens:64,onDelta(){}});
+  const sentBody=requestRecord.body;
+  assert.ok(Array.isArray(sentBody.system)&&sentBody.system.length===3,'官方域对话请求 system 必须是三段 text block');
+  assert.equal(sentBody.system[0].text,'You are ZCode, an interactive coding agent','system[0] 必须是官方 cli_prefix 逐字（含 coding 一词）');
+  assert.equal(sentBody.system[0].cache_control?.type,'ephemeral','system[0] 必须带 cache_control ephemeral');
+  assert.equal(sentBody.system[2].cache_control?.type,'ephemeral','system[2] 必须带 cache_control ephemeral');
+  assert.ok(typeof sentBody.metadata?.user_id==='string'&&sentBody.metadata.user_id.includes('"device_id"'),'官方域对话请求必须带官方形状 metadata.user_id');
  }
 
  // 正式会话通过同一原生桥发请求，不能只证明设置页的测试可用。

@@ -104,6 +104,8 @@ import type { ToolEngine, ToolEngineFactory, ToolRunResult } from "./tool-engine
 import { capToolContent } from "./tool-engine.js";
 import { AGENT_TOOL, SKILL_TOOL, discoverMobileCapabilities, executeMobileSkill, runMobileSubagent, type ExecuteSubagentTool } from "./skills-subagents.js";
 import * as vfs from "../compat/vfs.mjs";
+import { buildOfficialConversationSystemSegments } from "./official-system-blocks.js";
+import { OFFICIAL_LINUX_KERNEL } from "./quota-transport.js";
 import { parseDsmlCalls } from "./dsml.js";
 import { markJankPhase } from "./jank-witness.js";
 import type { MobileSessionStore, PersistedSession, PersistedSessionState, PersistedTurnUsage } from "./session-store.js";
@@ -1884,7 +1886,23 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       // 摘要就是最终摘要。桌面端在摘要请求装不下时是把更早的轮次**丢掉**再重试
       // （compact-selection.ts 的 selectCompactEntriesAfterPromptTooLong）——那等于悄悄
       // 丢历史。端侧改成分段摘要：装不下就分几次，历史一条不丢。
-      const systemMessage: ModelTurnMessage = { role: "system", content: COMPACT_SUMMARY_SYSTEM_PROMPT };
+      // 压缩请求同样走 zcode-plan 网关（官方域）——同一次 3012 判定，system 必须是官方
+      // 三段形状：压缩指令作为 mobileNotes 拼进 dynamic 块尾部。
+      const compactSegments = buildOfficialConversationSystemSegments({
+        env: {
+          cwd: localWorkspacePath(session.workspacePath),
+          platform: "linux",
+          shell: "/system/bin/sh",
+          osVersion: OFFICIAL_LINUX_KERNEL,
+          model: selection?.modelId ?? session.config.modelSelection?.modelId ?? session.config.model ?? undefined,
+        },
+        mobileNotes: COMPACT_SUMMARY_SYSTEM_PROMPT,
+      });
+      const systemMessage: ModelTurnMessage = {
+        role: "system",
+        content: compactSegments.join("\n\n"),
+        systemSegments: compactSegments,
+      };
       const instructionMessage: ModelTurnMessage = { role: "user", content: COMPACT_SUMMARY_USER_INSTRUCTION };
       /** 发一段摘要请求；装不下（上下文/附件过大）时改用附件占位再试一次。 */
       const summarizePass = async (passRows: ConversationRow[], prefix: string | null, passIndex: number): Promise<string> => {
@@ -1964,7 +1982,14 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         const prefixTokens = prefix
           ? estimateMessageTokens({ role: "user", content: compactSummaryPrefix(prefix) })
           : 0;
-        const rowBudget = Math.max(64, passInputBudget - compactInstructionReserve - prefixTokens);
+        // 0.12.9：system（官方三段）也是摘要请求输入的一部分，必须从行预算里扣——
+        // 不扣的话分段器按满预算装行，summarizePass 的实际估算（含 system）超预算抛错，
+        // 表现就是"单个完整历史轮次连同摘要前缀仍超过摘要输入预算"。
+        const systemTokens = estimateMessageTokens(systemMessage);
+        const rowBudget = Math.max(
+          64,
+          passInputBudget - systemTokens - compactInstructionReserve - prefixTokens,
+        );
         const count = Math.max(1, planCompactPass(remaining.map((turn) => turn.cost), rowBudget));
         const passRows = remaining.slice(0, count).flatMap((turn) => turn.rows);
         remaining = remaining.slice(count);
@@ -2050,8 +2075,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   function systemPrompt(workspacePath: string, engine: ToolEngine | null, mode: MobileExecutionMode = "build"): string {
     workspacePath = localWorkspacePath(workspacePath);
     const lines = [
-      "You are ZCode running on a phone.",
-      "Reply in the language the user writes in.",
+      "You are ZCode, an interactive agent",
+      "You are running on an Android mobile device. Reply in the language the user writes in.",
     ];
     if (engine) {
       lines.push(
@@ -2924,14 +2949,31 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       });
       return;
     }
+    // 官方三段 system（0.12.9，405/3012 修复）：zcode-plan 网关按请求体的 system 形状
+    // 判客户端，官方对话请求是 cli_prefix/identity/dynamic 三个 text block。安卓附加说明
+    // （workspace 真路径/全文件访问/执行模式/skills/hook）拼进 dynamic 块尾部——官方身份
+    // 段在前过网关校验，端侧功能语义在后。content 恒等于拼接文本（第三方网关与预算估算
+    // 语义不变），systemSegments 只在官方域块化时被消费（model-stream buildRequest）。
+    const mobileNotes = [
+      systemPrompt(params.workspacePath, engine, execMode),
+      ...(capabilities ? [capabilities.catalog] : []),
+      ...hookNotes.map((note) => `Hook context: ${note}`),
+    ].join("\n");
+    const systemSegments = buildOfficialConversationSystemSegments({
+      env: {
+        cwd: localWorkspacePath(params.workspacePath),
+        platform: "linux",
+        shell: "/system/bin/sh",
+        osVersion: OFFICIAL_LINUX_KERNEL,
+        model: session.config.modelSelection?.modelId ?? session.config.model ?? undefined,
+      },
+      mobileNotes,
+    });
     const transcript: ModelTurnMessage[] = [
       {
         role: "system",
-        content: [
-          systemPrompt(params.workspacePath, engine, execMode),
-          ...(capabilities ? [capabilities.catalog] : []),
-          ...hookNotes.map((note) => `Hook context: ${note}`),
-        ].join("\n"),
+        content: systemSegments.join("\n\n"),
+        systemSegments,
       },
       ...history,
     ];

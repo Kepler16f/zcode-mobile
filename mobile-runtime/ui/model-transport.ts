@@ -1,5 +1,9 @@
 import { getOrCreateSessionId, isZCodeContextHost, officialIdentityRequest } from "./quota-transport.js";
-import { officialAiSdkAnthropicVersion } from "./server-compat.js";
+import {
+  officialAiSdkAnthropicVersion,
+  officialAiSdkProviderUtilsVersion,
+  OFFICIAL_NODE_RUNTIME_UA,
+} from "./server-compat.js";
 
 function headerHas(headers: Record<string, string>, name: string): boolean {
   const lower = name.toLowerCase();
@@ -12,13 +16,35 @@ function headerValue(headers: Record<string, string>, name: string): string | un
   return found ? headers[found] : undefined;
 }
 
-function withZCodeChatTraceHeaders(url: URL, headers: Record<string, string>): Record<string, string> {
+function setHeaderCaseInsensitive(headers: Record<string, string>, name: string, value: string): void {
+  const lower = name.toLowerCase();
+  for (const existing of Object.keys(headers)) {
+    if (existing.toLowerCase() === lower) delete headers[existing];
+  }
+  headers[name] = value;
+}
+
+function isConnectivityProbeBody(body: string): boolean {
+  return typeof body === "string" && body.includes("You are ZCode connectivity probe.");
+}
+
+function withZCodeChatTraceHeaders(
+  url: URL,
+  headers: Record<string, string>,
+  body: string,
+): Record<string, string> {
   if (!isZCodeContextHost(url)) return headers;
   const out = { ...headers };
+  const connectivityProbe = isConnectivityProbeBody(body);
   const fallbackId = () => `${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
   if (!headerHas(out, "x-query-id")) out["x-query-id"] = crypto.randomUUID?.() ?? fallbackId();
   if (!headerHas(out, "x-session-id")) out["x-session-id"] = getOrCreateSessionId();
-  if (!headerHas(out, "x-zcode-query-source")) out["x-zcode-query-source"] = "main_turn";
+  if (!headerHas(out, "x-zcode-query-source")) {
+    out["x-zcode-query-source"] = connectivityProbe ? "provider_settings_connectivity" : "main_turn";
+  }
+  if (connectivityProbe) {
+    setHeaderCaseInsensitive(out, "X-ZCode-Session-Type", "other");
+  }
   if (!headerHas(out, "x-zcode-trace-id")) out["x-zcode-trace-id"] = crypto.randomUUID?.() ?? fallbackId();
   return out;
 }
@@ -38,9 +64,51 @@ interface ModelDiagEntry {
   /** 实际发出的头名清单（小写、只记名不记值）——装机报告可与官方请求逐头对比。 */
   headerNames?: string[];
   userAgent?: string;
+  /** 请求体结构摘要（0.12.9）：网关 3012 按请求体判客户端，只有头清单不够定位。 */
+  bodyShape?: {
+    model?: string;
+    systemBlocks?: number;
+    systemFirstChars?: string;
+    hasMetadata?: boolean;
+    toolsCount?: number;
+    maxTokens?: number;
+    stream?: boolean;
+    bodyBytes?: number;
+  };
   status?: number;
   errorBody?: string;
   error?: string;
+}
+
+/** 从请求体 JSON 提取结构摘要（只记形状不记对话内容——隐私与体积都安全）。 */
+function readBodyShape(body: string): ModelDiagEntry["bodyShape"] | undefined {
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const system = parsed.system;
+    const systemBlocks = Array.isArray(system)
+      ? system.length
+      : typeof system === "string" && system.trim()
+        ? 1
+        : 0;
+    const systemFirst = Array.isArray(system)
+      ? String((system[0] as { text?: string } | undefined)?.text ?? "").slice(0, 48)
+      : typeof system === "string"
+        ? system.slice(0, 48)
+        : "";
+    const tools = parsed.tools;
+    return {
+      model: typeof parsed.model === "string" ? parsed.model : undefined,
+      systemBlocks,
+      systemFirstChars: systemFirst,
+      hasMetadata: parsed.metadata != null,
+      toolsCount: Array.isArray(tools) ? tools.length : undefined,
+      maxTokens: typeof parsed.max_tokens === "number" ? parsed.max_tokens : undefined,
+      stream: parsed.stream === true,
+      bodyBytes: body.length,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
 /** 从取证 Packet 收集错误响应体（前 300 字）；无 body/解不了返回空串。 */
@@ -143,8 +211,16 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
   const officialModelHeaders: Record<string, string> = {};
   for (const [name, value] of Object.entries(identity.headers)) {
     if (name.toLowerCase() === "user-agent" && isZCodeContextHost(identity.url)) {
-      const suffix = ` ai-sdk/anthropic/${officialAiSdkAnthropicVersion()}`;
-      officialModelHeaders[name] = value.includes("ai-sdk/anthropic/") ? value : `${value}${suffix}`;
+      const sdkSuffix = [
+        `ai-sdk/anthropic/${officialAiSdkAnthropicVersion()}`,
+        `ai-sdk/provider-utils/${officialAiSdkProviderUtilsVersion()}`,
+        OFFICIAL_NODE_RUNTIME_UA,
+      ].join(" ");
+      officialModelHeaders[name] = value.includes("ai-sdk/provider-utils/")
+        ? value
+        : value.includes("ai-sdk/anthropic/")
+          ? `${value} ai-sdk/provider-utils/${officialAiSdkProviderUtilsVersion()} ${OFFICIAL_NODE_RUNTIME_UA}`
+          : `${value} ${sdkSuffix}`;
       continue;
     }
     officialModelHeaders[name] = value;
@@ -153,7 +229,14 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
   // 原生路径剥掉浏览器 CORS 自报头（官方桌面 CLI 不发它；服务端据此回 405 "This client
   // is not supported"——0.11.6 装机主诉）。桌面浏览器 harness 的 fetch 路径保留原头（CORS 需要）。
   const diagHeaders = init.headers;
-  init = { ...init, headers: withZCodeChatTraceHeaders(identity.url, stripBrowserOnlyHeaders(officialModelHeaders)) };
+  init = {
+    ...init,
+    headers: withZCodeChatTraceHeaders(
+      identity.url,
+      stripBrowserOnlyHeaders(officialModelHeaders),
+      init.body,
+    ),
+  };
   const diagHeaderNames = Object.keys(init.headers).map((name) => name.toLowerCase()).sort();
   const diagUserAgent = headerValue(init.headers, "user-agent");
   const bridge = (globalThis as { zcodeModelHttp?: NativeModelBridge }).zcodeModelHttp;
@@ -241,6 +324,7 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
       hasZcodeAgent: headerHas(diagHeaders, "x-zcode-agent"),
       headerNames: diagHeaderNames,
       userAgent: diagUserAgent,
+      bodyShape: readBodyShape(init.body),
       status,
     };
     if (status >= 400) {

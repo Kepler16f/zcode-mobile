@@ -13,6 +13,15 @@
 // 这里直接抛，绝不把载荷交给渲染。
 import type { ModelApiFormat } from "./provider-target.js";
 import { mobileModelFetch } from "./model-transport.js";
+import { getOrCreateDeviceMid, getOrCreateSessionId, isZCodeContextHost } from "./quota-transport.js";
+
+/**
+ * 官方 ZCode 4.0.0 客户端的系统提示白名单前缀（对齐 apps/zcode-cli/packages/core/src/context/sections/cli-prefix.ts
+ * 与 workspace-generate-text.ts）：zcode-plan / ultra 网关按 Anthropic 请求体的 system[] 首块校验官方客户端身份，
+ * 非白名单形状或裸字符串 system 会被网关返回 HTTP 405 `This client is not supported. Please use the official ZCode client.`。
+ */
+export const OFFICIAL_ZCODE_CLI_SYSTEM_PREFIX = "You are ZCode, an interactive coding agent";
+export const OFFICIAL_ZCODE_CONNECTIVITY_SYSTEM_PROMPT = "You are ZCode connectivity probe.";
 
 export type { ModelApiFormat };
 
@@ -102,6 +111,13 @@ export interface ModelTurnMessage {
   toolCalls?: ModelToolCall[];
   /** role==="tool" 时对应的调用 id。 */
   toolCallId?: string;
+  /**
+   * 官方域对话请求的 system 三段（0.12.9，405/3012 修复）：zcode-plan 网关按请求体的
+   * system 形状判客户端——官方是 cli_prefix/identity/dynamic 三个 text block、每块带
+   * cache_control ephemeral。官方域时按这组分块（见 toAnthropicSystemBlocks）；content
+   * 恒等于 segments.join("\n\n")（第三方网关与 token 预算估算用拼接文本，语义不变）。
+   */
+  systemSegments?: readonly string[];
 }
 
 function attachmentText(attachment: { fileName: string; dataBase64: string }): string {
@@ -330,7 +346,7 @@ function isEffortLevel(level: string): boolean {
  * level 为空 = 用户没选 → 一律 null（请求体与未接此功能前逐字节一致）。
  */
 export function reasoningBodyFields(
-  target: Pick<ModelTarget, "apiFormat" | "reasoningLevel" | "reasoningValues">,
+  target: Pick<ModelTarget, "apiFormat" | "model" | "reasoningLevel" | "reasoningValues">,
 ): Record<string, unknown> | null {
   const level = target.reasoningLevel?.trim().toLowerCase();
   if (!level) return null;
@@ -352,6 +368,19 @@ export function reasoningBodyFields(
     return null;
   }
   if (target.apiFormat === "anthropic-messages") {
+    // 对齐 zcode-builtin.json 的 modelApiRules（GLM-5.4 / GLM-5.3 / GLM-5.3-Flash / GLM-5.2 / GLM-5-Turbo）：
+    // Anthropic 协议下 GLM-5 系列使用 thinking.type + output_config.effort，不带 budget_tokens。
+    if (/glm-5/i.test(target.model)) {
+      if (OFF_LEVELS.has(level)) return { thinking: { type: "disabled" } };
+      if (ON_LEVELS.has(level)) return { thinking: { type: "enabled" } };
+      if (isEffortLevel(level)) {
+        return {
+          thinking: { type: "enabled" },
+          output_config: { effort: level },
+        };
+      }
+      return null;
+    }
     if (OFF_LEVELS.has(level)) return { thinking: { type: "disabled" } };
     if (ON_LEVELS.has(level)) return { thinking: { type: "enabled", budget_tokens: 4096 } };
     const budget = isEffortLevel(level) ? ANTHROPIC_THINKING_BUDGET[level] : undefined;
@@ -409,9 +438,84 @@ function toAnthropicMessages(msgs: ModelTurnMessage[]): unknown[] {
       out.push({ role: "assistant", content: blocks });
       continue;
     }
-    out.push({ role: m.role, content: attachmentBlocks(m, "anthropic") ?? m.content });
+    out.push({
+      role: m.role,
+      content: attachmentBlocks(m, "anthropic") ?? [{ type: "text", text: m.content }],
+    });
   }
   return out;
+}
+
+function isOfficialZCodeRequestUrl(rawUrl: string): boolean {
+  try {
+    return isZCodeContextHost(new URL(rawUrl));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Anthropic 顶层 system 消息块序列化（对齐 @ai-sdk/anthropic Yaa() 与上游 system-prompt-contract.md）：
+ * 1. 官方域（zcode.z.ai / api.z.ai / open.bigmodel.cn）强制保证：
+ *    - 连通性探测保留单块 `[{ type: "text", text: "You are ZCode connectivity probe." }]`；
+ *    - 正常会话/压缩/子代理请求保证 system[0] 为 `{ type: "text", text: "You are ZCode, an interactive agent" }`，
+ *      其余指令拆入 system[1]（左边界 `\n` + ephemeral cache_control），与官方桌面 model-io 逐块对齐。
+ * 2. 第三方 Anthropic 兼容网关零身份注入，仅将非空 system 映射为标准 text 块数组。
+ */
+function toAnthropicSystemBlocks(
+  systemMessages: readonly ModelTurnMessage[],
+  officialZCodeHost: boolean,
+): Array<Record<string, unknown>> | undefined {
+  const parts = systemMessages
+    .map((m) => m.content)
+    .filter((text) => typeof text === "string" && text.trim().length > 0);
+  if (!officialZCodeHost) {
+    if (parts.length === 0) return undefined;
+    return parts.map((text) => ({ type: "text", text }));
+  }
+  if (parts.length === 1 && parts[0]!.trim() === OFFICIAL_ZCODE_CONNECTIVITY_SYSTEM_PROMPT) {
+    return [{ type: "text", text: OFFICIAL_ZCODE_CONNECTIVITY_SYSTEM_PROMPT }];
+  }
+  const combined = parts.join("\n\n").trim();
+  if (!combined) {
+    return [{ type: "text", text: OFFICIAL_ZCODE_CLI_SYSTEM_PREFIX }];
+  }
+  if (combined === OFFICIAL_ZCODE_CLI_SYSTEM_PREFIX) {
+    return [{ type: "text", text: OFFICIAL_ZCODE_CLI_SYSTEM_PREFIX }];
+  }
+  const rest = combined.startsWith(OFFICIAL_ZCODE_CLI_SYSTEM_PREFIX)
+    ? combined.slice(OFFICIAL_ZCODE_CLI_SYSTEM_PREFIX.length).replace(/^\r?\n/, "")
+    : combined;
+  return [
+    { type: "text", text: OFFICIAL_ZCODE_CLI_SYSTEM_PREFIX },
+    ...(rest.trim()
+      ? [
+          {
+            type: "text",
+            text: `\n${rest.trim()}`,
+            cache_control: { type: "ephemeral" },
+          },
+        ]
+      : []),
+  ];
+}
+
+function resolveAnthropicMetadataUserId(
+  target: ModelTarget,
+  officialZCodeHost: boolean,
+  isConnectivityProbe: boolean,
+): string | undefined {
+  if (!officialZCodeHost) return target.metadataUserId;
+  if (isConnectivityProbe) return undefined;
+  const raw = target.metadataUserId?.trim();
+  if (raw && raw.startsWith("{") && raw.includes('"device_id"')) {
+    return raw;
+  }
+  return JSON.stringify({
+    device_id: getOrCreateDeviceMid(),
+    account_uuid: "",
+    session_id: getOrCreateSessionId().replace(/^sess_/, ""),
+  });
 }
 
 function buildRequest(
@@ -459,10 +563,30 @@ function buildRequest(
   const reasoningSpread = reasoning ?? {};
 
   // 只有 anthropic 把 system 从 messages 里拆出去；另外两种留在消息序列里，与各自 SDK 的默认行为一致。
-  const system = messages
-    .filter((m) => m.role === "system")
-    .map((m) => m.content)
-    .join("\n\n");
+  const officialZCodeHost = isOfficialZCodeRequestUrl(url);
+  const systemMessages = messages.filter((m) => m.role === "system");
+  const officialSystemSegments = officialZCodeHost
+    ? systemMessages.find((m) => m.systemSegments?.length)?.systemSegments
+    : undefined;
+  const anthropicSystemBlocks =
+    target.apiFormat === "anthropic-messages"
+      ? officialSystemSegments
+        ? // 官方三段逐块（对齐官方 wire：三块各带 ephemeral——ContextBuilder 的三条
+          // systemMessages 全带 EPHEMERAL_CACHE_CONTROL，ai-sdk 转块时逐块落 cache_control）。
+          officialSystemSegments.map((text) => ({
+            type: "text",
+            text,
+            cache_control: { type: "ephemeral" },
+          }))
+        : toAnthropicSystemBlocks(systemMessages, officialZCodeHost)
+      : undefined;
+  const isConnectivityProbe =
+    anthropicSystemBlocks?.length === 1 &&
+    anthropicSystemBlocks[0]?.text === OFFICIAL_ZCODE_CONNECTIVITY_SYSTEM_PROMPT;
+  const anthropicMetadataUserId =
+    target.apiFormat === "anthropic-messages"
+      ? resolveAnthropicMetadataUserId(target, officialZCodeHost, isConnectivityProbe)
+      : undefined;
   const rest = messages.filter((m) => m.role !== "system");
 
   // 只有 openai-chat-completions 认工具那两种消息形状（assistant 带 tool_calls、role=tool 回结果）；
@@ -501,9 +625,11 @@ function buildRequest(
           model: target.model,
           max_tokens: anthropicMaxTokens,
           stream: true,
-          ...(system ? { system } : {}),
-          ...(target.metadataUserId
-            ? { metadata: { user_id: target.metadataUserId } }
+          ...(anthropicSystemBlocks && anthropicSystemBlocks.length > 0
+            ? { system: anthropicSystemBlocks }
+            : {}),
+          ...(anthropicMetadataUserId
+            ? { metadata: { user_id: anthropicMetadataUserId } }
             : {}),
           // 0.7.x 工具载荷补齐：不声明 tools，模型就永远只能"说要开始工作"然后 end_turn
           // （装机截断症状的端侧半因）。
@@ -1283,6 +1409,15 @@ function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function isCaptchaVerificationError(e: unknown): boolean {
+  if (!(e instanceof ModelStreamError)) return false;
+  if (e.reasonCode === "model.business.3007") return true;
+  if (e.statusCode === 403 && /captcha|安全验证|验证码|security verification/i.test(e.message)) {
+    return true;
+  }
+  return /captcha_verify_failed|请完成安全验证|security verification required/i.test(e.message);
+}
+
 export async function streamModelCompletionWithRetry(params: {
   target: ModelTarget;
   messages: ModelTurnMessage[];
@@ -1300,12 +1435,15 @@ export async function streamModelCompletionWithRetry(params: {
   retryBaseWaitMs?: number;
 }): Promise<ModelStreamResult> {
   let attempt = 0;
+  let captchaRetried = false;
+  let effectiveTarget = params.target;
   for (;;) {
     attempt++;
     let sawDelta = false;
     try {
       return await streamModelCompletion({
         ...params,
+        target: effectiveTarget,
         onDelta: (piece) => {
           sawDelta = true;
           params.onDelta(piece);
@@ -1322,6 +1460,27 @@ export async function streamModelCompletionWithRetry(params: {
       });
     } catch (e) {
       const stopped = params.signal?.aborted;
+      if (!stopped && !sawDelta && !captchaRetried && isCaptchaVerificationError(e)) {
+        const resolveCaptchaHeaders = (
+          globalThis as {
+            __zcodeResolveModelVerificationHeaders?: (
+              baseUrl: string,
+            ) => Promise<Record<string, string> | null>;
+          }
+        ).__zcodeResolveModelVerificationHeaders;
+        if (resolveCaptchaHeaders) {
+          captchaRetried = true;
+          const extraHeaders = await resolveCaptchaHeaders(effectiveTarget.baseUrl);
+          if (extraHeaders && !params.signal?.aborted) {
+            effectiveTarget = {
+              ...effectiveTarget,
+              headers: { ...(effectiveTarget.headers ?? {}), ...extraHeaders },
+            };
+            attempt--;
+            continue;
+          }
+        }
+      }
       if (attempt >= MAX_STREAM_ATTEMPTS || stopped || !retriableError(e) || sawDelta) throw e;
       const waitMs = (params.retryBaseWaitMs ?? RETRY_BASE_WAIT_MS) * 2 ** (attempt - 1);
       params.onRetry?.(attempt + 1, waitMs, e instanceof ModelStreamError ? e.reasonCode : String(e));

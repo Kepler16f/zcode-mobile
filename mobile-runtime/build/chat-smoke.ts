@@ -2155,10 +2155,13 @@ async function main() {
     compactionSummaryText = "【压缩摘要·第{n}段】";
     compactionRequestCount = 0;
     const chunkBody = "正文".repeat(500); // 单轮完整正文约 1000 汉字，仍能与摘要指令一起装入单段预算
+    // 0.12.9 起压缩请求的 system 是官方三段（约 1.6k token，3012 形状对齐）——单段预算
+    // 必须盖过它 + 摘要指令 + 单轮正文，分段路径才仍然成立（真实设备窗口 64k 无感）。
+    const chunkPassBudget = 7000; // 盖过官方三段 system(约1.7k)+摘要指令+前段摘要+单轮（分段器一段可装1-2轮），全量4轮(约9.7k)仍必分段
     const rigChunk = makeRig(mock.url, undefined, undefined, undefined, {
       compactEnabled: false,       // 只测手动压缩这一条路，别让自动压缩插进来搅乱计数
       compactKeepRecentRows: 2,    // 保留最近一轮（两行）
-      compactPassInputTokens: 2000, // 单段预算压小 → 早期段必然分段
+      compactPassInputTokens: chunkPassBudget, // 单段预算压小 → 早期段必然分段
     });
     const sChunk = await openSession(rigChunk);
     const chunkTexts = ["早期第一轮", "早期第二轮", "早期第三轮", "早期第四轮"];

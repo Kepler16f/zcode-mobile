@@ -153,7 +153,8 @@ function appVersion(): string {
  * 内核串、x-zcode-app-version/user-agent→**官方发行版本号**。用户可经
  * desktopCompatibilityVersion（localStorage）覆盖，缺省跟当前官方发行版。
  */
-const OFFICIAL_LINUX_KERNEL = "6.8.0-45-generic";
+/** X-Os-Version 的统一口径；官方 system 的 env 段（OS Version 行）也用同一个值。 */
+export const OFFICIAL_LINUX_KERNEL = "6.8.0-45-generic";
 
 function officialVersion(): string {
   return officialCompatibilityVersion();

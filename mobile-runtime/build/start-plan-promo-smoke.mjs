@@ -1,6 +1,6 @@
 /**
  * Start Plan 赠送活动全链路冒烟：
- *   1. 版本伪装与包内 ZCODE_VERSION 注入（3.18.2，而非 0.0.0-dev）；
+ *   1. 版本伪装与包内 ZCODE_VERSION 注入（跟随实挖的官方版本，而非 0.0.0-dev）；
  *   2. 官方请求头对齐（zcode.z.ai 鉴权 + 对话追踪头，第三方域零泄漏）；
  *   3. 识别非 "start plan" 字面的限时赠送活动（如 ZCODE WEEKEND BUILD），并拒掉过期 active 脏数据；
  *   4. billing/preview + marketing/touch 合并发现与 billing/claim（含 3007 验证重放 + touch 确认）；
@@ -10,13 +10,14 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { readOfficialCompatVersion } from "./official-version.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const esbuild = createRequire(path.join(root, "zcode/apps/zcode-cli/package.json"))("esbuild");
 const officialVersion = readOfficialCompatVersion(root);
-assert.match(officialVersion, /^3\.18\./, "官方兼容版本应保持在 3.18.x 最新线");
+assert.match(officialVersion, /^\d+\.\d+\.\d+$/, "官方兼容版本应为三段数字（实挖或兜底）");
+assert.notEqual(officialVersion, "0.0.0-dev", "不能把开发版本号发给服务端");
 
 const tempFiles = [];
 async function bundleModule(relPath, extraDefine = {}) {
@@ -256,8 +257,8 @@ try {
           // 模拟真实服务端返回 HTTP 400 + 拼写错的 "captcha vertify failed"，不能抛错阻断 3007 弹窗流程
           return new Response(JSON.stringify({ code: 3007, msg: "captcha vertify failed" }), { status: 400 });
         }
-        assert.equal(hdrs["X-Aliyun-Captcha-Region"], "cn", "必须携带 X-Aliyun-Captcha-Region");
-        assert.equal(hdrs["X-Aliyun-Captcha-Verify-Region"], "cn", "同时兼容 X-Aliyun-Captcha-Verify-Region");
+        assert.equal(hdrs["X-Aliyun-Captcha-Region"], undefined, "不应发送非官方头 X-Aliyun-Captcha-Region");
+        assert.equal(hdrs["X-Aliyun-Captcha-Verify-Region"], "cn", "必须携带官方头 X-Aliyun-Captcha-Verify-Region");
         return new Response(
           JSON.stringify({
             code: 0,
@@ -419,6 +420,272 @@ try {
     { "X-Platform": "android-arm64", Authorization: "Bearer jwt-promo" },
   );
   assert.equal(normReq.headers["X-Platform"], "linux-arm64");
+
+  // ── 6. v4.0.0 全面对齐回归（GLM-5.4 + highspeed Schema + Aliyun V3 Captcha + 半登录态清理 + 时钟偏移 + 遗留家族域纠偏 + 流式 3007 重试）──
+  const builtinJson = JSON.parse(
+    readFileSync(path.join(root, "zcode/config/provider/zcode-builtin.json"), "utf8"),
+  );
+  assert.ok(builtinJson.revision >= 48, "内置 zcode-builtin.json 至少同步至 revision 48");
+  const bmStartRule = builtinJson.config.providerConfigRules.providerRules.find(
+    (r) => r.providerId === "account:bigmodel-start-plan",
+  );
+  assert.ok(
+    bmStartRule?.config?.builtinModelIds?.includes("GLM-5.4"),
+    "account:bigmodel-start-plan 必须包含 GLM-5.4",
+  );
+  const { decodeZCodeBuiltinRelease } = await bundleModule(
+    "zcode/packages/provider-node/src/zcode-builtin-release.ts",
+  );
+  assert.equal(
+    decodeZCodeBuiltinRelease(builtinJson).revision,
+    builtinJson.revision,
+    "zcode-builtin.json（含 highspeed 模式与 GLM-5.4）必须通过完整 Release Schema 校验",
+  );
+
+  const glmIdMod = await bundleModule("zcode/packages/shared/src/official-glm-model-id.ts");
+  assert.equal(
+    glmIdMod.normalizeOfficialGlmModelId("glm-5.4"),
+    "GLM-5.4",
+    "billing/balance 返回的小写 model:glm-5.4 必须规范化为大写 GLM-5.4 以匹配 Registry",
+  );
+
+  // Aliyun Captcha V3 分离式核验静态守卫（禁止退回 V2 captchaVerifyCallback）
+  const browserBridgeKt = readFileSync(
+    path.join(root, "android-app/app/src/main/kotlin/cn/zcode/mobile/BrowserBridge.kt"),
+    "utf8",
+  );
+  assert.match(browserBridgeKt, /success:\s*function\s*\(\s*captchaVerifyParam\s*\)/);
+  assert.match(browserBridgeKt, /fail:\s*function\s*\(\s*result\s*\)/);
+  assert.match(browserBridgeKt, /showErrorTip:\s*false/);
+  assert.match(browserBridgeKt, /startTracelessVerification/);
+  assert.ok(
+    !/captchaVerifyCallback\s*:/.test(browserBridgeKt),
+    "BrowserBridge.kt 严禁传入 V2 captchaVerifyCallback（会导致 AliyunCaptcha.js 退回 2.0 耦合模式使验证失效）",
+  );
+
+  // 登录前遗留 providerFamilyDomain="zai" 时，bigmodel/zai_cn 登录仍必须把 bigmodel Start Plan 判为当前可用
+  const zaiCnCredMap = new Map([
+    ["oauth:active_provider", "zai_cn"],
+    ["oauth:zai_cn:access_token", "cn-access"],
+    ["oauth:zai_cn:user_info", JSON.stringify({ user_id: "u_cn_1", name: "CNUser" })],
+    ["zcodejwttoken", "jwt-cn-valid"],
+  ]);
+  const zaiCnCreds = {
+    load: async (k) => zaiCnCredMap.get(k) ?? null,
+    save: async (k, v) => {
+      zaiCnCredMap.set(k, v);
+    },
+    delete: async (k) => zaiCnCredMap.delete(k),
+  };
+  const leftoverDomainAuth = accountMod.createMobileAccountRequestAuthService({
+    apiClient: balancesOnlyApi,
+    credentialService: zaiCnCreds,
+    settingService: {
+      get: async () => ({ providerFamilyDomain: "zai", providerFamilyConnectionSelections: {} }),
+    },
+    configSource: {},
+  });
+  const leftoverResolved = await leftoverDomainAuth.resolveAccessCurrent({
+    type: "zhipu-account",
+    accountType: "bigmodel",
+    mode: "start-plan",
+  });
+  assert.deepEqual(
+    leftoverResolved,
+    { type: "zhipu-account", family: "bigmodel", planKind: "start-plan" },
+    "未保存 zai 付费选择时，遗留 providerFamilyDomain=zai 不得锁死已登录的国内 Start Plan",
+  );
+
+  // OAuthService：1) 缺失 zcodejwttoken 的 bigmodel 半登录态必须清理并返回 signed-out；2) server_time 时钟偏移容错
+  const { OAuthService } = await bundleModule("zcode/packages/services/src/oauth/oauthService.ts");
+  const halfCredMap = new Map([
+    ["oauth:active_provider", "bigmodel"],
+    ["oauth:bigmodel:user_info", JSON.stringify({ id: "u_bm", username: "bm", displayName: "bm" })],
+    ["oauth:bigmodel:access_token", "bm-access"],
+  ]);
+  const halfOAuth = new OAuthService(
+    {
+      load: async (k) => halfCredMap.get(k) ?? null,
+      save: async (k, v) => {
+        halfCredMap.set(k, v);
+      },
+      delete: async (k) => halfCredMap.delete(k),
+    },
+    {
+      apiClient: {
+        request: async () =>
+          new Response(
+            JSON.stringify({
+              code: 0,
+              data: {
+                flow_id: "f_skew",
+                authorize_url: "https://zchat.z.ai/api/oauth/authorize?state=st_skew",
+                server_time: 1_700_000_000,
+                expires_at: 1_700_000_300,
+                poll_interval_sec: 2,
+              },
+            }),
+            { status: 200 },
+          ),
+      },
+      // 模拟手机本地时钟比服务端快 10 分钟（+600s）
+      now: () => 1_700_000_600_000,
+      env: {},
+    },
+  );
+  const halfRestored = await halfOAuth.restoreCachedSessionState();
+  assert.equal(halfRestored.status, "signed-out", "缺失 zcodejwttoken 的 bigmodel 半登录态必须按未登录清理");
+  assert.equal(halfCredMap.has("oauth:active_provider"), false, "半登录态清理后不应残留 active_provider");
+  const skewStart = await halfOAuth.startOAuthWithPolling("zai_cn");
+  assert.equal(skewStart.provider, "zai_cn");
+  assert.match(decodeURIComponent(skewStart.authorizeUrl), /provider=zai_cn/);
+  await halfOAuth.cancelPending();
+
+  // 官网活动页注入脚本必须携带 oauth:active_provider 与 oauth:zai_cn:access_token
+  const webviewMod = await bundleModule(
+    "zcode/packages/ui/src/settings/model-provider-section/codingPlanEmbeddedWebview.ts",
+  );
+  const injScript = webviewMod.createCodingPlanAuthInjectionScript({
+    provider: "bigmodel",
+    loginProvider: "zai_cn",
+    credentials: { zcodeJwtToken: "jwt-cn", zaiCnAccessToken: "cn-tok" },
+    theme: "zai-dark",
+    locale: "zh-CN",
+  });
+  assert.match(injScript, /"oauth:active_provider",\s*"zai_cn"/);
+  assert.match(injScript, /"oauth:zai_cn:access_token",\s*"cn-tok"/);
+
+  // 模型对话流触发 3007 安全验证时自动附带阿里云验证头重试，且请求体/UA/metadata 严格对齐官方 ZCode 4.0.0 白名单（防 HTTP 405）
+  const streamMod = await bundleModule("mobile-runtime/ui/model-stream.ts");
+  const connectivityMod = await bundleModule("mobile-runtime/ui/model-connectivity.ts");
+  let streamCalls = 0;
+  let capturedVerifyHdr = null;
+  let capturedModelReq = null;
+  globalThis.zcodeModelHttp = {
+    start(req) {
+      streamCalls++;
+      const parsed = JSON.parse(req);
+      capturedModelReq = parsed;
+      capturedVerifyHdr = hdr(parsed.headers, "x-aliyun-captcha-verify-param") ?? null;
+      pollStep = 0;
+      return JSON.stringify({ id: `s_${streamCalls}` });
+    },
+    poll() {
+      pollStep++;
+      if (pollStep > 1) return JSON.stringify({ done: true });
+      if (streamCalls === 1) {
+        return JSON.stringify({
+          status: 403,
+          headers: { "content-type": "application/json" },
+          bodyBase64: btoa('{"code":3007,"msg":"captcha verification required"}'),
+          done: true,
+        });
+      }
+      return JSON.stringify({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        bodyBase64: btoa('{"type":"message","stop_reason":"end_turn","content":[{"type":"text","text":"OK-5.4"}]}'),
+        done: true,
+      });
+    },
+    cancel() {
+      return true;
+    },
+  };
+  globalThis.__zcodeResolveModelVerificationHeaders = async () => ({
+    "X-Aliyun-Captcha-Verify-Param": "stream-verified-token",
+    "X-Aliyun-Captcha-Verify-Region": "cn",
+  });
+  let streamed = "";
+  const streamRes = await streamMod.streamModelCompletionWithRetry({
+    target: {
+      apiFormat: "anthropic-messages",
+      baseUrl: "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+      apiKey: "jwt-test",
+      model: "GLM-5.4",
+      reasoningLevel: "max",
+      reasoningValues: ["low", "high", "max"],
+    },
+    messages: [
+      { role: "system", content: "You are ZCode, an interactive coding agent\nMobile instructions." },
+      { role: "user", content: "ping" },
+    ],
+    onDelta: (d) => {
+      streamed += d;
+    },
+  });
+  assert.equal(streamCalls, 2, "流式对话遇 3007 安全验证应自动完成一次带凭证重放");
+  assert.equal(capturedVerifyHdr, "stream-verified-token");
+  assert.equal(streamRes.text, "OK-5.4");
+  assert.equal(streamed, "OK-5.4");
+  const wireBody = JSON.parse(capturedModelReq.body);
+  assert.ok(Array.isArray(wireBody.system), "zcode-plan/anthropic 请求体 system 必须是数组而非裸字符串");
+  assert.deepEqual(wireBody.system[0], {
+    type: "text",
+    text: "You are ZCode, an interactive coding agent",
+  });
+  assert.equal(wireBody.system[1]?.type, "text");
+  assert.match(wireBody.system[1]?.text ?? "", /^\nMobile instructions\./);
+  assert.deepEqual(wireBody.thinking, { type: "enabled" }, "GLM-5.4 推理字段不得携带非法 budget_tokens");
+  assert.deepEqual(wireBody.output_config, { effort: "max" }, "GLM-5.4 必须发送 output_config.effort");
+  assert.deepEqual(wireBody.messages, [{ role: "user", content: [{ type: "text", text: "ping" }] }]);
+  const parsedMetaUserId = JSON.parse(wireBody.metadata?.user_id ?? "{}");
+  assert.equal(typeof parsedMetaUserId.device_id, "string");
+  assert.equal(parsedMetaUserId.account_uuid, "");
+  assert.equal(typeof parsedMetaUserId.session_id, "string");
+  assert.match(
+    String(hdr(capturedModelReq.headers, "user-agent") ?? ""),
+    /^ZCode\/\d+\.\d+\.\d+ ai-sdk\/anthropic\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/\d+\.\d+\.\d+ runtime\/node\.js\/v\d+\.\d+\.\d+$/,
+  );
+  delete globalThis.__zcodeResolveModelVerificationHeaders;
+
+  // 连通性探测（设置页「测试连接」）必须发送官方白名单消息对 + provider_settings_connectivity
+  streamCalls = 2;
+  const tester = connectivityMod.createMobileConnectivityTester({
+    resolver: {
+      view: async () => ({
+        providers: [
+          {
+            providerId: "account:bigmodel-start-plan",
+            models: [
+              {
+                modelId: "GLM-5.4",
+                config: {
+                  optionSpecs: {
+                    reasoningLevel: { values: ["low", "high", "max"] },
+                    maxOutputTokens: { max: 128000 },
+                  },
+                },
+              },
+            ],
+            config: {
+              api: {
+                type: "anthropic-messages",
+                baseUrl: "https://zcode.z.ai/api/v1/zcode-plan/anthropic",
+              },
+              access: { type: "zhipu-account", accountType: "bigmodel" },
+            },
+          },
+        ],
+      }),
+      codingPlanApiKey: async () => "jwt-test",
+    },
+  });
+  const probeOutcome = await tester({
+    workspacePath: "/work",
+    providerId: "account:bigmodel-start-plan",
+    modelId: "GLM-5.4",
+  });
+  assert.equal(probeOutcome.success, true);
+  const probeBody = JSON.parse(capturedModelReq.body);
+  assert.deepEqual(probeBody.system, [
+    { type: "text", text: "You are ZCode connectivity probe." },
+  ]);
+  assert.deepEqual(probeBody.messages, [{ role: "user", content: [{ type: "text", text: "hi" }] }]);
+  assert.equal(probeBody.max_tokens, 512);
+  assert.deepEqual(probeBody.output_config, { effort: "low" });
+  assert.equal(hdr(capturedModelReq.headers, "x-zcode-query-source"), "provider_settings_connectivity");
+  assert.equal(hdr(capturedModelReq.headers, "x-zcode-session-type"), "other");
 
   console.log("start-plan-promo-smoke: ALL PASS");
 } finally {
