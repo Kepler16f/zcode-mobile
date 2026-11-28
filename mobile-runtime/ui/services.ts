@@ -211,6 +211,16 @@ export async function createMobileServices(options: {
   const trace = (message: string) => {
     agentLog.push(message);
     if (agentLog.length > 40) agentLog.splice(0, agentLog.length - 40);
+    // 同步持久化：agentLog 只活在内存里，切到自检页就没了——"帧不合法/订阅失败"这类
+    // 侧栏链 say 读数（装机报告可读）必须跨页存活。环形 60 条，自检 M10 读取。
+    try {
+      globalThis.localStorage?.setItem(
+        "zcode-mobile.agent-log",
+        JSON.stringify([...agentLog.slice(-60)]),
+      );
+    } catch {
+      /* 持久化失败不影响主流程 */
+    }
   };
 
   // 主动探一次 task-index：桌面 e2e（sql.js）、真 node:sqlite 冒烟、真机 SQLite 桥自检三处各自都绿，

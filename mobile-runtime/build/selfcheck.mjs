@@ -820,6 +820,25 @@ export async function runDeviceChecks(rt) {
             : live > 0 && read > 0
               ? "库和读取口都有行 ⇒ 断在投影/帧消费（看 snapshotLast.tasks 与 deltas.upserted 是否 >0；都正常就是 UI 侧订阅链）"
               : "还没有读取口读数 ⇒ UI 页从没问过列表（tabStore/订阅链没触发 listTaskList）";
+    // 0.13.0 侧栏链取证（agent.ts 写入各跳：announce→subscribe→publish→帧投递）——
+    // 写入链断时这一串直接指认断在哪一跳（announce 有而 subscribe 没有 = lifecycle 竞态；
+    // publish 有而 frame-dropped = 订阅注册晚于发帧；frame-dropped 连发 = workspaceKey 错位）。
+    try {
+      out.sidebarChain = JSON.parse(
+        globalThis.localStorage?.getItem("zcode-mobile.sidebar.diag") ?? "[]",
+      );
+    } catch {
+      out.sidebarChain = [];
+    }
+    // 装机侧 agentLog（services.ts trace 持久化，环形 60 条）——syncer/帧校验的 say
+    // 全进这里，"帧不合法（schema 差异）/订阅失败/回源失败"的原文直接可读。
+    try {
+      out.agentLog = JSON.parse(
+        globalThis.localStorage?.getItem("zcode-mobile.agent-log") ?? "[]",
+      ).slice(-30);
+    } catch {
+      out.agentLog = [];
+    }
     return out;
   });
 
@@ -885,6 +904,8 @@ export async function runDeviceChecks(rt) {
     } catch {
       return { fail: "读数坏了（JSON 解析失败）", raw: globalThis.localStorage?.getItem("zcode-mobile.jank.diag") };
     }
+    let inputRecoveries = [];
+    try { inputRecoveries = JSON.parse(globalThis.localStorage?.getItem("zcode-mobile.input-recovery") ?? "[]"); } catch {}
     if (!diag) {
       return { skipped: true, reason: "UI 页从没写过冻结采样（boot 没跑，或本机至今没发生过 ≥800ms 的阻塞——好事）" };
     }

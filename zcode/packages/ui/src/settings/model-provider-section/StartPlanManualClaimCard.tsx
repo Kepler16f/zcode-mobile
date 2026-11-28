@@ -81,6 +81,16 @@ export function StartPlanManualClaimCard({
     return ids;
   }, [locallyClaimedIds, quotaLimits, subscriptionDetails]);
 
+  /**
+   * 跨设备领取状态（0.13.0，用户报"另一设备已经领取了，设置里没显示"）：
+   * 本机 entitlement 的 subscription.details / quotaLimits 由 billing/balance 回源，
+   * 另一台设备领取后同一账号的 balance 里就有该套餐实例——只要两者非空，说明账号
+   * 已经持有 Start Plan 权益。活动行仍按 planId 精确匹配显示"已领"；id 空间对不上
+   * 时（campaign id 与实例 id 不同构）用这条提示兜底，避免重复走领取流程。
+   */
+  const hasHeldEntitlement =
+    (subscriptionDetails?.length ?? 0) > 0 || (quotaLimits?.length ?? 0) > 0;
+
   const loadOffers = useCallback(
     async (syncQuota = false, forceRefresh = false) => {
       if (isDisconnected || !subscriptionService?.getManualClaimPlanPreviews) {
@@ -300,6 +310,13 @@ export function StartPlanManualClaimCard({
         </div>
       ) : plans.length > 0 ? (
         <div className="mt-3 space-y-2">
+          {hasHeldEntitlement ? (
+            <div className="rounded-lg border border-border/80 bg-surface/60 px-3 py-2 text-ui-xs text-muted-foreground">
+              {isZh
+                ? "当前账号已持有 Start Plan 权益（可能在其他设备领取）；重复领取按活动规则处理。"
+                : "This account already holds Start Plan entitlement (possibly claimed on another device)."}
+            </div>
+          ) : null}
           {plans.map((plan) => {
             const busy = claimingPlanId === plan.planId;
             const normalizedPlanId = plan.planId.trim().toLowerCase();

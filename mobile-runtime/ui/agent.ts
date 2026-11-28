@@ -655,6 +655,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     // task-index 库里的旧行撑着（点开仍然空），用户看到的就是"历史没了"。
     hydrateWorkspaceFromStore(workspacePath);
     announcedWorkspaces.add(state.workspaceKey);
+    sidebarDiag("announce", `workspace=${state.workspaceKey} (同步器据此订阅 sessions-index)`);
     say(`workspace=${state.workspaceKey} 的端侧 runtime 起来了（同步器据此订阅 sessions-index）`);
     runtimeLifecycleEmitter.fire({
       workspaceKey: state.workspaceKey,
@@ -675,6 +676,39 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
    * 水位只在**真的发出去至少一帧**之后才推进 —— 预推进会让下一帧的 fromSeq 对不上，
    * 而同步器把对不上当作断档，会退订重订，表现是列表每隔一会儿整片闪空。
    */
+  /**
+   * 侧栏链取证面（0.13.0，装机"新建会话侧栏不显示"）：写入链各跳的事实落进
+   * localStorage `zcode-mobile.sidebar.diag`（环形 40 条），自检 M10 读取——
+   * 报告能直接回答断在哪一跳：announce（lifecycle 广播）→ 同步器订阅注册 →
+   * publishSessionIndex 发帧（有/无订阅者）→ taskIndexRepo 写库（rejects 在 repo.diag）。
+   */
+  const SIDEBAR_DIAG_KEY = "zcode-mobile.sidebar.diag";
+  const sidebarDiagRing: Array<{ at: number; step: string; detail: string }> = [];
+  let sidebarDiagLoaded = false;
+  function sidebarDiag(step: string, detail: string): void {
+    try {
+      if (!sidebarDiagLoaded) {
+        sidebarDiagLoaded = true;
+        const raw = globalThis.localStorage?.getItem(SIDEBAR_DIAG_KEY);
+        if (raw) {
+          try {
+            const restored = JSON.parse(raw) as Array<{ at: number; step: string; detail: string }>;
+            if (Array.isArray(restored)) sidebarDiagRing.push(...restored.slice(-40));
+          } catch { /* 旧格式坏读数不还原 */ }
+        }
+      }
+      sidebarDiagRing.push({ at: Date.now(), step, detail: detail.slice(0, 160) });
+      while (sidebarDiagRing.length > 40) sidebarDiagRing.shift();
+      globalThis.localStorage?.setItem(SIDEBAR_DIAG_KEY, JSON.stringify(sidebarDiagRing));
+    } catch {
+      /* 取证失败不影响主流程 */
+    }
+  }
+  function readSidebarDiag(): Array<{ at: number; step: string; detail: string }> {
+    sidebarDiag("read", "自检读取侧栏链取证");
+    return [...sidebarDiagRing];
+  }
+
   function emitWorkspaceTopicFrame(
     kind: "sessions-index" | "workspace-config",
     state: WorkspaceTopicState,
@@ -724,6 +758,13 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     if (advanced) {
       if (isIndex) state.indexSeq = nextSeq;
       else state.configSeq = nextSeq;
+    } else if (isIndex) {
+      // 侧栏链取证：sessions-index 帧没有匹配的订阅者就是被静默丢弃——同步器
+      // 那一跳没发生的最常见原因（lifecycle 事件与订阅注册的时序竞态）。
+      sidebarDiag(
+        "frame-dropped",
+        `workspace=${state.workspaceKey} subs=${subs.size} kind=${payload.kind}`,
+      );
     }
   }
 
@@ -778,6 +819,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     if (session.missing || session.rows.length === 0 || session.sessionId.startsWith("mobile-subagent-")) return;
     const state = stateForSessionPath(session.workspacePath);
     const summary = summaryOf(session, state.workspaceKey);
+    sidebarDiag("publish", `session=${session.sessionId} workspace=${state.workspaceKey} rows=${session.rows.length}`);
     const previous = state.summaries.get(session.sessionId);
     if (previous && JSON.stringify(previous) === JSON.stringify(summary)) return;
     state.summaries.set(session.sessionId, summary);
@@ -4684,6 +4726,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
       ordinal: 0,
     };
     (isIndex ? indexSubs : configSubs).set(sub.subscriptionId, sub);
+    if (isIndex) sidebarDiag("subscribe", `workspace=${state.workspaceKey} subs=${indexSubs.size}`);
     emitWorkspaceTopicFrame(kind, state, workspaceSnapshotOf(kind, state), "initial", sub);
     say(`${kind} 订阅 workspace=${state.workspaceKey}`);
     return {
