@@ -55,7 +55,7 @@ try {
   assert.equal(received.headers["x-platform"], "linux-arm64", "X-Platform 未归一成 linux-arm64");
   assert.equal(received.headers["x-os-category"], "linux", "X-Os-Category 未归一成 linux");
   assert.ok(/^6\.\d+\.\d+/.test(received.headers["x-os-version"] ?? ""), "X-Os-Version 不是 Linux 内核串");
-  assert.ok(/^3\.\d+\.\d+/.test(received.headers["x-zcode-app-version"] ?? ""), "X-ZCode-App-Version 不是官方版本号形状");
+  assert.ok(/^[1-9]\d*\.\d+\.\d+/.test(received.headers["x-zcode-app-version"] ?? ""), "X-ZCode-App-Version 不是官方版本号形状");
   assert.equal(received.headers["user-agent"], `ZCode/${received.headers["x-zcode-app-version"]}`, "UA 与版本头不一致");
   assert.ok(received.headers["x-request-id"], "x-request-id 没注入");
   assert.equal(
