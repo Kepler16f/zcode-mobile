@@ -31,6 +31,7 @@
 //     B3 进设置后设置项不被任何层覆盖（elementFromPoint 命中按钮本体）；
 //     B4 真触摸点分区导航 ≤2.5s 内生效（就绪后立即生效）。
 import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
@@ -51,6 +52,10 @@ const out = path.join(root, "mobile-runtime/build", `.tmp-startup-settings-${pro
 await esbuild.build({
   stdin: {
     contents: `export {createMobileAgentService} from "${root.replaceAll("\\", "/")}/mobile-runtime/ui/agent.ts";
+export {createMobileWindowControllerService} from "${root.replaceAll("\\", "/")}/mobile-runtime/ui/window-controller.ts";
+export {createZCodeTaskIndexSyncer} from "${root.replaceAll("\\", "/")}/zcode/packages/services/src/zcode-agent/zcodeTaskIndexSyncer.ts";
+export {TaskIndexRepo} from "${root.replaceAll("\\", "/")}/zcode/packages/services/src/session/taskIndexRepo.ts";
+export {setDataBaseDir} from "${root.replaceAll("\\", "/")}/zcode/packages/services/src/paths.ts";
 export {createCommandEnvelope,getV4ClientId} from "${root.replaceAll("\\", "/")}/zcode/packages/ui/src/v4/commandFactory.ts";`,
     resolveDir: path.join(root, "mobile-runtime/ui"),
   },
@@ -59,7 +64,15 @@ export {createCommandEnvelope,getV4ClientId} from "${root.replaceAll("\\", "/")}
   alias: { "@": path.join(root, "zcode/packages/ui/src") },
   nodePaths: ["web", "ui", "client", "services", "shared"].map(p => path.join(root, "zcode/packages", p, "node_modules")).concat(path.join(root, "zcode/node_modules")),
 });
-const { createMobileAgentService, createCommandEnvelope, getV4ClientId } = await import(pathToFileURL(out).href);
+const {
+  createMobileAgentService,
+  createMobileWindowControllerService,
+  createZCodeTaskIndexSyncer,
+  TaskIndexRepo,
+  setDataBaseDir,
+  createCommandEnvelope,
+  getV4ClientId,
+} = await import(pathToFileURL(out).href);
 
 const records = new Map();
 const marks = { storeLoadAt: -1, listSummariesAt: -1 };
@@ -186,6 +199,94 @@ check("A4 sessions-index 订阅在首帧前挂起让路（调用任务内不发�
   idxSuspended && marksSeq.idxFrame > 0,
   `frameSeq=${marksSeq.idxFrame}`);
 check("A4b sessions-index 订阅行为不回归（snapshot ack）", idxAck.ack.mode === "snapshot");
+
+// A4c：并发 Promise.all([sessions-index, workspace-config]) 都必须兑现（回归 yieldToInput 单端口覆盖死锁）。
+const [concurrentIdxAck, concurrentCfgAck] = await Promise.all([
+  agent.subscribeSessionsIndexV4({ workspacePath: "/work/concurrent" }),
+  agent.subscribeWorkspaceConfigV4({ workspacePath: "/work/concurrent" }),
+]);
+check(
+  "A4c 并发 sessions-index 与 workspace-config 订阅均兑现（yieldToInput 不丢回调）",
+  concurrentIdxAck.ack.mode === "snapshot" && concurrentCfgAck.ack.mode === "snapshot",
+);
+
+// A5：完整侧栏写入链（直接 createSession+firstInput 与草稿+sendText 都必须实时入库并在 listTaskList 可见）。
+{
+  const tempDbRoot = path.join(root, "tmp", `startup-sidebar-db-${process.pid}`);
+  setDataBaseDir(tempDbRoot);
+  const oldFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      'data: {"choices":[{"index":0,"delta":{"content":"sidebar ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      { headers: { "content-type": "text/event-stream" } },
+    );
+  const repo = new TaskIndexRepo();
+  await repo.ensureReady();
+  const sidebarAgent = createMobileAgentService({
+    modelTargets: {
+      view: async () => ({
+        providers: [{ providerId: "test", models: [{ modelId: "mock" }], config: { api: { type: "openai-chat-completions", baseUrl: "https://test.invalid/v1" }, access: { type: "personal-api-key", apiKey: "test" } } }],
+        preferredSelection: { providerId: "test", modelId: "mock" },
+      }),
+    },
+  });
+  const syncer = createZCodeTaskIndexSyncer({ agentService: sidebarAgent, taskIndexRepo: repo });
+  const ctrl = createMobileWindowControllerService({
+    taskIndexRepo: repo,
+    taskIndexSyncer: syncer,
+    isSessionRunning: (id) => sidebarAgent.isSessionRunning(id),
+    sessionSummaries: (w) => sidebarAgent.liveSessionSummaries(w),
+  });
+  try {
+    const sHello = await sidebarAgent.helloConversationV4();
+    await sidebarAgent.initializeConversationV4({
+      kind: "clientHello",
+      protocolVersion: sHello.protocolVersion,
+      clientId,
+      clientKind: "mobileApp",
+      appVersion: "test",
+    });
+    const ws = "/work/sidebar-smoke";
+    await ctrl.listTaskList({ kind: "timeline", workspaceScopes: [{ workspacePath: ws }], sortBy: "updated" });
+    // ① 直接创建带首条输入的新会话
+    const directAck = await sidebarAgent.sendConversationCommandV4({
+      workspacePath: ws,
+      envelope: createCommandEnvelope({ type: "createSession", sessionId: null, payload: { workspaceId: "sidebar-smoke", firstInput: { text: "直接创建首句" } } }),
+    });
+    // ② 侧栏草稿新建后再 sendText
+    const draftAck = await sidebarAgent.sendConversationCommandV4({
+      workspacePath: ws,
+      envelope: createCommandEnvelope({ type: "createSession", sessionId: null, payload: { workspaceId: "sidebar-smoke" } }),
+    });
+    await sidebarAgent.sendConversationCommandV4({
+      workspacePath: ws,
+      envelope: createCommandEnvelope({ type: "sendText", sessionId: draftAck.result.sessionId, payload: { text: "侧栏新建首句" } }),
+    });
+    let listed = { items: [], total: 0 };
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      listed = await ctrl.listTaskList({ kind: "timeline", workspaceScopes: [{ workspacePath: ws }], sortBy: "updated" });
+      if (listed.items.length >= 2) break;
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    const titles = listed.items.map((item) => item.title);
+    check(
+      "A5 直接创建与侧栏草稿发送均实时进入侧栏列表",
+      directAck.status === "accepted" &&
+        titles.some((t) => t.startsWith("直接创建首句")) &&
+        titles.some((t) => t.startsWith("侧栏新建首句")),
+      `titles=${JSON.stringify(titles)}`,
+    );
+  } finally {
+    syncer.disposeAll();
+    ctrl.dispose();
+    sidebarAgent.disposeAll();
+    repo.close();
+    globalThis.fetch = oldFetch;
+    rmSync(tempDbRoot, { recursive: true, force: true });
+    rmSync(out, { force: true });
+  }
+}
 
 // ══════════════ 浏览器侧：真 dist-ui 产物 ══════════════
 console.log("\n── 浏览器：启动屏交臂与设置项可达性 ──");

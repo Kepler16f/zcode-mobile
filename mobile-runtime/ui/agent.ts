@@ -412,14 +412,24 @@ function now(): number {
  */
 const inputYieldChannel =
   typeof MessageChannel !== "undefined" ? new MessageChannel() : null;
+const yieldWaiters: Array<() => void> = [];
+function drainYieldWaiter(): void {
+  const next = yieldWaiters.shift();
+  if (yieldWaiters.length === 0 && inputYieldChannel) {
+    inputYieldChannel.port1.onmessage = null;
+  }
+  next?.();
+}
 export function yieldToInput(): Promise<void> {
   if (!inputYieldChannel) return Promise.resolve();
   return new Promise((resolve) => {
-    const port = inputYieldChannel.port1;
-    port.onmessage = () => {
-      port.onmessage = null;
-      resolve();
-    };
+    yieldWaiters.push(resolve);
+    // 多个并发入口（如 syncer 的 Promise.all([subscribeSessionsIndexV4, subscribeWorkspaceConfigV4])
+    // 与 listTaskList）会同一拍挂入 yieldToInput：队列 FIFO 依次兑现，禁止覆盖 port.onmessage
+    // 否则先到调用方的 Promise 永久悬空，侧栏写入链直接断在第一跳。
+    if (!inputYieldChannel.port1.onmessage) {
+      inputYieldChannel.port1.onmessage = drainYieldWaiter;
+    }
     inputYieldChannel.port2.postMessage(null);
   });
 }
@@ -586,6 +596,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     indexSeq: number;
     configSeq: number;
     summaries: Map<string, SessionSummary>;
+    /** 在 task-index 订阅落地前已在本进程首发的会话 ID：不能静默吞进 initial 基线，须在首帧后补发 online delta 触发侧栏广播。 */
+    pendingSyncerSessionIds: Set<string>;
+    hasTaskIndexSubscriber: boolean;
     /** 端侧此刻的 workspace 级配置目录真的是空的：模型目录走 conversation 的 config 面。 */
     config: WorkspaceConfigState;
   }
@@ -593,6 +606,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     subscriptionId: string;
     topic: string;
     ordinal: number;
+    isTaskIndex?: boolean;
   }
   const workspaceTopics = new Map<string, WorkspaceTopicState>();
   /** workspacePath -> 订阅时实际使用的 workspaceKey，发布摘要时要用同一个键，否则帧会按 topic 被静默过滤。 */
@@ -615,6 +629,8 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
         indexSeq: 0,
         configSeq: 0,
         summaries: new Map(),
+        pendingSyncerSessionIds: new Set(),
+        hasTaskIndexSubscriber: false,
         config: { configOptions: [], slashCommands: [] },
       };
       workspaceTopics.set(workspaceKey, state);
@@ -682,7 +698,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
    * 报告能直接回答断在哪一跳：announce（lifecycle 广播）→ 同步器订阅注册 →
    * publishSessionIndex 发帧（有/无订阅者）→ taskIndexRepo 写库（rejects 在 repo.diag）。
    */
-  const SIDEBAR_DIAG_KEY = "zcode-mobile.sidebar.diag";
+  const SIDEBAR_DIAG_KEY = "zcode-mobile.sidebar-chain.diag";
   const sidebarDiagRing: Array<{ at: number; step: string; detail: string }> = [];
   let sidebarDiagLoaded = false;
   function sidebarDiag(step: string, detail: string): void {
@@ -823,6 +839,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     const previous = state.summaries.get(session.sessionId);
     if (previous && JSON.stringify(previous) === JSON.stringify(summary)) return;
     state.summaries.set(session.sessionId, summary);
+    if (!state.hasTaskIndexSubscriber) {
+      state.pendingSyncerSessionIds.add(session.sessionId);
+    }
     // 「等待确认」是侧栏唯一关心的易丢字段：它挂在增量帧的水位上，中间丢一帧或水位漂移，
     // 侧栏就会一直留着旧标识（用户报的就是这个：确认以后标识不消失）。
     // 所以待确认状态发生变化时直接投**快照**——快照不校验水位，丢了也只能是下一帧，不会留下旧状态。
@@ -4683,6 +4702,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
   function workspaceSnapshotOf(
     kind: "sessions-index" | "workspace-config",
     state: WorkspaceTopicState,
+    excludeSessionIds?: ReadonlySet<string>,
   ): SessionsIndexTopicFrame["payload"] | { kind: "snapshot"; snapshot: WorkspaceConfigSnapshot } {
     return kind === "sessions-index"
       ? {
@@ -4691,7 +4711,9 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
             protocolVersion: 1,
             workspaceId: state.workspaceKey,
             logEpoch: state.logEpoch,
-            sessions: [...state.summaries.values()],
+            sessions: excludeSessionIds?.size
+              ? [...state.summaries.values()].filter((s) => !excludeSessionIds.has(s.sessionId))
+              : [...state.summaries.values()],
           },
         }
       : {
@@ -4712,22 +4734,39 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
    */
   function subscribeWorkspaceTopic(
     kind: "sessions-index" | "workspace-config",
-    params: { workspacePath: string; workspaceIdentity?: string },
+    params: { workspacePath: string; workspaceIdentity?: string; subscriberScope?: string },
   ): { ack: { subscriptionId: string; mode: "snapshot"; logEpoch: string } } {
     // 注意：这条是同步实现，水合/首帧都在调用方的宏任务里。调用面（下面两个 async 方法）
     // 先 yieldToInput 让积压输入派发，再进来跑重活。
     const state = workspaceTopicOf(params);
     const isIndex = kind === "sessions-index";
+    const isTaskIndex = isIndex && params.subscriberScope === "task-index";
     const sub: WorkspaceTopicSubscription = {
       subscriptionId: newId(isIndex ? "isub" : "csub"),
       topic: isIndex
         ? sessionsIndexTopic(state.workspaceKey)
         : workspaceConfigTopic(state.workspaceKey),
       ordinal: 0,
+      ...(isTaskIndex ? { isTaskIndex: true } : {}),
     };
     (isIndex ? indexSubs : configSubs).set(sub.subscriptionId, sub);
+    if (isTaskIndex) state.hasTaskIndexSubscriber = true;
     if (isIndex) sidebarDiag("subscribe", `workspace=${state.workspaceKey} subs=${indexSubs.size}`);
-    emitWorkspaceTopicFrame(kind, state, workspaceSnapshotOf(kind, state), "initial", sub);
+    const pendingSyncer =
+      isTaskIndex && state.pendingSyncerSessionIds.size > 0
+        ? new Set(state.pendingSyncerSessionIds)
+        : undefined;
+    if (pendingSyncer) state.pendingSyncerSessionIds.clear();
+    emitWorkspaceTopicFrame(kind, state, workspaceSnapshotOf(kind, state, pendingSyncer), "initial", sub);
+    if (pendingSyncer) {
+      const deltas = [...pendingSyncer]
+        .map((id) => state.summaries.get(id))
+        .filter((s): s is SessionSummary => Boolean(s))
+        .map((session) => ({ op: "session.upserted" as const, session }));
+      if (deltas.length > 0) {
+        emitWorkspaceTopicFrame("sessions-index", state, { kind: "deltas", deltas }, "online");
+      }
+    }
     say(`${kind} 订阅 workspace=${state.workspaceKey}`);
     return {
       ack: { subscriptionId: sub.subscriptionId, mode: "snapshot", logEpoch: state.logEpoch },
@@ -5024,6 +5063,7 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     async subscribeSessionsIndexV4(params: {
       workspacePath: string;
       workspaceIdentity?: string;
+      subscriberScope?: string;
       base?: { logEpoch: string; seq: number };
       visibility?: "foreground" | "background";
     }): Promise<{ ack: { subscriptionId: string; mode: "snapshot"; logEpoch: string } }> {
@@ -5041,7 +5081,17 @@ export function createMobileAgentService(options: MobileAgentServiceOptions = {}
     },
 
     async unsubscribeSessionsIndexV4(params: { subscriptionId: string }): Promise<void> {
+      const sub = indexSubs.get(params.subscriptionId);
       indexSubs.delete(params.subscriptionId);
+      if (sub?.isTaskIndex) {
+        const key = sub.topic.slice(sub.topic.indexOf("/") + 1);
+        const state = workspaceTopics.get(key);
+        if (state) {
+          state.hasTaskIndexSubscriber = [...indexSubs.values()].some(
+            (s) => s.topic === sub.topic && s.isTaskIndex,
+          );
+        }
+      }
     },
 
     /**

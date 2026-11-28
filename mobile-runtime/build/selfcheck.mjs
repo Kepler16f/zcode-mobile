@@ -825,7 +825,7 @@ export async function runDeviceChecks(rt) {
     // publish 有而 frame-dropped = 订阅注册晚于发帧；frame-dropped 连发 = workspaceKey 错位）。
     try {
       out.sidebarChain = JSON.parse(
-        globalThis.localStorage?.getItem("zcode-mobile.sidebar.diag") ?? "[]",
+        globalThis.localStorage?.getItem("zcode-mobile.sidebar-chain.diag") ?? "[]",
       );
     } catch {
       out.sidebarChain = [];
