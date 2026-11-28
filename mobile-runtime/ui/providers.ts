@@ -12,14 +12,18 @@
 // accountSource（ui/account.ts）装进来；桥不在（桌面跑开发自检）就继续 fail-closed，
 // 而不是给个能收 token 却存不下的登录面。个人 API Key（自己的免费额度）走 personalFilePath，
 // 与登录无关、端侧一直可用。全程符合"只用官方 OAuth / 自己的额度、不碰反向代理"。
+import { join } from "node:path";
 import { materializeZCodeBuiltinProviderConfig, NodeModelSelectionConfigRepository } from "@zcode/provider-node";
+import { buildRuntimeZCodeEndpointUrls, type ApiClient } from "@zcode/shared";
 import { createProviderConfigRuntime } from "@zcode/services/deep/model-provider/providerConfigRuntime.js";
 import { createProviderRuntimeFromConfigRuntime } from "@zcode/services/deep/model-provider/providerRuntime.js";
+import { fetchZCodeBuiltinRemoteRelease } from "@zcode/services/deep/model-provider/zcodeBuiltinRemoteConfig.js";
 // accountSource / testConnectivity 这两格的类型直接取消费方那一份声明（providerRuntime.ts:33-36），
 // 不写 unknown 再 as never：上一版就是这么写的，tsc 一跑就是 TS2345 "accountSource: unknown
 // 不能赋给 RefreshableProviderSource<AccountProviderConfigSnapshot>"。
 import type { ProviderRuntimeDependencies } from "@zcode/services/deep/model-provider/providerRuntime.js";
 import { getAppConfigDir } from "@zcode/services/deep/paths.js";
+import { officialCompatibilityVersion } from "./server-compat.js";
 
 // 随包基线：构建时把仓库里的 config/provider/zcode-builtin.json 嵌进来，
 // 与上游 server 的 tsup define 同一个符号、同一份内容（packages/server/tsup.config.ts:23）。
@@ -51,9 +55,13 @@ export async function createMobileProviderRuntime(options: {
    * 会抛"当前 Environment 未装配模型连通性测试能力"，用户点下去看到的是一句像端侧坏了的话。
    */
   testConnectivity?: ProviderRuntimeDependencies["testConnectivity"];
+  /** 接入官方 CDN 的 zcode-builtin 远端热更新（与桌面端同源，确保服务端上新如 GLM-5.4 时免重装即生效）。 */
+  remoteApiClient?: ApiClient;
+  onDiagnostic?: (message: string) => void;
 } = {}) {
+  const appConfigDir = getAppConfigDir();
   const zcodeBuiltinFilePath = await materializeZCodeBuiltinProviderConfig({
-    environmentConfigRoot: getAppConfigDir(),
+    environmentConfigRoot: appConfigDir,
     content: bundledZCodeBuiltinProviderConfig(),
   });
   const configRuntime = createProviderConfigRuntime({
@@ -62,6 +70,27 @@ export async function createMobileProviderRuntime(options: {
     // 个人配置轮询在桌面上是为了发现"另一个进程改了同一个文件"；端侧只有这一个运行时，
     // 改配置的路径全在本进程内，留下定时器就是白烧电。
     personalPollingIntervalMs: false,
+    ...(options.remoteApiClient
+      ? {
+          zcodeBuiltinRemote: {
+            controlFilePath: join(appConfigDir, "zcode-builtin-remote-control.json"),
+            resolveEndpointKey: () => buildRuntimeZCodeEndpointUrls({}).origin,
+            fetchRelease: (endpointOrigin, signal) =>
+              fetchZCodeBuiltinRemoteRelease({
+                apiClient: options.remoteApiClient!,
+                endpointOrigin,
+                appVersion: officialCompatibilityVersion(),
+                platform: "linux-arm64",
+                signal,
+              }),
+          },
+          onZCodeBuiltinRefreshError: (err) => {
+            options.onDiagnostic?.(
+              `zcode-builtin 远端刷新失败（继续使用本地基线）：${String((err as Error)?.message ?? err)}`,
+            );
+          },
+        }
+      : {}),
   });
   const account = options.buildAccountSource?.(configRuntime.configService);
   // 模型选择的"默认模型"配置源原来由 createProviderRuntime 内部顺手建；这里改用

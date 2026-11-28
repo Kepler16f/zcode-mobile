@@ -1,19 +1,32 @@
 /* eslint-disable max-lines -- OAuth 凭据仓储集中维护 ZAI/BigModel 登录镜像 key 边界，拆分会让鉴权事实源更难追踪。 */
 import { Buffer } from "node:buffer";
 import type {
+  OAuthLinkedBigModel,
   OAuthLoginAttribution,
   OAuthProviderId,
   OAuthTokenSet,
   OAuthUserProfile,
 } from "@zcode/shared";
-import { BIGMODEL_PROVIDER_ID, isCredentialDecryptError, ZAI_PROVIDER_ID } from "@zcode/shared";
+import {
+  BIGMODEL_PROVIDER_ID,
+  isBuiltinOAuthProvider,
+  isCredentialDecryptError,
+  isZaiOAuthProvider,
+  OAUTH_LINKED_BIGMODEL_KEY,
+  ZAI_CN_PROVIDER_ID,
+  ZAI_PROVIDER_ID,
+} from "@zcode/shared";
 import type { ICredentialService } from "../../credential/credential.js";
 import { createServiceLogger } from "../../logger/serviceLogger.js";
 
 const ACTIVE_PROVIDER_KEY = "oauth:active_provider";
 const LOGIN_ATTRIBUTION_KEY = "oauth:login_attribution";
 const ZCODE_JWT_TOKEN_KEY = "zcodejwttoken";
-const KNOWN_OAUTH_PROVIDER_IDS = [BIGMODEL_PROVIDER_ID, ZAI_PROVIDER_ID] as const;
+const KNOWN_OAUTH_PROVIDER_IDS = [
+  BIGMODEL_PROVIDER_ID,
+  ZAI_PROVIDER_ID,
+  ZAI_CN_PROVIDER_ID,
+] as const;
 const log = createServiceLogger("oauthCredentialRepo");
 
 interface OAuthCredentialRepoOptions {
@@ -298,13 +311,16 @@ export class OAuthCredentialRepo {
 
       const refreshToken = await this.credentialService.load(refreshTokenKey(provider));
 
-      const zcodeJwtToken =
-        provider === ZAI_PROVIDER_ID || provider === BIGMODEL_PROVIDER_ID
-          ? await this.credentialService.load(ZCODE_JWT_TOKEN_KEY)
-          : null;
+      const zcodeJwtToken = isBuiltinOAuthProvider(provider)
+        ? await this.credentialService.load(ZCODE_JWT_TOKEN_KEY)
+        : null;
+      const linkedBigModel = isZaiOAuthProvider(provider)
+        ? await this.loadLinkedBigModelForProvider(provider)
+        : undefined;
 
       return {
         accessToken,
+        ...(linkedBigModel ? { linkedBigModel } : {}),
         ...(refreshToken ? { refreshToken } : {}),
         ...(zcodeJwtToken ? { zcodeJwtToken } : {}),
       };
@@ -318,7 +334,40 @@ export class OAuthCredentialRepo {
     }
   }
 
-  async saveTokenSet(provider: OAuthProviderId, tokenSet: OAuthTokenSet): Promise<void> {
+  async loadLinkedBigModel(): Promise<(OAuthLinkedBigModel & { userId?: string }) | null> {
+    try {
+      const raw = await this.credentialService.load(OAUTH_LINKED_BIGMODEL_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const customerId = typeof parsed.customerId === "string" ? parsed.customerId.trim() : "";
+      const accessToken = typeof parsed.accessToken === "string" ? parsed.accessToken.trim() : "";
+      if (!customerId || !accessToken) return null;
+      const userId = typeof parsed.userId === "string" ? parsed.userId.trim() : undefined;
+      return { customerId, accessToken, ...(userId ? { userId } : {}) };
+    } catch {
+      return null;
+    }
+  }
+
+  private async loadLinkedBigModelForProvider(
+    provider: OAuthProviderId,
+  ): Promise<OAuthLinkedBigModel | undefined> {
+    const linked = await this.loadLinkedBigModel();
+    if (!linked) return undefined;
+    if (linked.userId) {
+      const profile = await this.loadUserProfile(provider);
+      if (profile?.id && linked.userId !== profile.id) {
+        return undefined;
+      }
+    }
+    return { customerId: linked.customerId, accessToken: linked.accessToken };
+  }
+
+  async saveTokenSet(
+    provider: OAuthProviderId,
+    tokenSet: OAuthTokenSet,
+    userId?: string,
+  ): Promise<void> {
     await this.credentialService.save(accessTokenKey(provider), tokenSet.accessToken);
 
     if (tokenSet.refreshToken) {
@@ -327,14 +376,23 @@ export class OAuthCredentialRepo {
       await this.credentialService.delete(refreshTokenKey(provider));
     }
 
-    if (provider === ZAI_PROVIDER_ID || provider === BIGMODEL_PROVIDER_ID) {
+    if (isBuiltinOAuthProvider(provider)) {
       if (tokenSet.zcodeJwtToken) {
-        // BigModel Start Plan 与 Z.ai Start Plan 一样消费 zcode JWT。
-        // JWT 必须在 OAuth callback 阶段随 tokenSet 落盘，后续 balance/runtime 只读取它，
-        // 不能再拿 BigModel access token 拼另一个 /oauth/token body 临时兑换。
         await this.credentialService.save(ZCODE_JWT_TOKEN_KEY, tokenSet.zcodeJwtToken);
       } else {
         await this.credentialService.delete(ZCODE_JWT_TOKEN_KEY);
+      }
+      if (tokenSet.linkedBigModel) {
+        await this.credentialService.save(
+          OAUTH_LINKED_BIGMODEL_KEY,
+          JSON.stringify({
+            ...(userId ? { userId } : {}),
+            customerId: tokenSet.linkedBigModel.customerId,
+            accessToken: tokenSet.linkedBigModel.accessToken,
+          }),
+        );
+      } else {
+        await this.credentialService.delete(OAUTH_LINKED_BIGMODEL_KEY);
       }
     }
   }
@@ -384,8 +442,8 @@ export class OAuthCredentialRepo {
         };
       }
 
-      if (provider === ZAI_PROVIDER_ID && typeof parsed === "object" && parsed !== null) {
-        // ZAI user_info 现在按后端 data.user 原样持久化，
+      if (isZaiOAuthProvider(provider) && typeof parsed === "object" && parsed !== null) {
+        // ZAI / ZAI_CN user_info 按后端 data.user 原样持久化，
         // 启动恢复时需要从 user_id/name/avatar 重新映射展示字段。
         const zaiProfile = toOAuthUserProfileFromRawZaiUser(parsed as Record<string, unknown>);
         if (zaiProfile) {
@@ -400,10 +458,8 @@ export class OAuthCredentialRepo {
   }
 
   async saveUserProfile(provider: OAuthProviderId, profile: OAuthUserProfile): Promise<void> {
-    // ZAI 后端返回的 data.user 是后续账号态排查与恢复的源数据，
-    // 之前只保存归一化展示字段会丢失 email/name/avatar 原始结构。
     const persistProfile =
-      provider === ZAI_PROVIDER_ID && profile.rawProfile ? profile.rawProfile : profile;
+      isZaiOAuthProvider(provider) && profile.rawProfile ? profile.rawProfile : profile;
 
     await this.credentialService.save(userInfoKey(provider), JSON.stringify(persistProfile));
   }
@@ -418,6 +474,7 @@ export class OAuthCredentialRepo {
     await this.credentialService.delete(userInfoKey(provider));
     if (shouldClearZcodeJwtOnLogout(provider)) {
       await this.credentialService.delete(ZCODE_JWT_TOKEN_KEY);
+      await this.credentialService.delete(OAUTH_LINKED_BIGMODEL_KEY);
     }
   }
 
@@ -448,5 +505,5 @@ export class OAuthCredentialRepo {
 }
 
 function shouldClearZcodeJwtOnLogout(provider: OAuthProviderId): boolean {
-  return provider === ZAI_PROVIDER_ID || provider === BIGMODEL_PROVIDER_ID;
+  return isBuiltinOAuthProvider(provider);
 }

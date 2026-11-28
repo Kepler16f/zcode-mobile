@@ -11,8 +11,27 @@ export const BIGMODEL_PROVIDER_ID = "bigmodel" as const;
 /** 内置 ZAI provider id */
 export const ZAI_PROVIDER_ID = "zai" as const;
 
-/** 内置中国区 ZCode OAuth provider id（与上游 v3.18.2 对齐） */
+/** 内置中国区 ZCode OAuth provider id（与上游 v4.0.0 对齐） */
 export const ZAI_CN_PROVIDER_ID = "zai_cn" as const;
+
+/** 国内登录关联的 BigModel 身份与访问凭据存储键 */
+export const OAUTH_LINKED_BIGMODEL_KEY = "oauth:linked_bigmodel" as const;
+
+export function isZaiOAuthProvider(
+  provider: string | null | undefined,
+): provider is typeof ZAI_PROVIDER_ID | typeof ZAI_CN_PROVIDER_ID {
+  return provider === ZAI_PROVIDER_ID || provider === ZAI_CN_PROVIDER_ID;
+}
+
+export function isBuiltinOAuthProvider(
+  provider: string | null | undefined,
+): provider is typeof BIGMODEL_PROVIDER_ID | typeof ZAI_PROVIDER_ID | typeof ZAI_CN_PROVIDER_ID {
+  return (
+    provider === BIGMODEL_PROVIDER_ID ||
+    provider === ZAI_PROVIDER_ID ||
+    provider === ZAI_CN_PROVIDER_ID
+  );
+}
 
 /** 凭据解密失败错误前缀 */
 export const CREDENTIAL_DECRYPT_ERROR_PREFIX = "凭据解密失败：" as const;
@@ -133,12 +152,18 @@ export interface OAuthLoginAttribution {
   utm_campaign?: string;
 }
 
+export interface OAuthLinkedBigModel {
+  customerId: string;
+  accessToken: string;
+}
+
 /** 归一化 token 结构 */
 export interface OAuthTokenSet {
   accessToken: string;
   refreshToken?: string;
   expiresAt?: number;
   zcodeJwtToken?: string;
+  linkedBigModel?: OAuthLinkedBigModel;
 }
 
 export interface UserInfo {

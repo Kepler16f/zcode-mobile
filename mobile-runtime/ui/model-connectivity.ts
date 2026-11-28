@@ -16,10 +16,16 @@
 // 判成失败就是把连通性测试变成误报源。
 import { createProviderSettingsConnectivityTester } from "@zcode/services/deep/model-provider/providerSettingsConnectivity.js";
 import { resolveModelTarget, type ModelTargetResolver } from "./provider-target.js";
-import { streamModelCompletion, modelRequestUrl, type ModelTarget } from "./model-stream.js";
+import {
+  OFFICIAL_ZCODE_CONNECTIVITY_SYSTEM_PROMPT,
+  streamModelCompletion,
+  modelRequestUrl,
+  type ModelTarget,
+} from "./model-stream.js";
 
-/** 一次测试最多花多少输出 token：够网关回一个增量，又不至于产生有意义的计费。 */
-const TEST_MAX_OUTPUT_TOKENS = 16;
+/** 对齐上游 workspace-generate-text.ts 的连通性探测预算（上限受模型 maxOutputTokensCap 约束）。 */
+const TEST_MAX_OUTPUT_TOKENS = 512;
+const CONNECTIVITY_PROBE_USER_PROMPT = "hi";
 /** 网关挂住不通时的收口。这不是"用超时掩盖同步问题"：这里等的就是一次真的外网往返。 */
 const DEFAULT_TIMEOUT_MS = 20_000;
 
@@ -52,7 +58,16 @@ export function createMobileConnectivityTester(
     workspacePath: string;
     selection: { providerId: string; modelId: string };
   }): Promise<{ readonly success: true }> => {
-    const target = await resolveModelTarget(options.resolver, input.selection);
+    const resolvedTarget = await resolveModelTarget(options.resolver, input.selection);
+    const lowestReasoningLevel = resolvedTarget.reasoningValues?.[0];
+    const target: ModelTarget =
+      lowestReasoningLevel && !resolvedTarget.reasoningLevel
+        ? { ...resolvedTarget, reasoningLevel: lowestReasoningLevel }
+        : resolvedTarget;
+    const maxOutputTokens = Math.min(
+      TEST_MAX_OUTPUT_TOKENS,
+      target.maxOutputTokensCap ?? TEST_MAX_OUTPUT_TOKENS,
+    );
     const controller = new AbortController();
     let delivered = false;
     let timedOut = false;
@@ -63,9 +78,13 @@ export function createMobileConnectivityTester(
     try {
       await stream({
         target,
-        // 一句没有业务含义的 ping：这一格验的是"能不能通"，不是"答得好不好"。
-        messages: [{ role: "user", content: "ping" }],
-        maxOutputTokens: TEST_MAX_OUTPUT_TOKENS,
+        // 严格对齐上游 workspace-generate-text.ts 的连通性探测白名单消息对：
+        // Start Plan / Coding Plan 网关按该精确 system + user 消息放行官方连通性测试。
+        messages: [
+          { role: "system", content: OFFICIAL_ZCODE_CONNECTIVITY_SYSTEM_PROMPT },
+          { role: "user", content: CONNECTIVITY_PROBE_USER_PROMPT },
+        ],
+        maxOutputTokens,
         signal: controller.signal,
         onDelta: (text) => {
           if (!delivered && text) {

@@ -13,6 +13,7 @@ import {
   TID_OAUTH_CANCEL,
   TID_OAUTH_ERROR,
   TID_OAUTH_LOGIN_BUTTON,
+  ZAI_CN_PROVIDER_ID,
   ZAI_PROVIDER_ID,
   testId,
 } from "@zcode/shared";
@@ -328,7 +329,10 @@ function LoginPanel({ active, onComplete }: LoginPanelProps) {
                     }
                     onClick={() => void startTrackedLogin(provider.id)}
                   >
-                    {renderOAuthProviderIcon(provider.id, "size-4")}
+                    {renderOAuthProviderIcon(
+                      provider.id === ZAI_CN_PROVIDER_ID ? ZAI_PROVIDER_ID : provider.id,
+                      "size-4",
+                    )}
                     <span className="min-w-0 truncate">
                       {intl.formatMessage(
                         { id: getLoginOAuthButtonMessageId(provider.id) },
@@ -488,6 +492,7 @@ function LoginPanelLogo() {
 function getLoginOAuthButtonMessageId(providerId: string): string {
   switch (providerId) {
     case ZAI_PROVIDER_ID:
+    case ZAI_CN_PROVIDER_ID:
       return "login.oauth.button.zai";
     case BIGMODEL_PROVIDER_ID:
       return "login.oauth.button.bigmodel";
@@ -501,6 +506,7 @@ function getLoginOAuthRegionTagMessageId(providerId: string): string | null {
     case ZAI_PROVIDER_ID:
       return "login.oauth.regionTag.zai";
     case BIGMODEL_PROVIDER_ID:
+    case ZAI_CN_PROVIDER_ID:
       return "login.oauth.regionTag.bigmodel";
     default:
       return null;
@@ -524,13 +530,12 @@ function LoginOAuthRegionTag({ providerId }: { providerId: string }) {
 
 function getProviderPriority(provider: OAuthProviderMeta): number {
   switch (provider.id) {
-    // Windows 登录入口里 z.ai 入口需要固定排在最上面，
-    // 之前把 BigModel 设成更高优先级后，用户首屏会先看到次要入口。
-    // 这里直接调整排序权重，只改展示顺序，不影响 OAuth provider 的真实配置来源。
-    case ZAI_PROVIDER_ID:
+    case ZAI_CN_PROVIDER_ID:
       return 0;
     case BIGMODEL_PROVIDER_ID:
       return 1;
+    case ZAI_PROVIDER_ID:
+      return 2;
     default:
       return 10 + provider.order;
   }

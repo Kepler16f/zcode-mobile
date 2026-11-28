@@ -5,6 +5,9 @@ import {
   formatLogPrefix,
   type ApiClient,
   BIGMODEL_PROVIDER_ID,
+  isBuiltinOAuthProvider,
+  isZaiOAuthProvider,
+  ZAI_CN_PROVIDER_ID,
   ZAI_PROVIDER_ID,
   type OAuthCallbackResult,
   type OAuthCachedSessionRestoreResult,
@@ -26,7 +29,11 @@ import {
   refreshLegacyBigModelCachedProfile,
   withProviderProfileSchema,
 } from "./oauthProfileSchema.js";
-import { createOAuthProviderAdapters, type OAuthProviderAdapter } from "./providers/index.js";
+import {
+  createOAuthProviderAdapters,
+  readLinkedBigModel,
+  type OAuthProviderAdapter,
+} from "./providers/index.js";
 import { OAuthCredentialRepo } from "./repo/oauthCredentialRepo.js";
 import { createOAuthRuntimeConfig } from "./runtimeConfig.js";
 import {
@@ -48,6 +55,7 @@ interface PendingState {
   expiresAt: number;
   timeout: NodeJS.Timeout;
   phase: "awaiting-attribution-or-code" | "awaiting-code-after-attribution";
+  redirectUri?: string;
   completionPromise?: Promise<OAuthCallbackResult | null>;
   polling?: {
     expiresAt: number;
@@ -110,14 +118,13 @@ function isSameOAuthProfile(left: OAuthUserProfile, right: OAuthUserProfile): bo
   );
 }
 
-function resolveInactiveOAuthProvider(provider: OAuthProviderId): OAuthProviderId | null {
-  if (provider === ZAI_PROVIDER_ID) {
-    return BIGMODEL_PROVIDER_ID;
+function resolveInactiveOAuthProviders(provider: OAuthProviderId): OAuthProviderId[] {
+  if (!isBuiltinOAuthProvider(provider)) {
+    return [];
   }
-  if (provider === BIGMODEL_PROVIDER_ID) {
-    return ZAI_PROVIDER_ID;
-  }
-  return null;
+  return [BIGMODEL_PROVIDER_ID, ZAI_PROVIDER_ID, ZAI_CN_PROVIDER_ID].filter(
+    (candidate) => candidate !== provider,
+  );
 }
 
 /**
@@ -217,23 +224,62 @@ export class OAuthService implements IOAuthService {
       return { status: "signed-out" };
     }
 
-    // 启动缓存恢复只需要检查共享 zcode JWT；若通过 loadActiveTokenSet 连带读取
-    // provider access token，会把原本后台执行的 BigModel profile 迁移重新阻塞到首屏恢复链路。
-    const zcodeJwtToken = (await this.credentialService.load(ZCODE_JWT_TOKEN_KEY))?.trim() ?? "";
-    if (zcodeJwtToken && resolveJwtExpiration(zcodeJwtToken, this.now()).kind === "expired") {
-      serviceLog.info("cached session invalidated because zcode JWT expired", {
+    // 启动缓存恢复同时检查共享 zcode JWT 与当前登录域 access_token（中国区 zai_cn 仅消费共享 zcode JWT）：
+    // 1. 任一已过期的 JWT 均触发重登失效清理，避免过期凭据继续把 UI 留在“已登录”假象；
+    // 2. 所有内置登录域（zai / bigmodel / zai_cn）都必须持有非空 zcodejwttoken，
+    //    否则 billing/balance（剩余用量）、billing/preview+claim（活动领取）与 zcode-plan/anthropic（试用）全部会因无 JWT 静默失效。
+    const candidateTokens = [
+      {
+        key: ZCODE_JWT_TOKEN_KEY,
+        value: (await this.credentialService.load(ZCODE_JWT_TOKEN_KEY))?.trim() ?? "",
+      },
+      ...(activeProvider === ZAI_CN_PROVIDER_ID
+        ? []
+        : [
+            {
+              key: `oauth:${activeProvider}:access_token`,
+              value:
+                (await this.credentialService.load(`oauth:${activeProvider}:access_token`))?.trim() ??
+                "",
+            },
+          ]),
+    ];
+    const zcodeJwtToken = candidateTokens[0]?.value ?? "";
+    const expired = candidateTokens.find(
+      ({ value }) => value && resolveJwtExpiration(value, this.now()).kind === "expired",
+    );
+    if (expired) {
+      serviceLog.info("cached session invalidated because login JWT expired", {
         provider: activeProvider,
+        credentialKey: expired.key,
       });
       const invalidated = await this.invalidateExpiredCachedSession(
         restoreGeneration,
         activeProvider,
         profile,
-        zcodeJwtToken,
+        expired.value,
+        expired.key,
       );
       if (!invalidated) {
         return this.restoreCachedSessionState();
       }
       return { status: "reauthentication-required", reason: "jwt-expired" };
+    }
+
+    if (isBuiltinOAuthProvider(activeProvider) && !zcodeJwtToken) {
+      // 修复“伪登录态”：BigModel / ZAI_CN / ZAI 只要缺失 zcodejwttoken，Start Plan 领取、试用与余额查询均不可用。
+      // 同步清理残留 active_provider，避免侧栏未登录而登录弹窗仍误认为已连接。
+      log("restoreCachedSession skipped: missing zcodejwttoken, clearing half session:", activeProvider);
+      await this.runSessionMutation(async () => {
+        if (this.oauthSessionGeneration !== restoreGeneration) return;
+        const currentProvider = await this.repo.getActiveProvider();
+        const currentJwt = (await this.credentialService.load(ZCODE_JWT_TOKEN_KEY))?.trim() ?? "";
+        if (currentProvider === activeProvider && !currentJwt) {
+          this.oauthSessionGeneration += 1;
+          await this.repo.clearActiveSession();
+        }
+      });
+      return { status: "signed-out" };
     }
 
     if (activeProvider === BIGMODEL_PROVIDER_ID) {
@@ -266,15 +312,6 @@ export class OAuthService implements IOAuthService {
         });
     }
 
-    if (activeProvider === ZAI_PROVIDER_ID) {
-      if (!zcodeJwtToken) {
-        // sidebar 登录入口之前只看缓存 user_info，会把“缺少 zcodejwttoken”的状态误判成已登录。
-        // 这里补充 zcodejwttoken 门槛，确保没有后端 JWT 时统一按未登录处理。
-        log("restoreCachedSession skipped: missing zcodejwttoken:", activeProvider);
-        return { status: "signed-out" };
-      }
-    }
-
     log("restoreCachedSession restored:", activeProvider, profile.id);
     return { status: "authenticated", userInfo: toUserInfo(profile) };
   }
@@ -284,11 +321,12 @@ export class OAuthService implements IOAuthService {
     expectedProvider: OAuthProviderId,
     expectedProfile: OAuthUserProfile,
     expectedJwt: string,
+    credentialKey = ZCODE_JWT_TOKEN_KEY,
   ): Promise<boolean> {
     const invalidated = await this.runSessionMutation(async () => {
       const currentProvider = await this.repo.getActiveProvider();
       const currentProfile = await this.repo.loadUserProfile(expectedProvider);
-      const currentJwt = (await this.credentialService.load(ZCODE_JWT_TOKEN_KEY))?.trim() ?? "";
+      const currentJwt = (await this.credentialService.load(credentialKey))?.trim() ?? "";
       if (
         this.oauthSessionGeneration !== expectedGeneration ||
         currentProvider !== expectedProvider ||
@@ -393,28 +431,33 @@ export class OAuthService implements IOAuthService {
     profile: OAuthUserProfile,
     isStillCurrent?: () => boolean,
   ): Promise<void> {
-    const inactiveProvider = resolveInactiveOAuthProvider(provider);
+    const inactiveProviders = resolveInactiveOAuthProviders(provider);
     const previousTokenSet = await this.repo.loadTokenSet(provider);
     const previousProfile = await this.repo.loadUserProfile(provider);
-    const previousInactiveTokenSet = inactiveProvider
-      ? await this.repo.loadTokenSet(inactiveProvider)
-      : null;
-    const previousInactiveProfile = inactiveProvider
-      ? await this.repo.loadUserProfile(inactiveProvider)
-      : null;
+    const previousInactives = await Promise.all(
+      inactiveProviders.map(async (inactiveProvider) => ({
+        provider: inactiveProvider,
+        tokenSet: await this.repo.loadTokenSet(inactiveProvider),
+        profile: await this.repo.loadUserProfile(inactiveProvider),
+      })),
+    );
     const previousActiveProvider = await this.repo.getActiveProvider();
     const rollback = async () => {
-      if (previousTokenSet) await this.repo.saveTokenSet(provider, previousTokenSet);
-      else await this.repo.clearProvider(provider);
+      if (previousTokenSet) {
+        await this.repo.saveTokenSet(provider, previousTokenSet, previousProfile?.id);
+      } else {
+        await this.repo.clearProvider(provider);
+      }
       if (previousProfile) await this.repo.saveUserProfile(provider, previousProfile);
       else await this.repo.clearUserProfile(provider);
-      if (inactiveProvider) {
-        if (previousInactiveTokenSet)
-          await this.repo.saveTokenSet(inactiveProvider, previousInactiveTokenSet);
-        else await this.repo.clearProvider(inactiveProvider);
-        if (previousInactiveProfile)
-          await this.repo.saveUserProfile(inactiveProvider, previousInactiveProfile);
-        else await this.repo.clearUserProfile(inactiveProvider);
+      for (const prev of previousInactives) {
+        if (prev.tokenSet) {
+          await this.repo.saveTokenSet(prev.provider, prev.tokenSet, prev.profile?.id);
+        } else {
+          await this.repo.clearProvider(prev.provider);
+        }
+        if (prev.profile) await this.repo.saveUserProfile(prev.provider, prev.profile);
+        else await this.repo.clearUserProfile(prev.provider);
       }
       if (previousActiveProvider) await this.repo.setActiveProvider(previousActiveProvider);
       else await this.repo.setActiveProvider(null);
@@ -426,21 +469,18 @@ export class OAuthService implements IOAuthService {
       }
     };
     this.oauthSessionGeneration += 1;
-    if (inactiveProvider) {
+    for (const inactiveProvider of inactiveProviders) {
       await assertCurrent();
-      // ZAI 与 BigModel 是互斥身份域。切换 provider 时必须先清旧 provider，
-      // 再保存当前 token；反序会让 clearProvider 误删共享的 zcodejwttoken。
+      // 互斥身份域切换时必须先清旧 provider，再保存当前 token；反序会让 clearProvider 误删共享的 zcodejwttoken。
       await this.repo.clearProvider(inactiveProvider);
     }
     await assertCurrent();
-    await this.repo.saveTokenSet(provider, tokenSet);
+    await this.repo.saveTokenSet(provider, tokenSet, profile.id);
     await assertCurrent();
     await this.repo.saveUserProfile(provider, withProviderProfileSchema(provider, profile));
     await assertCurrent();
     await this.repo.setActiveProvider(provider);
     if (isStillCurrent && !isStillCurrent()) {
-      // active provider 写入无法被底层 credential IO 取消；失效 flow 不能仅按
-      // provider 清理，否则同 provider 的新 flow 可能被旧 flow 误删。
       await rollback();
       throw new Error("OAuth flow 已取消");
     }
@@ -599,6 +639,9 @@ export class OAuthService implements IOAuthService {
   }
 
   async startOAuth(provider: OAuthProviderId): Promise<OAuthStartResponse> {
+    if (provider === ZAI_CN_PROVIDER_ID) {
+      return this.startOAuthWithPolling(provider);
+    }
     return this.startOAuthInternal(provider);
   }
 
@@ -655,7 +698,7 @@ export class OAuthService implements IOAuthService {
   }
 
   async startOAuthWithPolling(provider: OAuthProviderId): Promise<OAuthStartResponse> {
-    if (provider !== ZAI_PROVIDER_ID && provider !== BIGMODEL_PROVIDER_ID) {
+    if (!isBuiltinOAuthProvider(provider)) {
       return this.startOAuthInternal(provider);
     }
 
@@ -708,13 +751,19 @@ export class OAuthService implements IOAuthService {
       // BigModel CLI callback 的失败页会截断原有 Desktop deep link 回调体验。
       // flow 仍由 Host 轮询，但浏览器回调恢复到官网中转页，再透传到 zcode://oauth/callback。
       authorizeUrl.searchParams.set("redirect", buildDesktopOAuthRedirectUriFromEnv(this.env));
-    } else if (provider === ZAI_PROVIDER_ID) {
-      // Z.AI 后端 init 仍可能返回 provider-specific callback，导致回跳行为与 BigModel 不一致。
-      // Desktop 统一改写为官网中转页，再由官网透传到 zcode://oauth/callback。
-      authorizeUrl.searchParams.set("redirect_uri", buildDesktopOAuthRedirectUriFromEnv(this.env));
+    } else if (isZaiOAuthProvider(provider)) {
+      // 同步上游 v4.0.0：国内渠道显式传 provider=zai_cn，避免官网把国内授权码送往海外回调。
+      const redirectUri = new URL(buildDesktopOAuthRedirectUriFromEnv(this.env));
+      if (provider === ZAI_CN_PROVIDER_ID) {
+        redirectUri.searchParams.set("provider", provider);
+      }
+      authorizeUrl.searchParams.set("redirect_uri", redirectUri.toString());
     }
     const state = authorizeUrl.searchParams.get("state")?.trim();
-    const remainingLifetimeMs = expiresAt - this.now();
+    // 同步上游 v4.0.0：expires_at 与 server_time 同属服务端时钟，避免手机本机时钟偏差导致初始化误报无效。
+    const remainingLifetimeMs = Number.isFinite(data.server_time)
+      ? expiresAt - (data.server_time as number) * 1_000
+      : expiresAt - this.now();
     if (
       authorizeUrl.protocol !== "https:" ||
       !state ||
@@ -728,6 +777,7 @@ export class OAuthService implements IOAuthService {
     }
 
     const timeoutMs = Math.min(OAUTH_TIMEOUT_MS, remainingLifetimeMs);
+    const localExpiresAt = this.now() + timeoutMs;
     const timeout = setTimeout(() => {
       const pending = this.pendingState;
       // polling flow 超时必须立即收口，不能等待下一次 UI 轮询；同时校验 flowId，避免旧定时器清掉新 flow。
@@ -738,11 +788,14 @@ export class OAuthService implements IOAuthService {
     this.pendingState = {
       state,
       provider: adapter.providerId,
-      expiresAt: this.now() + timeoutMs,
+      expiresAt: localExpiresAt,
       timeout,
       phase: "awaiting-attribution-or-code",
+      ...(provider === ZAI_CN_PROVIDER_ID
+        ? { redirectUri: authorizeUrl.searchParams.get("redirect_uri") ?? undefined }
+        : {}),
       polling: {
-        expiresAt,
+        expiresAt: localExpiresAt,
         flowId,
         nextPollAt: this.now(),
         pollIntervalMs,
@@ -841,10 +894,9 @@ export class OAuthService implements IOAuthService {
         const user = isUnknownRecord(ready.user) ? ready.user : null;
         const zai = isUnknownRecord(ready.zai) ? ready.zai : null;
         const bigmodel = isUnknownRecord(ready.bigmodel) ? ready.bigmodel : null;
-        const providerAccessToken =
-          pending.provider === ZAI_PROVIDER_ID
-            ? readTrimmedString(zai?.access_token)
-            : readTrimmedString(bigmodel?.access_token) || readTrimmedString(bigmodel?.accessToken);
+        const providerAccessToken = isZaiOAuthProvider(pending.provider)
+          ? readTrimmedString(zai?.access_token)
+          : readTrimmedString(bigmodel?.access_token) || readTrimmedString(bigmodel?.accessToken);
         const zcodeJwtToken = readTrimmedString(ready.token);
         const userId = readTrimmedString(user?.user_id);
         if (!zcodeJwtToken || !providerAccessToken || !userId) {
@@ -865,15 +917,20 @@ export class OAuthService implements IOAuthService {
             ? readTrimmedString(bigmodel?.refresh_token) ||
               readTrimmedString(bigmodel?.refreshToken)
             : undefined;
+        const linkedBigModel = isZaiOAuthProvider(pending.provider)
+          ? readLinkedBigModel(ready.bigmodel)
+          : undefined;
         const tokenSet = adapter.normalizePolledTokenSet
           ? await adapter.normalizePolledTokenSet({
               accessToken: providerAccessToken,
               zcodeJwtToken,
+              ...(linkedBigModel ? { linkedBigModel } : {}),
               ...(refreshToken ? { refreshToken } : {}),
             })
           : {
               accessToken: providerAccessToken,
               zcodeJwtToken,
+              ...(linkedBigModel ? { linkedBigModel } : {}),
               ...(refreshToken ? { refreshToken } : {}),
             };
         return { tokenSet, profile };
@@ -990,6 +1047,26 @@ export class OAuthService implements IOAuthService {
       };
     }
 
+    if (pending.provider === ZAI_CN_PROVIDER_ID && pending.polling) {
+      // 同步上游 v4.0.0：官网已把国内授权码交给后端；客户端再次兑换会争抢一次性 code。
+      // 唤起只补归因，登录由同一 flow 的 polling 提交。
+      const generation = this.oauthFlowStartGeneration;
+      return this.runSessionMutation(async () => {
+        const completed = this.recentlyCompletedPollingState;
+        const sameFlow =
+          this.oauthFlowStartGeneration === generation &&
+          (this.pendingState === pending ||
+            (!this.pendingState &&
+              completed?.state === pending.state &&
+              completed.generation === generation &&
+              this.now() < completed.expiresAt));
+        if (sameFlow && attribution) {
+          await this.repo.saveLoginAttribution(attribution);
+        }
+        return null;
+      });
+    }
+
     const adapter = this.getAdapter(pending.provider);
     const fallbackProfile: OAuthUserProfile = {
       id: "unknown",
@@ -1004,7 +1081,7 @@ export class OAuthService implements IOAuthService {
         const context = {
           providerId: adapter.providerId,
           state: callback.state,
-          redirectUri: adapter.redirectUri,
+          redirectUri: pending.redirectUri ?? adapter.redirectUri,
           now: this.now,
         };
         const tokenSet = await this.runWithAdapterError(adapter, () =>

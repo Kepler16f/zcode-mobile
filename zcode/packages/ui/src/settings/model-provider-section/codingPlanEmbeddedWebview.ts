@@ -5,6 +5,8 @@ import {
   isTrustedCodingPlanWebviewOrigin,
   isZaiCodingPlanProviderId,
   normalizeZCodeEndpointOrigin,
+  type OAuthProviderId,
+  ZAI_CN_PROVIDER_ID,
   ZAI_PROVIDER_ID,
 } from "@zcode/shared";
 import type { CodingPlanWebviewLocale } from "@zcode/shared";
@@ -18,6 +20,7 @@ export interface CodingPlanEmbeddedCredentials {
   zaiAccessToken?: string | null;
   zcodeJwtToken?: string | null;
   bigmodelAccessToken?: string | null;
+  zaiCnAccessToken?: string | null;
 }
 
 interface CodingPlanEmbeddedReportContext {
@@ -60,6 +63,8 @@ const CODING_PLAN_WEBVIEW_CREDENTIAL_LOCAL_STORAGE_KEYS = [
   "oauth:zai:access_token",
   "zcodejwttoken",
   "oauth:bigmodel:access_token",
+  "oauth:zai_cn:access_token",
+  "oauth:active_provider",
 ] as const;
 const CODING_PLAN_REPORT_CONTEXT_STORAGE_KEY = "zcode:coding-plan:report-context";
 
@@ -166,7 +171,9 @@ export function createCodingPlanAuthInjectionScript({
   theme,
   locale,
   reportContext,
+  loginProvider,
 }: {
+  loginProvider?: OAuthProviderId | null;
   provider: CodingPlanWebsiteProvider;
   credentials: CodingPlanEmbeddedCredentials;
   theme: CodingPlanEmbeddedTheme;
@@ -181,16 +188,27 @@ export function createCodingPlanAuthInjectionScript({
           "oauth:zai:access_token": credentials.zaiAccessToken?.trim() || null,
           zcodejwttoken: credentials.zcodeJwtToken?.trim() || null,
           "oauth:bigmodel:access_token": null,
+          "oauth:zai_cn:access_token": null,
         }
       : {
           "oauth:zai:access_token": null,
-          // zcodejwttoken 是 zcode-plan 域通用凭证（BigModel OAuth callback 同样落盘），
-          // 官网用它查 billing/balance 判定 Start Plan 是否使用中；BigModel 分支缺失注入
-          // 会导致官网 Start Plan 卡因查不到权益而误显示「已过期」。业务接口仍走
-          // oauth:bigmodel:access_token，互不污染。
+          // zcodejwttoken 是 zcode-plan 域通用凭证（BigModel / zai_cn OAuth 同样落盘），
+          // 官网用它查 billing/balance 判定 Start Plan 是否使用中。
           zcodejwttoken: credentials.zcodeJwtToken?.trim() || null,
           "oauth:bigmodel:access_token": credentials.bigmodelAccessToken?.trim() || null,
+          "oauth:zai_cn:access_token": credentials.zaiCnAccessToken?.trim() || null,
         };
+  values["oauth:active_provider"] =
+    loginProvider?.trim() ||
+    (provider === "zai"
+      ? credentials.zaiAccessToken?.trim()
+        ? ZAI_PROVIDER_ID
+        : null
+      : credentials.bigmodelAccessToken?.trim()
+        ? BIGMODEL_PROVIDER_ID
+        : credentials.zaiCnAccessToken?.trim() || credentials.zcodeJwtToken?.trim()
+          ? ZAI_CN_PROVIDER_ID
+          : null);
   const storageUpdates = Object.entries(values)
     .map(([key, value]) =>
       value
@@ -319,8 +337,13 @@ export function createCodingPlanLangInjectionScript(locale: CodingPlanWebviewLoc
 
 export function getCodingPlanCredentialKeys(provider: CodingPlanWebsiteProvider): string[] {
   // zcodejwttoken 对两个 provider 都加载：它是 zcode-plan 域通用凭证，
-  // BigModel OAuth callback 同样落盘（见 resolveBigModelStartPlanZcodeJwt）。
+  // 同时携带 oauth:active_provider 与国内 zai_cn token，避免官网停留在“等待 App 的登录信息”。
   return provider === "zai"
-    ? [`oauth:${ZAI_PROVIDER_ID}:access_token`, "zcodejwttoken"]
-    : [`oauth:${BIGMODEL_PROVIDER_ID}:access_token`, "zcodejwttoken"];
+    ? [`oauth:${ZAI_PROVIDER_ID}:access_token`, "zcodejwttoken", "oauth:active_provider"]
+    : [
+        `oauth:${BIGMODEL_PROVIDER_ID}:access_token`,
+        "zcodejwttoken",
+        `oauth:${ZAI_CN_PROVIDER_ID}:access_token`,
+        "oauth:active_provider",
+      ];
 }

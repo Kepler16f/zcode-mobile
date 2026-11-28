@@ -449,12 +449,21 @@ export function ModelProviderSection({
     effectiveConnectionSelections.bigmodel?.kind === "team-coding-plan" ||
     effectiveConnectionSelections.zai?.kind === "team-coding-plan",
   );
+  const activeStartFamily = resolveStartPlanFamilyFromOAuthProvider(activeOAuthProvider);
+  const configuredFamily = sharedSettings?.providerFamilyDomain ?? null;
+  const hasSavedConfiguredSelection = configuredFamily
+    ? Boolean(effectiveConnectionSelections[configuredFamily])
+    : false;
   const effectiveProviderFamilyDomain =
-    sharedSettings?.providerFamilyDomain ??
-    resolveProviderFamilyDomainFromOAuthProvider(activeOAuthProvider);
+    configuredFamily && (hasSavedConfiguredSelection || !activeStartFamily)
+      ? configuredFamily
+      : (resolveProviderFamilyDomainFromOAuthProvider(activeOAuthProvider) ??
+        configuredFamily ??
+        activeStartFamily);
   const startPlanFamilyDomain =
-    sharedSettings?.providerFamilyDomain ??
-    resolveStartPlanFamilyFromOAuthProvider(activeOAuthProvider);
+    configuredFamily && (hasSavedConfiguredSelection || !activeStartFamily)
+      ? configuredFamily
+      : (activeStartFamily ?? configuredFamily);
   const { entitlements: codingPlanEntitlements, refresh: refreshCodingPlanEntitlements } =
     useCodingPlanEntitlements({
       providerSettingsView,
@@ -489,12 +498,15 @@ export function ModelProviderSection({
         shouldApply?: () => boolean;
       } = {},
     ) => {
-      const [activeProvider, zaiToken, bigmodelToken, zcodeJwtToken] = await Promise.all([
-        credentialService.load("oauth:active_provider"),
-        credentialService.load(`oauth:${ZAI_PROVIDER_ID}:access_token`),
-        credentialService.load(`oauth:${BIGMODEL_PROVIDER_ID}:access_token`),
-        credentialService.load("zcodejwttoken"),
-      ]);
+      const [activeProvider, zaiToken, bigmodelToken, zaiCnToken, linkedBigmodelRaw, zcodeJwtToken] =
+        await Promise.all([
+          credentialService.load("oauth:active_provider"),
+          credentialService.load(`oauth:${ZAI_PROVIDER_ID}:access_token`),
+          credentialService.load(`oauth:${BIGMODEL_PROVIDER_ID}:access_token`),
+          credentialService.load(`oauth:${ZAI_CN_PROVIDER_ID}:access_token`),
+          credentialService.load("oauth:linked_bigmodel"),
+          credentialService.load("zcodejwttoken"),
+        ]);
       if (options.shouldApply && !options.shouldApply()) {
         return null;
       }
@@ -505,6 +517,17 @@ export function ModelProviderSection({
           ? activeProvider
           : null;
       const hasStartPlanJwt = (zcodeJwtToken?.trim().length ?? 0) > 0;
+      const hasZaiCnToken = (zaiCnToken?.trim().length ?? 0) > 0;
+      let hasLinkedBigmodelToken = false;
+      if (linkedBigmodelRaw) {
+        try {
+          const parsed = JSON.parse(linkedBigmodelRaw) as { accessToken?: unknown };
+          hasLinkedBigmodelToken =
+            typeof parsed?.accessToken === "string" && parsed.accessToken.trim().length > 0;
+        } catch {
+          hasLinkedBigmodelToken = false;
+        }
+      }
       const startPlanFamily = resolveStartPlanFamilyFromOAuthProvider(normalizedActiveProvider);
       setActiveOAuthProvider(normalizedActiveProvider);
       setCodingPlanPurchaseTokenAuthenticatedByProviderId({
@@ -515,14 +538,16 @@ export function ModelProviderSection({
         [BUILTIN_MODEL_PROVIDER_IDS.zaiStartPlan]:
           startPlanFamily === "zai" && ((zaiToken?.trim().length ?? 0) > 0 || hasStartPlanJwt),
         [BUILTIN_MODEL_PROVIDER_IDS.bigmodelIndividualCodingPlan]:
-          normalizedActiveProvider === BIGMODEL_PROVIDER_ID &&
-          (bigmodelToken?.trim().length ?? 0) > 0,
+          (normalizedActiveProvider === BIGMODEL_PROVIDER_ID &&
+            (bigmodelToken?.trim().length ?? 0) > 0) ||
+          (normalizedActiveProvider === ZAI_CN_PROVIDER_ID && hasLinkedBigmodelToken),
         [BUILTIN_MODEL_PROVIDER_IDS.bigmodelTeamCodingPlan]:
-          normalizedActiveProvider === BIGMODEL_PROVIDER_ID &&
-          (bigmodelToken?.trim().length ?? 0) > 0,
+          (normalizedActiveProvider === BIGMODEL_PROVIDER_ID &&
+            (bigmodelToken?.trim().length ?? 0) > 0) ||
+          (normalizedActiveProvider === ZAI_CN_PROVIDER_ID && hasLinkedBigmodelToken),
         [BUILTIN_MODEL_PROVIDER_IDS.bigmodelStartPlan]:
           startPlanFamily === "bigmodel" &&
-          ((bigmodelToken?.trim().length ?? 0) > 0 || hasStartPlanJwt),
+          ((bigmodelToken?.trim().length ?? 0) > 0 || hasZaiCnToken || hasStartPlanJwt),
       });
       if (!normalizedActiveProvider && options.clearUserWhenLoggedOut) {
         // provider Unlink 已等价于 App logout。

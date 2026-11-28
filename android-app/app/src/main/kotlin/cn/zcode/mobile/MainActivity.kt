@@ -45,6 +45,8 @@ class MainActivity : Activity() {
     // 通知面（0.11.1）：POST_NOTIFICATIONS 权限、常驻通知（保活）、出错提醒。
     // 第二个参数是 Activity 的取用口：运行时权限只能由 Activity 发（挂名 zcodeNotify）。
     private val notificationBridge by lazy { NotificationBridge(applicationContext) { this } }
+    // 内置浏览器与安全验证小浮窗桥：验证码在当前 Activity 之上弹出轻量无感优先小窗口，不整屏跳页。
+    private val browserBridge by lazy { BrowserBridge(applicationContext) { this } }
 
     // ES module 在 file:// 下会被 CORS 拒绝，因此用 https://appassets 虚拟域加载 assets。
     // lazy：onCreate 与 onRenderProcessGone 的重建路径共用同一份 handler。
@@ -277,8 +279,8 @@ class MainActivity : Activity() {
                         if (uiChrome.selfcheckEntryEnabled) View.VISIBLE else View.GONE
                 }
             }
-            // 内置浏览器（0.6.0）：Browser 工具的 open/navigate/back/read/close 走这条桥。
-            addJavascriptInterface(BrowserBridge(applicationContext), "zcodeBrowser")
+            // 内置浏览器（0.6.0）：Browser 工具的 open/navigate/back/read/close 与安全验证浮窗走这条桥。
+            addJavascriptInterface(browserBridge, "zcodeBrowser")
             // Git 传输 HTTP 桥（0.6.7）：isomorphic-git 的 fetch 传输在 WebView 里被 CORS
             // 全拦（git 端点普遍不答 CORS，GitHub 也是），改走原生 HttpURLConnection。
             gitHttpBridge = NativeBridges.gitHttp()

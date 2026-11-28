@@ -1,4 +1,4 @@
-import { BIGMODEL_PROVIDER_ID } from "@zcode/shared";
+import { BIGMODEL_PROVIDER_ID, ZAI_CN_PROVIDER_ID } from "@zcode/shared";
 
 const ACTIVE_PROVIDER_KEY = "oauth:active_provider";
 const ZCODE_JWT_TOKEN_KEY = "zcodejwttoken";
@@ -16,7 +16,8 @@ export async function resolveBigModelStartPlanZcodeJwt(params: {
   if (
     params.trustCachedZcodeJwt === true ||
     !activeProvider ||
-    activeProvider === BIGMODEL_PROVIDER_ID
+    activeProvider === BIGMODEL_PROVIDER_ID ||
+    activeProvider === ZAI_CN_PROVIDER_ID
   ) {
     const credentialJwt = (await params.credentialService?.load(ZCODE_JWT_TOKEN_KEY))?.trim() || "";
     if (credentialJwt) {

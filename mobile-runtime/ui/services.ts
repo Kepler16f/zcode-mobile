@@ -325,6 +325,8 @@ export async function createMobileServices(options: {
     providerRuntime = await createMobileProviderRuntime({
       ...(credentialService
         ? {
+            remoteApiClient: officialApiClient as never,
+            onDiagnostic: trace,
             buildAccountSource: (configService: unknown) => {
               const created = createMobileAccountSource({
                 credentialService,
@@ -568,7 +570,9 @@ export async function createMobileServices(options: {
       name: "codingPlanSubscriptionService",
       descriptor: ICodingPlanSubscriptionService,
       make: () => {
-        installMobilePromoVerificationHook();
+        installMobilePromoVerificationHook({
+          apiRequest: (url, init) => officialApiClient.request(url, init),
+        });
         if (hasNativeHttpBridge && credentialService) {
           void reportStartPlanActivationEvents({
             apiRequest: (url, init) => officialApiClient.request(url, init),

@@ -1,5 +1,6 @@
 // 只供官方模型名单、telemetry 模型白名单与单向迁移入口使用；不能用于 Registry 比较或通用请求改写。
 const canonicalIds = [
+  "GLM-5.4",
   "GLM-5.3",
   "GLM-5.3-Flash",
   "GLM-5V-Turbo",

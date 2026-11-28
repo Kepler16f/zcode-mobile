@@ -16,7 +16,9 @@ import { officialCompatibilityVersion } from "./server-compat.js";
 
 const DAILY_ACTIVE_CACHE_KEY = "zcode-mobile.startPlanDailyActiveDay";
 const EVENT_REPORT_URL = "https://zcode.z.ai/api/v1/event/report";
+const CLIENT_CONFIGS_URL = "https://zcode.z.ai/api/v1/client/configs";
 const VERIFICATION_GLOBAL_KEY = "__zcodeRequestClaimVerification";
+const MODEL_VERIFICATION_GLOBAL_KEY = "__zcodeResolveModelVerificationHeaders";
 
 type CaptchaPollResult = {
   done?: boolean;
@@ -126,9 +128,14 @@ export async function reportStartPlanActivationEvents(options: {
   }
 }
 
-export function installMobilePromoVerificationHook(): void {
+export function installMobilePromoVerificationHook(options?: {
+  apiRequest?: (
+    input: string,
+    init?: { method?: string; headers?: Record<string, string>; timeoutMs?: number },
+  ) => Promise<Response>;
+}): void {
   const g = globalThis as Record<string, unknown>;
-  g[VERIFICATION_GLOBAL_KEY] = async (
+  const runChallenge = async (
     config: RequestVerificationConfig,
   ): Promise<RequestVerificationProof | null> => {
     const bridge = (globalThis as { zcodeBrowser?: NativeCaptchaBridge }).zcodeBrowser;
@@ -175,5 +182,66 @@ export function installMobilePromoVerificationHook(): void {
       return null;
     }
     return null;
+  };
+
+  g[VERIFICATION_GLOBAL_KEY] = runChallenge;
+  g[MODEL_VERIFICATION_GLOBAL_KEY] = async (
+    targetBaseUrl: string,
+  ): Promise<Record<string, string> | null> => {
+    try {
+      const host = new URL(targetBaseUrl).hostname.toLowerCase();
+      if (host !== "zcode.z.ai" && !host.endsWith(".z.ai")) return null;
+    } catch {
+      return null;
+    }
+    try {
+      const url = new URL(CLIENT_CONFIGS_URL);
+      url.searchParams.set("platform", "linux-arm64");
+      url.searchParams.set("app_version", officialCompatibilityVersion());
+      const identity = officialIdentityRequest(url.toString(), { Accept: "application/json" });
+      const res = options?.apiRequest
+        ? await options.apiRequest(identity.url.toString(), {
+            method: "GET",
+            headers: identity.headers,
+            timeoutMs: 10_000,
+          })
+        : await fetch(identity.url.toString(), { method: "GET", headers: identity.headers });
+      if (!res.ok) return null;
+      const json = (await res.json()) as {
+        data?: {
+          configs?: {
+            captcha?: {
+              enabled?: boolean;
+              prefix?: string;
+              region?: string;
+              sceneId?: string;
+              scene_id?: string;
+            };
+          };
+        };
+      };
+      const raw = json.data?.configs?.captcha;
+      const prefix = typeof raw?.prefix === "string" ? raw.prefix.trim() : "";
+      const sceneId =
+        typeof raw?.sceneId === "string"
+          ? raw.sceneId.trim()
+          : typeof raw?.scene_id === "string"
+            ? raw.scene_id.trim()
+            : "";
+      if (!prefix || !sceneId) return null;
+      const proof = await runChallenge({
+        enabled: true,
+        prefix,
+        region: typeof raw?.region === "string" && raw.region.trim() ? raw.region.trim() : "cn",
+        sceneId,
+      });
+      if (!proof?.captchaVerifyParam) return null;
+      return {
+        "X-Aliyun-Captcha-Verify-Param": proof.captchaVerifyParam,
+        "X-Aliyun-Captcha-Verify-Region": proof.captchaVerifyRegion || "cn",
+      };
+    } catch {
+      return null;
+    }
   };
 }

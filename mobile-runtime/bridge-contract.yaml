@@ -536,14 +536,19 @@ innerShims:
   ZCodeCaptchaBridge:
     kotlinClass: CaptchaShim
     kotlinFile: android-app/app/src/main/kotlin/cn/zcode/mobile/BrowserBridge.kt
-    host: BrowserActivity
-    purpose: "阿里云 SmartCaptcha 验证页面回传真实 captchaVerifyParam"
+    host: CaptchaDialogSession
+    purpose: "阿里云 SmartCaptcha 小浮窗回传真实 captchaVerifyParam 及需交互拼图时的显现信号"
     methods:
       onVerified:
         arity: 2
         args: "param: String?, region: String?"
         returns: "Unit"
         errors: "空 param 时视为失败"
+      onInteractive:
+        arity: 0
+        args: ""
+        returns: "Unit"
+        errors: "无"
 
 callbacks:
   __zcodeJobDone:

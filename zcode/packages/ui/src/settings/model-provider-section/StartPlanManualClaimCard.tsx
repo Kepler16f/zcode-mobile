@@ -123,7 +123,7 @@ export function StartPlanManualClaimCard({
   }, [locallyClaimedIds, quotaLimits, subscriptionDetails]);
 
   const loadOffers = useCallback(
-    async (syncQuota = false) => {
+    async (syncQuota = false, forceRefresh = false) => {
       if (isDisconnected || !subscriptionService?.getManualClaimPlanPreviews) {
         setPlans([]);
         return;
@@ -132,7 +132,9 @@ export function StartPlanManualClaimCard({
       setLoadError(null);
       try {
         const [snapshot] = await Promise.all([
-          subscriptionService.getManualClaimPlanPreviews(),
+          subscriptionService.getManualClaimPlanPreviews(
+            forceRefresh ? { forceRefresh: true } : undefined,
+          ),
           ...(syncQuota
             ? [
                 Promise.resolve(onClaimCompletedRef.current?.()).catch(() => {}),
@@ -178,22 +180,45 @@ export function StartPlanManualClaimCard({
       setClaimingPlanId(plan.planId);
       setFeedback(null);
       try {
+        const verifyHook = (
+          globalThis as { __zcodeRequestClaimVerification?: GlobalClaimVerificationHook }
+        ).__zcodeRequestClaimVerification;
+        // 同步官方客户端 prepareRequestVerificationClaim：当服务端 client/configs 开启 captcha 时，
+        // 在请求 POST /billing/claim 前先获取阿里云 V3 captchaVerifyParam，避免无凭证首请求被拒或消耗限流预算。
+        let captchaConfig = await subscriptionService
+          .getRequestVerificationConfig?.()
+          .catch(() => null);
+        let initialProof: RequestVerificationProof | null = null;
+        if (captchaConfig?.enabled && verifyHook) {
+          initialProof = await verifyHook(captchaConfig);
+          if (!initialProof?.captchaVerifyParam) {
+            setFeedback({
+              kind: "info",
+              text: isZh
+                ? "安全验证未完成，请重新点击「领取」完成验证。"
+                : "Security verification was cancelled. Tap Claim to try again.",
+            });
+            return;
+          }
+        }
         let result = await subscriptionService.claimManualPlan({
           planId: plan.planId,
           ...(plan.campaignId ? { campaignId: plan.campaignId } : {}),
+          ...(initialProof ?? {}),
         });
-        if (!result.success && result.code === 3007) {
-          const verifyHook = (
-            globalThis as { __zcodeRequestClaimVerification?: GlobalClaimVerificationHook }
-          ).__zcodeRequestClaimVerification;
-          const captchaConfig = await subscriptionService.getRequestVerificationConfig?.().catch(() => null);
+        if (!result.success && result.code === 3007 && !initialProof?.captchaVerifyParam) {
+          if (!captchaConfig) {
+            captchaConfig = await subscriptionService
+              .getRequestVerificationConfig?.()
+              .catch(() => null);
+          }
           if (verifyHook && captchaConfig) {
             const proof = await verifyHook(captchaConfig);
             if (!proof?.captchaVerifyParam) {
               setFeedback({
                 kind: "info",
                 text: isZh
-                  ? "安全验证未完成，请重新点击「立即领取」完成验证。"
+                  ? "安全验证未完成，请重新点击「领取」完成验证。"
                   : "Security verification was cancelled. Tap Claim to try again.",
               });
               return;
@@ -220,7 +245,7 @@ export function StartPlanManualClaimCard({
             Promise.resolve(onClaimCompleted?.()),
             providerSettingsService?.refresh("manual-plan-claim"),
           ]);
-          await loadOffers(false);
+          await loadOffers(false, true);
           return;
         }
         if (result.code === 1003) {
@@ -291,7 +316,7 @@ export function StartPlanManualClaimCard({
               variant="ghost"
               aria-label={isZh ? "检查可领活动" : "Check offers"}
               disabled={loading}
-              onClick={() => void loadOffers(true)}
+              onClick={() => void loadOffers(true, true)}
             >
               {loading ? (
                 <Loader2Icon className="size-3.5 animate-spin" aria-hidden="true" />
@@ -344,7 +369,7 @@ export function StartPlanManualClaimCard({
                     <div className="mt-1 truncate text-ui-xs text-muted-foreground">
                       {formatClaimEntitlement(plan.entitlements[0], isZh)}
                     </div>
-                  ) : matchedLimits.length > 0 && matchedLimits[0] && !isClaimed ? (
+                  ) : matchedLimits.length > 0 && matchedLimits[0] ? (
                     <div className="mt-1 truncate text-ui-xs text-muted-foreground">
                       {isZh
                         ? `剩余 ${new Intl.NumberFormat(isZh ? "zh-CN" : "en-US").format(matchedLimits[0].remaining ?? 0)}`
@@ -388,7 +413,7 @@ export function StartPlanManualClaimCard({
             variant="outline"
             className="shrink-0"
             disabled={loading}
-            onClick={() => void loadOffers(false)}
+            onClick={() => void loadOffers(true, true)}
           >
             {loading ? (
               <Loader2Icon className="mr-1.5 size-3.5 animate-spin" aria-hidden="true" />

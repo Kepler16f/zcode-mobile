@@ -109,6 +109,10 @@ function buildAccountRuntime(options: MobileAccountOptions) {
   };
 
   const loadAccountIdentity = async (family: "zai" | "bigmodel") => {
+    if (family === "bigmodel") {
+      const linked = await credentialRepo.loadLinkedBigModel();
+      if (linked?.customerId) return linked.customerId;
+    }
     const providerIds =
       family === "zai" ? [ZAI_PROVIDER_ID] : [BIGMODEL_PROVIDER_ID, ZAI_CN_PROVIDER_ID];
     for (const providerId of providerIds) {
@@ -141,10 +145,14 @@ function buildAccountRuntime(options: MobileAccountOptions) {
   const credentialServiceForPlan = createAccountProviderCredentialService({
     credentialStore: createAccountProviderCredentialStore({ credentialService }),
     async loadOAuthAccessToken(family) {
-      return (
-        (await credentialRepo.loadTokenSet(family === "zai" ? ZAI_PROVIDER_ID : BIGMODEL_PROVIDER_ID))
-          ?.accessToken ?? null
-      );
+      if (family === "bigmodel") {
+        const directToken = (await credentialRepo.loadTokenSet(BIGMODEL_PROVIDER_ID))?.accessToken;
+        if (directToken) return directToken;
+        const linked = await credentialRepo.loadLinkedBigModel();
+        if (linked?.accessToken) return linked.accessToken;
+        return null;
+      }
+      return (await credentialRepo.loadTokenSet(ZAI_PROVIDER_ID))?.accessToken ?? null;
     },
     resolveProviderApiKey: (family, accessToken) =>
       apiKeyResolver.resolveProviderApiKey(
@@ -272,6 +280,16 @@ export function createMobileAccountRequestAuthService(options: MobileAccountOpti
       loadOAuthTokenSet: async (providerId) => {
         const set = await runtime.credentialRepo.loadTokenSet(providerId);
         if (set?.zcodeJwtToken?.trim()) return set;
+        // 当存在明确 active_provider 登录域时，仅对同家族 Start Plan 回退共享 zcodejwttoken，
+        // 避免 bigmodel/zai_cn 登录时 account:zai-start-plan 拿同一枚 JWT 并发重复请求 billing/balance。
+        const activeProvider = (
+          await options.credentialService.load("oauth:active_provider")
+        )?.trim();
+        const explicitLoginFamily = resolveStartPlanFamilyFromOAuthProvider(activeProvider);
+        const targetFamily = providerId === ZAI_PROVIDER_ID ? "zai" : "bigmodel";
+        if (explicitLoginFamily && explicitLoginFamily !== targetFamily) {
+          return set ?? null;
+        }
         const fallbackJwt = (await options.credentialService.load("zcodejwttoken"))?.trim();
         if (!set && !fallbackJwt) return null;
         return { ...(set ?? {}), ...(fallbackJwt ? { zcodeJwtToken: fallbackJwt } : {}) };

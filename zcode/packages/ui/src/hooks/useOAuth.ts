@@ -7,10 +7,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { OAuthProviderId, OAuthProviderMeta } from "@zcode/shared";
 import {
-  BIGMODEL_PROVIDER_ID,
+  isBuiltinOAuthProvider,
   isCredentialDecryptError,
   resolveSafeTelemetryHostname,
-  ZAI_PROVIDER_ID,
 } from "@zcode/shared";
 import { reportAppTelemetryEvent } from "@/lib/appTelemetry.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
@@ -87,9 +86,7 @@ export function useOAuth() {
         }
 
         platform.registerOAuthState({ state, provider: startedProvider });
-        setOAuthPollingActive(
-          startedProvider === ZAI_PROVIDER_ID || startedProvider === BIGMODEL_PROVIDER_ID,
-        );
+        setOAuthPollingActive(isBuiltinOAuthProvider(startedProvider));
         platform.openExternal(authorizeUrl);
         void reportAppTelemetryEvent(
           platform,

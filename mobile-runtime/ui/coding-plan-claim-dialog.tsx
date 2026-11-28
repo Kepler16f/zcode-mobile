@@ -84,13 +84,19 @@ export function CodingPlanEmbeddedWebviewDialog({
       urlRef.current = url;
       const keys = getCodingPlanCredentialKeys(provider);
       const values = await Promise.all(keys.map((key) => credentialService.load(key)));
+      const loginProvider = provider === "zai" ? values[2] : values[3];
       const credentials: CodingPlanEmbeddedCredentials =
         provider === "zai"
           ? { zaiAccessToken: values[0], zcodeJwtToken: values[1] }
-          : { bigmodelAccessToken: values[0], zcodeJwtToken: values[1] };
+          : {
+              bigmodelAccessToken: values[0],
+              zcodeJwtToken: values[1],
+              zaiCnAccessToken: values[2],
+            };
       const script = createCodingPlanAuthInjectionScript({
         provider,
         credentials,
+        loginProvider,
         theme,
         locale,
         reportContext: buildCodingPlanEmbeddedReportContext({
