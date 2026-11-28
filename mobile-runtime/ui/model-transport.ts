@@ -1,5 +1,14 @@
 import { getOrCreateSessionId, isZCodeContextHost, officialIdentityRequest } from "./quota-transport.js";
 import {
+  buildUltraSigningHeaders,
+  invalidateSigningKey,
+  isSigningBypassed,
+  markSigningBypassed,
+  readSigningFailureReason,
+  rewriteToUltraUrl,
+} from "./ultra-signing.js";
+import { officialCompatibilityVersion } from "./server-compat.js";
+import {
   officialAiSdkProviderUtilsVersion,
   OFFICIAL_NODE_RUNTIME_UA,
 } from "./server-compat.js";
@@ -155,6 +164,57 @@ function stripBrowserOnlyHeaders(headers: Record<string, string>): Record<string
   }
   return out;
 }
+
+/**
+ * ultra 签名链路的资格判定与头组/URL 准备（0.13.0）。
+ * 官方 4.0.0 的对话请求 = agent/configs 下发路由 → ultra 端点 + X-Zcode-Authorization
+ * （Bearer ZCode JWT）+ 签名五头；zcode-plan 端点已被服务端弃用（3012）。
+ * 资格：官方域 zcode-plan anthropic messages 请求 + 非探测 + 有 JWT + 未 bypass。
+ */
+async function rewriteToUltraUrlIfEligible(
+  url: string,
+  headers: Record<string, string>,
+): Promise<{ url: string; headers: Record<string, string> } | null> {
+  if (!url.includes("/v1/messages") || !url.includes("zcode.z.ai")) return null;
+  if (!url.includes("/zcode-plan/anthropic")) return null;
+  const rawAuthorization = headerValue(headers, "authorization") ?? "";
+  const apiKey = rawAuthorization.replace(/^Bearer\s+/i, "").trim() || headerValue(headers, "x-api-key")?.trim() || "";
+  if (!apiKey || isSigningBypassed(apiKey)) return null;
+  const sessionId = headerValue(headers, "x-session-id")?.trim() ?? "";
+  try {
+    const [rewritten, signingHeaders] = await Promise.all([
+      rewriteToUltraUrl(url, "bigmodel", (input, init) => fetch(input, init)),
+      buildUltraSigningHeaders({
+        apiKey,
+        sessionId,
+        clientVersion: officialCompatibilityVersion(),
+        bigmodelOrigin: "https://open.bigmodel.cn",
+      }),
+    ]);
+    if (rewritten === url) return null; // 没改写成 ultra（映射缺失）就不打签名头，保持 zcode-plan 原请求
+    const extra: Record<string, string> = { ...signingHeaders, "X-Zcode-Authorization": `Bearer ${apiKey}` };
+    // 平台头真值（官方 jOi 无伪装语义）：ultra 按真实平台判定，不再沿用 billing 链的伪装。
+    setHeaderCaseInsensitive(extra, "X-Platform", "android-arm64");
+    return { url: rewritten, headers: extra };
+  } catch {
+    return null; // fail-open
+  }
+}
+
+/** ultra 401 + 签名失败 reason：重握手（invalidate），再犯进 bypass（官方语义）。 */
+function handleUltraSigningRejection(apiKey: string, bodyText: string): void {
+  const reason = readSigningFailureReason(bodyText);
+  if (!/VERIFY_SIGNATURE_INVALID|VERIFY_APIKEY_EXPIRED/i.test(reason)) return;
+  if (keyInvalidatedOnce.has(apiKey)) {
+    markSigningBypassed(apiKey);
+    keyInvalidatedOnce.delete(apiKey);
+  } else {
+    invalidateSigningKey(apiKey);
+    keyInvalidatedOnce.add(apiKey);
+  }
+}
+
+const keyInvalidatedOnce = new Set<string>();
 /** Android 模型请求不受 WebView CORS 限制，仍由同一模型解析器消费增量 Response。 */
 type NativeModelBridge = { start(request: string): string; poll(id: string): string; cancel(id: string): boolean };
 type Packet = { status?: number; headers?: Record<string, string>; bodyBase64?: string; done?: boolean; error?: string };
@@ -240,6 +300,19 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
   };
   const diagHeaderNames = Object.keys(init.headers).map((name) => name.toLowerCase()).sort();
   const diagUserAgent = headerValue(init.headers, "user-agent");
+  // ── ultra 签名链路（0.13.0，3012 终局）：官方 4.0.0 的对话请求不再打 zcode-plan
+  // 端点（服务端弃用→3012），而是 agent/configs 下发路由 + v2/client 握手换 Ed25519
+  // 私钥 + 每请求签名五头。只对官方域的非探测 messages 请求生效；凭据/会话/版本缺一
+  // 或握手失败 → fail-open 按 unsigned 照发（官方 failOpenEligible 同语义）。
+  const ultraTarget = isConnectivityProbeBody(init.body)
+    ? null
+    : await rewriteToUltraUrlIfEligible(url, init.headers);
+  if (ultraTarget) {
+    url = ultraTarget.url;
+    for (const [name, value] of Object.entries(ultraTarget.headers)) {
+      setHeaderCaseInsensitive(init.headers, name, value);
+    }
+  }
   const bridge = (globalThis as { zcodeModelHttp?: NativeModelBridge }).zcodeModelHttp;
   if (!bridge) {
     // 壳里缺桥 = 应用装配坏了（桥注册失败 / 装的是旧包 / 页面在装配前就发了请求）。
@@ -332,6 +405,14 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
       // 收集完错误响应体（前 300 字）后再落盘；取证失败不影响响应回传。
       const errorBody = await readErrorBodySnippet(initial).catch(() => "");
       recordModelDiag({ ...diagStatusEntry, errorBody });
+      // ultra 链路的 401 签名拒绝：重握手一次，再犯进 bypass（官方语义）。
+      if (status === 401 && url.includes("/ultra")) {
+        const apiKey =
+          headerValue(init.headers, "authorization")?.replace(/^Bearer\s+/i, "").trim() ||
+          headerValue(init.headers, "x-api-key")?.trim() ||
+          "";
+        if (apiKey) handleUltraSigningRejection(apiKey, errorBody);
+      }
     } else {
       recordModelDiag(diagStatusEntry);
     }
