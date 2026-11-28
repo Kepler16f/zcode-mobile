@@ -5,3 +5,4 @@
 // 里的同名 declare 是模块内的，不覆盖端侧文件。
 declare const __ZCODE_VERSION__: string;
 declare const __ZCODE_AI_SDK_ANTHROPIC_VERSION__: string;
+declare const __ZCODE_AI_SDK_PROVIDER_UTILS_VERSION__: string;
