@@ -171,6 +171,17 @@ function stripBrowserOnlyHeaders(headers: Record<string, string>): Record<string
  * （Bearer ZCode JWT）+ 签名五头；zcode-plan 端点已被服务端弃用（3012）。
  * 资格：官方域 zcode-plan anthropic messages 请求 + 非探测 + 有 JWT + 未 bypass。
  */
+/** 同步资格判定：非官方域候选必须在不引入 await 的情况下直接短路——idle 看门狗
+ *  测试对 fetch 路径的同步时序敏感，多一个微任务都会推迟首字节计时器的建立。 */
+function isUltraCandidateSync(url: string, headers: Record<string, string>): boolean {
+  if (!url.includes("/v1/messages") || !url.includes("zcode.z.ai")) return false;
+  if (!url.includes("/zcode-plan/anthropic")) return false;
+  const rawAuthorization = headerValue(headers, "authorization") ?? "";
+  const apiKey = rawAuthorization.replace(/^Bearer\s+/i, "").trim() || headerValue(headers, "x-api-key")?.trim() || "";
+  if (!apiKey || isSigningBypassed(apiKey)) return false;
+  return true;
+}
+
 async function rewriteToUltraUrlIfEligible(
   url: string,
   headers: Record<string, string>,
@@ -304,9 +315,11 @@ export async function mobileModelFetch(url: string, init: { headers: Record<stri
   // 端点（服务端弃用→3012），而是 agent/configs 下发路由 + v2/client 握手换 Ed25519
   // 私钥 + 每请求签名五头。只对官方域的非探测 messages 请求生效；凭据/会话/版本缺一
   // 或握手失败 → fail-open 按 unsigned 照发（官方 failOpenEligible 同语义）。
-  const ultraTarget = isConnectivityProbeBody(init.body)
-    ? null
-    : await rewriteToUltraUrlIfEligible(url, init.headers);
+  // 同步资格判定先短路：非候选路径零 await（idle 看门狗对 fetch 路径同步时序敏感）。
+  const ultraTarget =
+    isConnectivityProbeBody(init.body) || !isUltraCandidateSync(url, init.headers)
+      ? null
+      : await rewriteToUltraUrlIfEligible(url, init.headers);
   if (ultraTarget) {
     url = ultraTarget.url;
     for (const [name, value] of Object.entries(ultraTarget.headers)) {
